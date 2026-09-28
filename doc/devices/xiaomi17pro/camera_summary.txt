@@ -1,0 +1,118 @@
+sections: 18
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/0 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=6.61999989
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES LOGICAL_MULTI_CAMERA
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/0 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/1 (v1.3) static information: ==
+  facing=FRONT hwLevel=3 orientation=270 focal=3.09999990
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/1 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/2 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=6.61999989
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/2 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/3 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=2.56999993
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/3 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/4 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=17.42000008
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/4 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/5 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=6.61999989
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES LOGICAL_MULTI_CAMERA
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/5 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/6 (v1.3) static information: ==
+  facing=BACK hwLevel=3 orientation=90 focal=6.61999989
+  maxNumOutputStreams[RAW,PREV,PROC]=1 3 2
+  pixelArray=4096 3072 blackLevel=64 64 64 64
+  caps: BACKWARD_COMPATIBLE CONSTRAINED_HIGH_SPEED_VIDEO RAW YUV_REPROCESSING PRIVATE_REPROCESSING READ_SENSOR_SETTINGS MANUAL_SENSOR BURST_CAPTURE MANUAL_POST_PROCESSING STREAM_USE_CASE DYNAMIC_RANGE_TEN_BIT COLOR_SPACE_PROFILES LOGICAL_MULTI_CAMERA
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/6 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/7 (v1.3) static information: ==
+  facing=EXTERNAL hwLevel=3 orientation=0 focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=0 1 1
+  pixelArray=12000 9000 blackLevel=None
+  caps: PRIVATE_REPROCESSING BURST_CAPTURE YUV_REPROCESSING SYSTEM_CAMERA
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/7 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/8 (v1.3) static information: ==
+  facing=EXTERNAL hwLevel=3 orientation=0 focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=0 1 1
+  pixelArray=12000 9000 blackLevel=None
+  caps: PRIVATE_REPROCESSING BURST_CAPTURE YUV_REPROCESSING SYSTEM_CAMERA
+  RAW outputs: NONE
+======================================================================
+== Camera HAL device device@1.1/vendor_qti/8 (v1.3) dumpState: ==
+  facing=None hwLevel=None orientation=None focal=None
+  maxNumOutputStreams[RAW,PREV,PROC]=None
+  pixelArray=None blackLevel=None
+  RAW outputs: NONE

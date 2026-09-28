@@ -1,0 +1,8 @@
+build/
+dist/
+out/
+.vs/
+.vscode/
+.idea/
+*.user
+*.apk.idsig
