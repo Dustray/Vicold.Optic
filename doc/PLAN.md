@@ -114,7 +114,19 @@ struct IOpticDevice {
 
 **退出标准**：空 app 在 17 Pro 上以 NDK 打开相机出预览；能力报告完成；架构决策（D2/D3）落文档。
 
-### M1 — 采集核心 【P0，2–3 周】
+### M1 — 采集核心 【P0，2–3 周】✅ 核心完成（2026-09-29）
+
+> **状态（2026-09-29）：核心完成 ✅**
+> - 1.1 ✅ RAII 封装（CameraDevice/CaptureSession/CameraEngine）+ 断流重连
+> - 1.2 ◐ 直写 Surface 预览 30fps 零丢帧 ✅；GL 预览链（顺带解决预览旋转 + 可视 UI 绘制）移入 M1.2 后半段
+> - 1.3 ✅ 手动控制（ae/iso/exp_us/af/focus_d/awb/zoom）经 controls.txt 下发，CaptureResult 回读验证
+> - 1.4 ✅ 多摄：物理 id 经 `ACAMERA_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS` 枚举（实测 [3 2 4]），zoom=[0.70,10.00]；物理流切换待 M1.4 复测
+> - 1.5 ✅ RAW 通路实测通过：`RAW saved 25165824 bytes`（4096×3072×2 分毫不差）+ 元数据绑定（回退配对已生效，iso=89 真实值；精确配对改进移 M2.1）
+> - 1.6 ✅ ZSL 环形缓冲 + 快门回溯实测通过（4 帧回溯保存）
+> - 1.7 ⏳ 会话延迟优化（未开工）
+> - **新增：拍摄按钮**（JNI 子窗口 TYPE_APPLICATION_PANEL，主线程 onWindowFocusChanged 创建）+ 每启动配额（saveQuota=1）+ 一次性命令自消费——真机验证：点按钮 → `shutter triggered (1/1)` → 恰好 4 帧 RAW（iso=89）→ 再点 `quota exhausted`
+> - **新增：存储保险丝**（155GB 事故复盘：controls.txt 在 FUSE 上 mtime 抖动导致 zsl_shutter 每轮询重触发；修复 = 内容比对 + 自消费 + 配额）
+> - 遗留：RawCapture 字节保险丝（补丁 D）待套；M2.1 需做落盘时精确配对（当前 miss delta=66ms=2 帧，回退值可用）
 
 | # | 任务 | 优先级 |
 |---|---|---|
@@ -126,7 +138,7 @@ struct IOpticDevice {
 | 1.6 | ZSL（零快门延迟）环形缓冲：常驻 N 帧缓存，快门即回溯取帧 | P1 |
 | 1.7 | 会话延迟优化：shared session、最小 stream 组合切换 | P1 |
 
-**退出标准**：预览流畅无丢帧；手动参数实时生效；RAW 帧能取出且元数据完整；快门回溯可用。
+**退出标准**：预览流畅无丢帧 ✅；手动参数实时生效 ✅；RAW 帧能取出且元数据完整 ✅（iso=89 真实值）；快门回溯可用 ✅。
 
 ### M2 — RAW/DNG 输出链路 【P0，2 周】
 

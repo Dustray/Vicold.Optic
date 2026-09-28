@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vicold.Optic · 专业相机界面</title>
+<style>
+  :root{
+    --bg:#000000;
+    --rail:#0A0A0C;
+    --line:rgba(255,255,255,.10);
+    --track:rgba(255,255,255,.08);
+    --accent:#F59E0B;
+    --t1:#FFFFFF;
+    --t2:rgba(255,255,255,.72);
+    --t3:rgba(255,255,255,.45);
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --ui:"Inter","Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:#08080A;color:var(--t1);font-family:var(--ui);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:14px;padding:20px;overflow:auto;
+  }
+
+  /* ============ 机身边框（区分屏幕边界） ============ */
+  .stage-wrap{
+    flex:0 0 auto;overflow:hidden;padding:11px;border-radius:36px;
+    background:linear-gradient(180deg,#1d1d22 0%,#131317 55%,#0d0d10 100%);
+    border:1px solid rgba(255,255,255,.16);
+    box-shadow:
+      0 40px 110px rgba(0,0,0,.85),
+      0 2px 0 rgba(255,255,255,.06) inset,
+      0 -2px 0 rgba(0,0,0,.6) inset,
+      0 0 0 8px #0c0c0e;                 /* 机身外侧一圈更深，凸出屏幕轮廓 */
+  }
+  /* ============ 屏幕 1560x720 ≈ 2340x1080 横屏 ============ */
+  .stage{
+    width:1560px;height:720px;display:flex;background:var(--bg);
+    transform-origin:top left;overflow:hidden;
+    border-radius:26px;
+    box-shadow:0 0 0 1px rgba(255,255,255,.14), 0 0 30px rgba(0,0,0,.9) inset;
+  }
+
+  /* ---- 左侧：摄像头避让区 + 无极变焦导轨 ---- */
+  .cam-safe{
+    width:80px;flex:0 0 80px;height:100%;background:var(--bg);
+    position:relative;display:flex;align-items:flex-end;justify-content:center;padding-bottom:14px;
+  }
+  .cam-safe::before{
+    content:"";position:absolute;inset:8px 10px;
+    border:1px dashed rgba(255,255,255,.10);border-radius:10px;
+  }
+  .cam-safe span{
+    font-size:9px;letter-spacing:2px;color:rgba(255,255,255,.22);
+    writing-mode:vertical-rl;text-orientation:upright;
+  }
+  .rail-left{
+    width:84px;height:100%;flex:0 0 84px;background:var(--rail);
+    border-right:1px solid var(--line);border-left:1px solid var(--line);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:8px;
+  }
+  .zoom-readout{font-family:var(--mono);font-weight:700;font-size:18px;color:var(--t1);letter-spacing:.3px;white-space:nowrap}
+  /* 焦距 / 倍数 单位切换 */
+  .unit-toggle{
+    display:flex;align-items:center;gap:2px;padding:3px;border-radius:999px;
+    background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);cursor:pointer;
+    -webkit-user-select:none;user-select:none;
+  }
+  .unit-toggle b{
+    font-family:var(--mono);font-size:9px;font-weight:700;color:var(--t3);
+    padding:3px 7px;border-radius:999px;transition:all .15s ease;line-height:1;
+  }
+  .unit-toggle b.on{background:var(--accent);color:#0A0A0C}
+
+  /* ---- 中间：预览区 ---- */
+  .preview-zone{flex:1;min-width:0;display:flex;align-items:center;justify-content:center;background:#000}
+  .preview{position:relative;width:960px;height:720px;overflow:hidden;background:#07101a}
+  .scene{position:absolute;inset:0;
+    background:
+      radial-gradient(150px 110px at 22% 46%, rgba(255,196,130,.55), transparent 70%),
+      radial-gradient(110px 90px at 58% 33%, rgba(255,163,92,.42), transparent 70%),
+      radial-gradient(90px 90px at 84% 55%, rgba(126,196,255,.34), transparent 70%),
+      radial-gradient(60px 60px at 40% 60%, rgba(255,214,160,.28), transparent 70%),
+      linear-gradient(180deg,#0a1420 0%,#12202e 42%,#2b2117 76%,#0e0b09 100%);
+  }
+  .scene::after{content:"";position:absolute;inset:52% 0 0 0;
+    background:linear-gradient(180deg, rgba(255,180,110,.22), transparent 62%);filter:blur(14px);}
+  .vignette{position:absolute;inset:0;
+    background:radial-gradient(120% 90% at 50% 45%, transparent 55%, rgba(0,0,0,.62) 100%);}
+  .grid{position:absolute;inset:0}
+  .grid i{position:absolute;background:rgba(255,255,255,.12)}
+  .grid i.v{width:1px;height:100%;top:0}
+  .grid i.h{height:1px;width:100%;left:0}
+
+  .hud-row{position:absolute;top:16px;left:16px;display:flex;gap:8px;align-items:center}
+  .chip{
+    padding:6px 10px;border-radius:6px;background:rgba(0,0,0,.5);
+    font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.72);
+    -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
+  }
+  .chip.raw{color:var(--accent);font-weight:700}
+  .chip.dng{color:#fff;font-weight:700}
+
+  .hud-right{position:absolute;top:16px;right:16px;display:flex;gap:10px;align-items:center}
+  .clock{font-family:var(--mono);font-size:13px;font-weight:500}
+  .battery{width:24px;height:14px;border:1.5px solid rgba(255,255,255,.8);border-radius:3px;position:relative;padding:2px}
+  .battery i{display:block;height:100%;width:62%;border-radius:1.5px;background:var(--accent)}
+  .battery::after{content:"";position:absolute;right:-4px;top:3px;width:2px;height:8px;background:rgba(255,255,255,.8)}
+
+  .histogram{position:absolute;top:52px;right:16px;width:132px;height:66px;
+    background:rgba(0,0,0,.42);border-radius:6px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);}
+
+  .af-box{position:absolute;width:96px;height:96px;left:432px;top:312px;
+    border:1px solid rgba(255,255,255,.7);border-radius:4px}
+  .af-box::before,.af-box::after{content:"";position:absolute;background:rgba(255,255,255,.85)}
+  .af-box::before{left:50%;top:-1px;width:1px;height:12px;transform:translateX(-50%)}
+  .af-box::after{top:50%;left:-1px;height:1px;width:12px;transform:translateY(-50%)}
+  .af-tag{position:absolute;left:432px;top:264px;font-family:var(--mono);font-size:10px;color:rgba(255,255,255,.7)}
+
+  /* 曝光补偿滑块 */
+  .ev-panel{
+    position:absolute;left:24px;bottom:24px;width:340px;padding:12px;border-radius:12px;
+    background:rgba(0,0,0,.45);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+    border:1px solid rgba(255,255,255,.08);
+  }
+  .ev-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .ev-head .label{font-size:11px;color:var(--t2)}
+  .ev-head .value{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--accent)}
+  .ev-track{position:relative;height:20px;cursor:pointer;touch-action:none}
+  .ev-line{position:absolute;left:0;right:0;top:9px;height:2px;background:rgba(255,255,255,.35);border-radius:2px}
+  .ev-tick{position:absolute;top:6px;width:1px;height:8px;background:rgba(255,255,255,.35);transform:translateX(-.5px)}
+  .ev-tick.major{top:3px;height:14px;background:rgba(255,255,255,.55)}
+  .ev-thumb{position:absolute;top:1px;width:18px;height:18px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 1.5px rgba(0,0,0,.55);transform:translateX(-50%);
+    font:700 9px/18px var(--mono);color:#0A0A0C;text-align:center}
+
+  /* ---- 右侧：参数导轨 ---- */
+  .rail-right{
+    width:300px;height:100%;flex:0 0 300px;background:var(--rail);
+    border-left:1px solid var(--line);
+    display:flex;align-items:center;justify-content:center;gap:24px;padding:14px 18px;
+  }
+  .rail-div{width:1px;height:200px;flex:0 0 1px;background:rgba(255,255,255,.10)}
+  .vslider{display:flex;flex-direction:column;align-items:center;gap:10px;user-select:none}
+  .vslider .label{font-size:12px;color:var(--t2);white-space:nowrap;letter-spacing:.3px}
+  .v-track{
+    position:relative;width:48px;height:440px;border-radius:20px;background:var(--track);
+    cursor:pointer;touch-action:none;
+  }
+  .v-line{position:absolute;left:23px;top:20px;bottom:20px;width:2px;background:rgba(255,255,255,.35);border-radius:2px}
+  .v-tick{position:absolute;left:20px;width:8px;height:1.5px;background:rgba(255,255,255,.30)}
+  .v-tick.major{left:16px;width:16px;height:2px;background:rgba(255,255,255,.55)}
+  .v-thumb{
+    position:absolute;left:2px;width:44px;height:30px;border-radius:15px;background:var(--accent);
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--mono);font-weight:700;font-size:11px;color:#0A0A0C;
+    box-shadow:0 4px 14px rgba(245,158,11,.35);
+  }
+  .v-value{font-family:var(--mono);font-weight:700;font-size:12px;color:var(--accent);white-space:nowrap}
+
+  .shutter{
+    width:76px;height:76px;border-radius:50%;background:rgba(255,255,255,.15);
+    border:2px solid rgba(255,255,255,.85);display:flex;align-items:center;justify-content:center;
+    cursor:pointer;transition:transform .08s ease;flex:0 0 76px;
+  }
+  .shutter:active{transform:scale(.94)}
+  .shutter i{width:58px;height:58px;border-radius:50%;background:#fff;display:block}
+
+  .flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .14s ease}
+  .flash.on{opacity:.85;transition:opacity .05s ease}
+  .toast{
+    position:absolute;left:50%;bottom:28px;transform:translate(-50%,10px);
+    padding:8px 14px;border-radius:999px;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.12);
+    -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+    font-family:var(--mono);font-size:11px;color:#fff;opacity:0;transition:all .25s ease;pointer-events:none;
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  /* ---- 图例 / 标注 ---- */
+  .device-tag{flex:0 0 auto;display:flex;align-items:center;gap:8px;
+    font-family:var(--mono);font-size:11px;color:var(--t3);letter-spacing:.4px}
+  .device-tag i{width:5px;height:5px;border-radius:50%;background:#22C55E;display:inline-block}
+  .legend-wrap{overflow:hidden;flex:0 0 auto;padding-left:12px}
+  .legend{width:1560px;display:flex;flex-wrap:wrap;gap:8px 22px;
+    font-size:12px;color:var(--t3);transform-origin:top left}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend b{color:var(--t2);font-weight:600}
+  .legend em{width:6px;height:6px;border-radius:50%;background:var(--accent);display:inline-block}
+</style>
+</head>
+<body>
+  <div class="device-tag"><i></i>Xiaomi 17 Pro · 2340 × 1080 · 横屏取景</div>
+  <div class="stage-wrap" id="stageWrap">
+    <div class="stage" id="stage">
+      <!-- 左侧：摄像头避让区 -->
+      <div class="cam-safe"><span>摄像头区域</span></div>
+
+      <!-- 左侧：无极变焦 -->
+      <aside class="rail-left">
+        <div class="zoom-readout" id="zoomReadout">32mm</div>
+        <div class="vslider">
+          <div class="v-track" id="zoomTrack">
+            <div class="v-line"></div>
+            <div class="v-thumb" id="zoomThumb">32</div>
+          </div>
+        </div>
+        <div class="unit-toggle" id="zoomUnitBtn" title="切换焦距 / 倍数">
+          <b class="on" data-unit="mm">mm</b><b data-unit="x">×</b>
+        </div>
+      </aside>
+
+      <!-- 中间：预览 -->
+      <main class="preview-zone">
+        <section class="preview">
+          <div class="scene"></div>
+          <div class="vignette"></div>
+          <div class="grid" id="grid"></div>
+
+          <div class="hud-row">
+            <span class="chip raw">RAW</span>
+            <span class="chip dng">DNG</span>
+            <span class="chip">4096 × 3072</span>
+            <span class="chip">ZSL 就绪</span>
+          </div>
+
+          <div class="hud-right">
+            <span class="clock">16:47</span>
+            <span class="battery"><i></i></span>
+          </div>
+
+          <canvas class="histogram" id="hist" width="264" height="132"></canvas>
+
+          <div class="af-box"></div>
+          <div class="af-tag">AF-S · f/1.65</div>
+
+          <!-- 曝光补偿滑块 -->
+          <div class="ev-panel">
+            <div class="ev-head">
+              <span class="label">曝光补偿</span>
+              <span class="value" id="evValue">−0.3 EV</span>
+            </div>
+            <div class="ev-track" id="evTrack">
+              <div class="ev-line"></div>
+              <div class="ev-thumb" id="evThumb"></div>
+            </div>
+          </div>
+
+          <div class="flash" id="flash"></div>
+          <div class="toast" id="toast">已保存 · DNG 环形缓冲 2/4</div>
+        </section>
+      </main>
+
+      <!-- 右侧：参数与快门 -->
+      <aside class="rail-right">
+        <div class="vslider">
+          <div class="label">ISO</div>
+          <div class="v-track" id="isoTrack">
+            <div class="v-line"></div>
+            <div class="v-thumb" id="isoThumb">400</div>
+          </div>
+          <div class="v-value" id="isoValue">ISO 400</div>
+        </div>
+
+        <div class="vslider">
+          <div class="label">曝光时间</div>
+          <div class="v-track" id="ssTrack">
+            <div class="v-line"></div>
+            <div class="v-thumb" id="ssThumb">1/125</div>
+          </div>
+          <div class="v-value" id="ssValue">1/125 s</div>
+        </div>
+
+        <div class="rail-div"></div>
+        <div class="shutter" id="shutter"><i></i></div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="legend-wrap" id="legendWrap">
+    <div class="legend" id="legend">
+      <span><em></em><b>左侧无极变焦滑块</b>　0.7×–10×（≈16mm–230mm）对数刻度，靠近整数档自动吸附；底部按键切换「焦距 mm」与「倍数 ×」两种读数</span>
+      <span><em></em><b>左侧避让区</b>　空出 112px 给摄像头模组，避免横屏握持误触；虚线仅作设计标注，真机不显示</span>
+      <span><em></em><b>预览区</b>　默认与传感器同比例 4:3（4096 × 3072）</span>
+      <span><em></em><b>曝光补偿滑块</b>　±3 EV，中心自动吸附 0 EV</span>
+      <span><em></em><b>ISO / 曝光时间</b>　竖向对数步进，当前 ISO 400 · 1/125 s</span>
+      <span><em></em><b>快门</b>　释放即拍 RAW(DNG)</span>
+    </div>
+  </div>
+
+<script>
+(function(){
+  "use strict";
+  const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+  const $=id=>document.getElementById(id);
+
+  /* ---------- 三分构图线 ---------- */
+  (function(){
+    const g=$('grid');
+    [320,640].forEach(x=>{const i=document.createElement('i');i.className='v';i.style.left=x+'px';g.appendChild(i);});
+    [240,480].forEach(y=>{const i=document.createElement('i');i.className='h';i.style.top=y+'px';g.appendChild(i);});
+  })();
+
+  /* ---------- 直方图装饰 ---------- */
+  (function(){
+    const c=$('hist'),ctx=c.getContext('2d');
+    const band=(color,seed)=>{
+      ctx.globalAlpha=.55;ctx.fillStyle=color;
+      for(let x=4;x<c.width-4;x+=4){
+        const f=Math.exp(-Math.pow((x/c.width-seed),2)/.02);
+        const h=(20+70*f)*(0.7+0.3*Math.sin(x*0.6+seed*9));
+        ctx.fillRect(x,c.height-4-h,3,h);
+      }
+    };
+    band('#4f8ef7',.32);band('#4ade80',.5);band('#f59e0b',.68);
+  })();
+
+  /* ---------- 竖向滑块（比例坐标，缩放无关） ---------- */
+  const PAD_F=20/440;                 // 上下内边距占比
+  const TH_F=30/440;                  // 滑块高度占比（同步 CSS .v-thumb height）
+  const USABLE_F=1-PAD_F*2;
+
+  function tick(track,fraction,major){
+    const t=document.createElement('div');
+    t.className='v-tick'+(major?' major':'');
+    t.style.top=(fraction*100)+'%';
+    track.appendChild(t);
+  }
+
+  function makeVertical(trackId,thumbId,stops,initialIndex,onChange){
+    const track=$(trackId),thumb=$(thumbId);
+    let index=clamp(initialIndex,0,stops.length-1);
+
+    // 刻度：每个档位一根长刻度，档位之间加一根短刻度
+    stops.forEach((s,i)=>{
+      const f=i/(stops.length-1);
+      tick(track,PAD_F+(1-f)*USABLE_F,true);
+      if(i<stops.length-1) tick(track,PAD_F+(1-f)*USABLE_F-USABLE_F/(stops.length-1)/2,false);
+    });
+
+    function render(){
+      const f=index/(stops.length-1);
+      const top=(PAD_F+(1-f)*USABLE_F-TH_F/2)*100;
+      thumb.style.top=top+'%';
+      thumb.textContent=stops[index];
+      onChange&&onChange(stops[index]);
+    }
+    function fromY(clientY){
+      const r=track.getBoundingClientRect();
+      const yFrac=(clientY-r.top)/r.height;
+      const f=clamp(1-(yFrac-PAD_F)/USABLE_F,0,1);
+      return Math.round(f*(stops.length-1));
+    }
+    function setIndex(i){
+      const n=clamp(i,0,stops.length-1);
+      if(n!==index){index=n;render();}
+    }
+    let dragging=false;
+    track.addEventListener('pointerdown',e=>{dragging=true;track.setPointerCapture(e.pointerId);setIndex(fromY(e.clientY));});
+    track.addEventListener('pointermove',e=>{if(dragging)setIndex(fromY(e.clientY));});
+    track.addEventListener('pointerup',()=>{dragging=false;});
+    track.addEventListener('wheel',e=>{e.preventDefault();setIndex(index+(e.deltaY<0?1:-1));},{passive:false});
+
+    render();
+    return {track,get index(){return index;}};
+  }
+
+  makeVertical('isoTrack','isoThumb',
+    ['100','200','400','800','1600','3200','6400','12800'],2,
+    v=>{$('isoValue').textContent='ISO '+v;});
+
+  makeVertical('ssTrack','ssThumb',
+    ['1/8','1/30','1/60','1/125','1/250','1/500','1/1000','1/2000','1/4000'],3,
+    v=>{$('ssValue').textContent=v+' s';});
+
+  /* ---------- 无极变焦 0.7×–10×（对数刻度 + 整数档吸附 + mm/× 切换） ---------- */
+  (function(){
+    const track=$('zoomTrack'),thumb=$('zoomThumb'),readout=$('zoomReadout'),
+          toggle=$('zoomUnitBtn'),opts=toggle.querySelectorAll('b');
+    const MIN=0.7,MAX=10;               // 0.7× 超广角 ~ 10× 长焦
+    const BASE_MM=23;                   // 1× 等效焦距基准值
+    const STOPS=[0.7,1,2,3,5,10];       // 长刻度档位
+    const toF=(val)=>Math.log(val/MIN)/Math.log(MAX/MIN);   // 值 → 轨道比例（对数）
+    const toV=(frac)=>MIN*Math.pow(MAX/MIN,clamp(frac,0,1));// 轨道比例 → 值（对数）
+    let v=1.4,unit='mm';
+
+    STOPS.forEach(s=>tick(track,PAD_F+(1-toF(s))*USABLE_F,true));
+    for(let k=1;k<14;k++) tick(track,PAD_F+(1-k/14)*USABLE_F,false);
+
+    function snap(val){
+      for(const s of STOPS){ if(Math.abs(val-s)<0.13){ return s; } }
+      for(let s=1;s<=10;s++){ if(Math.abs(val-s)<0.13){ return s; } }
+      return val;
+    }
+    function label(val){
+      if(unit==='x') return val.toFixed(1)+'×';
+      return Math.round(BASE_MM*val)+'mm';
+    }
+    function render(){
+      const shown=snap(v);
+      readout.textContent=label(shown);
+      thumb.textContent=unit==='x'?shown.toFixed(1)+'×':String(Math.round(BASE_MM*shown));
+      thumb.style.top=((PAD_F+(1-toF(v))*USABLE_F-TH_F/2)*100)+'%';
+    }
+    function fromY(clientY){
+      const r=track.getBoundingClientRect();
+      const yFrac=(clientY-r.top)/r.height;
+      return toV(clamp(1-(yFrac-PAD_F)/USABLE_F,0,1));
+    }
+    function set(nv){ v=clamp(nv,MIN,MAX); render(); }
+
+    // 单位切换：mm ⇄ ×
+    toggle.addEventListener('click',e=>{
+      const b=e.target.closest('b'); if(!b) return;
+      unit=b.dataset.unit;
+      opts.forEach(o=>o.classList.toggle('on',o===b));
+      set(v);
+    });
+
+    let dragging=false;
+    track.addEventListener('pointerdown',e=>{dragging=true;track.setPointerCapture(e.pointerId);set(fromY(e.clientY));});
+    track.addEventListener('pointermove',e=>{if(dragging)set(fromY(e.clientY));});
+    track.addEventListener('pointerup',()=>{dragging=false;});
+    track.addEventListener('wheel',e=>{e.preventDefault();set(v*(e.deltaY<0?1.06:1/1.06));},{passive:false});
+    track.addEventListener('dblclick',()=>set(1));   // 双击回 1×
+
+    set(1.4);
+  })();
+
+  /* ---------- 曝光补偿（±3 EV，中心吸附） ---------- */
+  (function(){
+    const track=$('evTrack'),thumb=$('evThumb'),label=$('evValue');
+    let ev=-0.3;
+
+    for(let i=0;i<=12;i++){
+      const t=document.createElement('div');
+      t.className='ev-tick'+(i%2===0?' major':'');
+      t.style.left=(i/12*100)+'%';
+      track.appendChild(t);
+    }
+
+    function render(){
+      const f=(ev+3)/6;
+      thumb.style.left=(f*100)+'%';
+      label.textContent=(ev<0?'−':ev>0?'+':'')+Math.abs(ev).toFixed(1)+' EV';
+    }
+    function set(nv){
+      if(Math.abs(nv)<0.06) nv=0;               // 中心吸附
+      ev=clamp(nv,-3,3);render();
+    }
+    function fromX(clientX){
+      const r=track.getBoundingClientRect();
+      return clamp((clientX-r.left)/r.width,0,1)*6-3;
+    }
+    let dragging=false;
+    track.addEventListener('pointerdown',e=>{dragging=true;track.setPointerCapture(e.pointerId);set(fromX(e.clientX));});
+    track.addEventListener('pointermove',e=>{if(dragging)set(fromX(e.clientX));});
+    track.addEventListener('pointerup',()=>{dragging=false;});
+    track.addEventListener('dblclick',()=>set(0));
+
+    set(-0.3);
+  })();
+
+  /* ---------- 快门 ---------- */
+  (function(){
+    const flash=$('flash'),toast=$('toast');
+    $('shutter').addEventListener('click',()=>{
+      flash.classList.add('on');
+      setTimeout(()=>flash.classList.remove('on'),70);
+      toast.classList.add('show');
+      setTimeout(()=>toast.classList.remove('show'),1500);
+    });
+  })();
+
+  /* ---------- 自适应缩放（外层容器同步收缩，避免留白） ---------- */
+  (function(){
+    function fit(){
+      const availW=Math.max(document.documentElement.clientWidth-88,320);
+      const availH=Math.max(window.innerHeight-186,320);
+      const s=Math.min(availW/1560,availH/720,1);
+      const stage=$('stage'),wrap=$('stageWrap'),legend=$('legend'),lwrap=$('legendWrap');
+      const BEZEL=12;                      // 11px 内边距 + 1px 机身描边
+      stage.style.transform='scale('+s+')';
+      wrap.style.width=(1560*s+BEZEL*2)+'px';
+      wrap.style.height=(720*s+BEZEL*2)+'px';
+      legend.style.transform='scale('+s+')';
+      lwrap.style.width=(1560*s+BEZEL*2)+'px';
+      lwrap.style.height=(34*s+8)+'px';
+    }
+    window.addEventListener('resize',fit);
+    window.addEventListener('load',fit);
+    fit();
+  })();
+})();
+</script>
+</body>
+</html>
