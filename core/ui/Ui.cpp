@@ -214,15 +214,12 @@ void Ui::onMove(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
             zoom_ = zoomFromY(y);
-            // 相机侧目标：主摄带内实时跟随（0 丢帧）；越带（上拉超过长焦阈值）时
-            // 钳在阈值下方，越带部分由 GL 数字裁切模拟，松手才推真实值 ——
-            // 跨带会话重建 ~285ms 冻结（真机实测）不再出现在拖动途中。
-            // 判定用 appliedZoom_（当前出图所处带），拖拽始于长焦带时不钳制。
-            float cam = zoom_;
-            if (appliedZoom_.load(std::memory_order_acquire) < teleMin_ - 0.05f &&
-                cam > teleMin_ - 0.08f)
-                cam = teleMin_ - 0.08f;
-            if (std::fabs(cam - lastCamPush_) > 1e-4f) pushZoomLive(cam);
+            // 双模式（防闪烁，详见 Ui::frame 注释）：放大方向相机完全冻结
+            // （纹理不变、crop 单调连续，零时序错位），缩小方向 crop 恒 1、
+            // 相机节流跟随（带内实测 0 丢帧）。跨带会话重建只发生在松手落位
+            // 或缩小穿越带界（物理限制，GL 无法模拟变宽）。
+            const float az = appliedZoom_.load(std::memory_order_acquire);
+            if (zoom_ < az - 1e-3f) pushZoomLive(zoom_);
             break;
         }
         case Drag::ISO: {
@@ -545,13 +542,34 @@ void Ui::frame() {
     gl_.beginFrame(kBg);
 
     // ---- 预览（相机 → GL 纹理）----
-    // 平滑变焦 GL 裁切：显示 FOV = appliedZoom（相机已出图），目标 = zoom_，
-    // 差值由 GL 数字裁切补齐；相机逐步追赶（result 回传 appliedZoom），收敛后恒为 1，
-    // 无跳变。zoom-out 期间 crop < 1 钳回 1（GL 无法扩 FOV，等相机切带）。
+    // 拖拽变焦防闪烁（核心机制）：
+    //  - appliedZoom（az）是帧【元数据】，GL 纹理像素滞后它数帧 —— 二者若同时
+    //    活跃变化（相机阶梯跟随 × crop 反向补偿），FOV 会来回错位 = 闪烁。
+    //  - 放大拖拽：相机冻结（az 恒定），crop = zoom_/az 随手指单调变化，
+    //    FOV = 纹理(az) × crop 精确等于 zoom_，零错位零延迟。
+    //  - 缩小拖拽：GL 无法扩 FOV，crop 恒 1，相机真实跟随（FOV=az 轻微滞后但平滑）。
+    //  - az 一旦变化（相机真实变焦生效）：cropSmooth 立即归一 —— 元数据与像素
+    //    同帧绑定，切换是单次跳变；若此时还让 crop 从高位平滑下降，会和纹理
+    //    过渡叠加冲高（实测闪烁来源之一），必须瞬时归一。
+    //  - crop 上限 16：超广角 0.7 拖到 10x 时 crop≈14.3（暂态数字裁切，糊但可用）。
     {
         const float az = appliedZoom_.load(std::memory_order_acquire);
-        const float crop = (az > 0.01f) ? zoom_ / az : 1.f;
-        gl_.setPreviewZoom(std::clamp(crop, 1.f, 4.f));
+        if (az != lastAz_) {
+            cropSmooth_ = 1.f;
+            lastAz_ = az;
+        }
+        float target;
+        if (drag_ == Drag::ZOOM && zoom_ < az - 1e-3f) {
+            target = 1.f;                                   // 缩小拖拽：相机跟随
+        } else {
+            target = (az > 0.01f) ? zoom_ / az : 1.f;       // 放大拖拽/静止收敛期：补差
+        }
+        target = std::clamp(target, 1.f, 16.f);
+        const double t = nowSec();
+        const float dt = lastCropT_ > 0 ? float(t - lastCropT_) : 0.016f;
+        lastCropT_ = t;
+        cropSmooth_ += (target - cropSmooth_) * (1.f - std::exp(-dt * 20.f));
+        gl_.setPreviewZoom(cropSmooth_);
     }
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                     int(dim(kPreviewH)), resolveUvRot());

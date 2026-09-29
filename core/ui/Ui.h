@@ -120,8 +120,16 @@ private:
     bool shutterDown_ = false;
     double lastShotAt_ = 0;
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
-    float lastCamPush_ = 0.f;   // 上次下发给相机的目标值（拖拽钳制判定用）
+    float lastCamPush_ = 0.f;   // 上次下发给相机的目标值
     std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前出图的用户倍率
+    // 拖拽变焦双模式（防闪烁核心，见 Ui::frame 注释）：
+    //   zoom_ >= appliedZoom（放大）→ 相机冻结不发命令，GL 裁切 crop = zoom_/az 补足；
+    //   zoom_ <  appliedZoom（缩小）→ crop 恒 1，相机节流实时跟随。
+    // az 是帧元数据、纹理像素滞后数帧，二者若同时活跃会互搏错位 —— 上面的分野
+    // 保证任一时刻只有一方在动；az 真实变化时 cropSmooth_ 立即归一（同帧切换）。
+    float lastAz_ = 0.f;        // 上次见到的 appliedZoom（变化检测 → crop 归一）
+    float cropSmooth_ = 1.f;    // GL 裁切平滑值（指数趋近目标，帧率无关）
+    double lastCropT_ = 0;      // 上一帧时刻（平滑器 dt）
     float teleMin_ = 2.63f;                 // 长焦直连阈值（setTeleMin 下发）
     void pushZoomLive(float camTarget);
 
