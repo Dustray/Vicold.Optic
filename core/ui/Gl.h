@@ -49,14 +49,16 @@ public:
     int32_t width() const;
     int32_t height() const;
 
-    // 预览帧源（RGBA_8888 + GPU_SAMPLED_IMAGE 用途）；window 交给引擎挂会话输出
-    bool makePreviewSource(int32_t w, int32_t h);
-    ANativeWindow* previewWindow();
-    int32_t previewW();
-    int32_t previewH();
-    // 每帧调用：acquireLatestImage → 导入/绑定纹理；有新帧返回帧号，否则 -1。
-    // 同时填充 64-bin RGB 直方图（10-bit 归一前灰度统计，供 UI 直方图）。
-    int64_t acquirePreview(int32_t histR[64], int32_t histG[64], int32_t histB[64]);
+    // 预览帧源（RGBA_8888 + GPU_SAMPLED_IMAGE 用途）；window 交给引擎挂会话输出。
+    // 多源：slot 0=逻辑主摄 / 1=超广角直连 / 2=长焦直连 —— 会话常驻三路输出，
+    // 跨带切换 repeating 请求即可换源（不重建会话，纹理永不失效 → 无黑帧闪烁）。
+    bool makePreviewSource(int slot, int32_t w, int32_t h);
+    ANativeWindow* previewWindow(int slot);
+    int32_t previewW(int slot) const;
+    int32_t previewH(int slot) const;
+    // 每帧调用：acquireLatestImage → 导入/绑定纹理；有新帧返回 true。
+    // 同时填充 64-bin RGB 直方图（PRIV 流暂空，见 M7.1）。
+    bool acquirePreview(int slot, int32_t histR[64], int32_t histG[64], int32_t histB[64]);
 
     // 文字图集（attach 后调用一次；bakedPx 为烘焙像素高）
     bool bakeFont(float bakedPx);
@@ -66,7 +68,7 @@ public:
 
     void beginFrame(const Rgba& c);   // viewport + 清屏
     void clear(const Rgba& c);
-    void drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot);
+    void drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot = 0);
     // 圆角矩形：填充 + 描边（borderA.a<=0 跳过描边）
     void roundedRect(float cx, float cy, float w, float h, float radius,
                      const Rgba& fill, const Rgba& border, float borderW);
@@ -78,21 +80,31 @@ public:
     void swap();
 
 private:
-    struct Impl {
-        EGLDisplay dpy = EGL_NO_DISPLAY;
-        EGLSurface surf = EGL_NO_SURFACE;
-        EGLContext ctx = EGL_NO_CONTEXT;
-
+    static constexpr int kSrcN = 3;      // 预览源数：0=逻辑 / 1=uw / 2=tele
+    struct Source {
+        Gl* gl = nullptr;                // 反向指针（listener 回调定位）
         AImageReader* reader = nullptr;
-        ANativeWindow* previewWindow = nullptr;
-        int32_t pvW = 0, pvH = 0;
+        ANativeWindow* win = nullptr;
+        int32_t w = 0, h = 0;
         int64_t frameNo = -1;
+        bool logged = false;
         struct PvTex {
             AHardwareBuffer* ahb = nullptr;
             EGLImageKHR eglImg = EGL_NO_IMAGE_KHR;
             uint32_t tex = 0;
         };
-        PvTex pv[6] = {};
+        PvTex pv[4] = {};
+        uint32_t lastTex = 0;
+        AImageReader_ImageListener listener = {};
+        std::mutex pendM;
+        AImage* pending = nullptr;
+    };
+    Source src_[kSrcN];
+
+    struct Impl {
+        EGLDisplay dpy = EGL_NO_DISPLAY;
+        EGLSurface surf = EGL_NO_SURFACE;
+        EGLContext ctx = EGL_NO_CONTEXT;
 
         GLuint progPreview = 0, progRect = 0, progText = 0, progSolid = 0;
         struct U {
@@ -110,20 +122,10 @@ private:
         float ascentPx = 0;
         GLuint lastTex = 0;
         bool fontOk = false;
-
-        // 本机（17 Pro/HyperOS）实测：不在 listener 回调里 acquire 的话，
-        // 轮询 AImageReader_acquireLatestImage 恒返回 NO_BUFFER_AVAILABLE（HAL 侧却在正常产帧）。
-        // 因此回调线程取最新帧存入 pending，glue 线程每帧取走并导入 EGL。
-        bool rotLogged = false;              // 定向只打一次日志，避免每帧刷屏
-
-        AImageReader_ImageListener listener = {};
-        int listenerHits = 0;
-        std::mutex pendM;
-        AImage* pending = nullptr;
     };
     Impl impl_;
     static void onPreviewAvailable(void* ctx, AImageReader* reader);
-    void importPreviewImage(AImage* img);
+    void importPreviewImage(Source& s, AImage* img);
     ANativeWindow* win_ = nullptr;
     int32_t winW_ = 0, winH_ = 0;
     float previewZoom_ = 1.f;            // 预览数字变焦（setPreviewZoom；默认 1 = 不裁切）

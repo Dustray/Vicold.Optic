@@ -31,27 +31,26 @@ FrameResult parseResult(const ACameraMetadata* result) {
 
 CaptureSession::~CaptureSession() { close(); }
 
-bool CaptureSession::create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs,
-                            const std::string& physicalId) {
+bool CaptureSession::create(ACameraDevice* dev, const std::vector<OutDesc>& outputs) {
     std::lock_guard<std::mutex> lock(mutex_);
     closeLocked();
     device_ = dev;
-    physicalId_ = physicalId;
     if (!dev || outputs.empty()) return false;
 
     if (ACaptureSessionOutputContainer_create(&container_) != ACAMERA_OK) return false;
-    for (size_t i = 0; i < outputs.size(); ++i) {
-        ANativeWindow* w = outputs[i];
+    for (const OutDesc& od : outputs) {
+        if (!od.win) continue;
         ACaptureSessionOutput* out = nullptr;
-        // 第一个输出（预览）在物理直连模式下绑定到指定物理摄像头，绕过逻辑多摄融合管线。
-        // 其余输出（如 RAW）保持逻辑输出（物理模式下列表仅含预览，不会走到这里）。
-        if (i == 0 && !physicalId_.empty()) {
-            if (ACaptureSessionPhysicalOutput_create(w, physicalId_.c_str(), &out) != ACAMERA_OK || !out) {
-                LOGE("physical session output create failed (phys=%s)", physicalId_.c_str());
+        if (od.physId) {
+            // 物理直连输出：绑定到指定物理摄像头，绕过逻辑多摄融合管线
+            //（本机 uw/tele 融合管线损坏，跨带也无需重配会话）
+            if (ACaptureSessionPhysicalOutput_create(od.win, od.physId, &out) != ACAMERA_OK ||
+                !out) {
+                LOGE("physical session output create failed (phys=%s)", od.physId);
                 return false;
             }
         } else {
-            if (ACaptureSessionOutput_create(w, &out) != ACAMERA_OK || !out) {
+            if (ACaptureSessionOutput_create(od.win, &out) != ACAMERA_OK || !out) {
                 LOGE("session output create failed");
                 return false;
             }
@@ -74,7 +73,7 @@ bool CaptureSession::create(ACameraDevice* dev, const std::vector<ANativeWindow*
 
     capCbs_ = {this, nullptr, nullptr, &CaptureSession::onCaptureCompleted,
                &CaptureSession::onCaptureFailed, nullptr, nullptr, nullptr};
-    LOGI("capture session created (%zu outputs)", outputs.size());
+    LOGI("capture session created (%zu outputs)", outputs_.size());
     return true;
 }
 
@@ -89,10 +88,11 @@ void CaptureSession::closeLocked() {
         ACameraCaptureSession_close(session_);
         session_ = nullptr;
     }
-    if (repeating_) { ACaptureRequest_free(repeating_); repeating_ = nullptr; }
-    for (auto* t : repeatingTgts_) ACameraOutputTarget_free(t);
-    repeatingTgts_.clear();
-    repeatingWins_.clear();
+    for (auto& [sig, b] : bands_) {
+        if (b.req) ACaptureRequest_free(b.req);
+        for (auto* t : b.tgts) ACameraOutputTarget_free(t);
+    }
+    bands_.clear();
     if (onceReq_) { ACaptureRequest_free(onceReq_); onceReq_ = nullptr; }
     for (auto* t : onceTgts_) ACameraOutputTarget_free(t);
     onceTgts_.clear();
@@ -104,32 +104,36 @@ void CaptureSession::closeLocked() {
     }
 }
 
-bool CaptureSession::setRepeating(const std::vector<ANativeWindow*>& targets,
-                                  const CaptureSettings& s, float physZoom) {
+bool CaptureSession::setRepeating(const std::string& band, const std::vector<ANativeWindow*>& targets,
+                                  const CaptureSettings& s, const std::string& physId,
+                                  float physZoom) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!session_ || targets.empty()) return false;
+    if (!session_ || targets.empty() || band.empty()) return false;
 
-    if (targets != repeatingWins_ || !repeating_) {
-        // 目标集变化 ⇒ 重建请求（NDK 无 removeTarget）
-        if (repeating_) { ACaptureRequest_free(repeating_); repeating_ = nullptr; }
-        for (auto* t : repeatingTgts_) ACameraOutputTarget_free(t);
-        repeatingTgts_.clear();
-        if (!physicalId_.empty()) {
+    BandReq& b = bands_[band];
+    if (targets != b.wins || !b.req) {
+        // 目标集变化（或首次）⇒ 重建该 band 请求（NDK 无 removeTarget）
+        if (b.req) { ACaptureRequest_free(b.req); b.req = nullptr; }
+        for (auto* t : b.tgts) ACameraOutputTarget_free(t);
+        b.tgts.clear();
+        b.physId = physId;
+        if (!physId.empty()) {
             // 直连物理摄像头：用 withPhysicalIds 建请求，使 HAL 直接交付该物理镜头画面，
-            // 不进入逻辑多摄融合（本机超广角融合管线已损坏）。
+            // 不进入逻辑多摄融合（本机 uw/tele 融合管线已损坏）。
             ACameraIdList plist{};
-            const char* pid = physicalId_.c_str();
+            const char* pid = physId.c_str();
             plist.numCameras = 1;
             plist.cameraIds = &pid;
-            if (ACameraDevice_createCaptureRequest_withPhysicalIds(device_, TEMPLATE_PREVIEW, &plist,
-                                                                  &repeating_) != ACAMERA_OK ||
-                !repeating_) {
-                LOGE("createCaptureRequest_withPhysicalIds failed (phys=%s)", physicalId_.c_str());
+            if (ACameraDevice_createCaptureRequest_withPhysicalIds(device_, TEMPLATE_PREVIEW,
+                                                                   &plist, &b.req) != ACAMERA_OK ||
+                !b.req) {
+                LOGE("createCaptureRequest_withPhysicalIds failed (band=%s phys=%s)", band.c_str(),
+                     physId.c_str());
                 return false;
             }
         } else {
-            if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &repeating_) != ACAMERA_OK) {
-                LOGE("createCaptureRequest(repeating) failed");
+            if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &b.req) != ACAMERA_OK) {
+                LOGE("createCaptureRequest(repeating) failed (band=%s)", band.c_str());
                 return false;
             }
         }
@@ -139,18 +143,18 @@ bool CaptureSession::setRepeating(const std::vector<ANativeWindow*>& targets,
                 LOGE("output target create failed");
                 return false;
             }
-            repeatingTgts_.push_back(t);
-            ACaptureRequest_addTarget(repeating_, t);
+            b.tgts.push_back(t);
+            ACaptureRequest_addTarget(b.req, t);
         }
-        repeatingWins_ = targets;
+        b.wins = targets;
     }
 
-    applySettings(repeating_, s, !physicalId_.empty(), physZoom);
+    applySettings(b.req, s, !b.physId.empty(), physZoom);
     int seqId = 0;
-    ACaptureRequest* reqArr[1] = {repeating_};
+    ACaptureRequest* reqArr[1] = {b.req};
     if (ACameraCaptureSession_setRepeatingRequest(session_, &capCbs_, 1, reqArr, &seqId) !=
         ACAMERA_OK) {
-        LOGE("setRepeatingRequest failed");
+        LOGE("setRepeatingRequest failed (band=%s)", band.c_str());
         return false;
     }
     return true;

@@ -4,6 +4,9 @@
 //  - 目标集（ANativeWindow 集合）变化 ⇒ 重建 repeating 请求（NDK 无 removeTarget）
 //  - 设置变化 ⇒ 复用请求改 entry 后重发 repeating
 //  - 单拍串行（同一时刻至多一个 captureOnce 在途，引擎保证节奏）
+// 多带（M-MC）：会话常驻多路输出（逻辑预览 + uw/tele 物理直连 + RAW），
+// repeating 请求按 band 签名缓存（"L"/"P:3"/"P:4"）—— 跨带切换只换 repeating
+// 请求，不重配会话（endConfigure ~290ms 冻结由此消除）。
 // 线程模型：create/setRepeating/captureOnce 仅由引擎相机线程调用；
 // 回调来自 binder 线程，只触达 onFrameResult/onFrameFailed。
 
@@ -14,7 +17,9 @@
 #include <camera/NdkCaptureRequest.h>
 
 #include <functional>
+#include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/capture/CaptureSettings.h"
@@ -36,12 +41,19 @@ public:
     CaptureSession(const CaptureSession&) = delete;
     CaptureSession& operator=(const CaptureSession&) = delete;
 
-    bool create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs,
-                const std::string& physicalId = {});
+    // 会话输出描述：physId 非空 = ACaptureSessionPhysicalOutput（直连该物理摄像头）
+    struct OutDesc {
+        ANativeWindow* win = nullptr;
+        const char* physId = nullptr;   // nullptr = 逻辑输出
+    };
+    // 一次性配置全部输出（跨带切换不再走这里 —— 那只换 repeating 请求）
+    bool create(ACameraDevice* dev, const std::vector<OutDesc>& outputs);
     void close();
 
-    bool setRepeating(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s,
-                      float physZoom = 0.f);
+    // 按 band 签名切换 repeating：请求按签名缓存复用（设置变化只更新 entry）。
+    // physId 非空 = 该带为物理直连（withPhysicalIds 建请求，skipZoom + 可选相对变焦）。
+    bool setRepeating(const std::string& band, const std::vector<ANativeWindow*>& targets,
+                      const CaptureSettings& s, const std::string& physId, float physZoom = 0.f);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
     std::function<void(const FrameResult&)> onFrameResult;
@@ -65,16 +77,19 @@ private:
                        float physZoom = 0.f) const;
     void closeLocked(); // mutex_ 已持有时使用（create 复用）
 
+    // 单个 band 的 repeating 请求（按签名缓存）
+    struct BandReq {
+        ACaptureRequest* req = nullptr;
+        std::vector<ANativeWindow*> wins;
+        std::vector<ACameraOutputTarget*> tgts;
+        std::string physId;             // 非空 = withPhysicalIds 请求
+    };
+
     ACameraDevice* device_ = nullptr;
     ACameraCaptureSession* session_ = nullptr;
     ACaptureSessionOutputContainer* container_ = nullptr;
     std::vector<ACaptureSessionOutput*> outputs_;
-    std::string physicalId_;   // 非空 = 预览输出直连该物理摄像头（绕过逻辑多摄融合）
-
-    // repeating：目标集不变时复用请求，仅更新 entry
-    ACaptureRequest* repeating_ = nullptr;
-    std::vector<ANativeWindow*> repeatingWins_;
-    std::vector<ACameraOutputTarget*> repeatingTgts_;
+    std::map<std::string, BandReq> bands_;
 
     // 单拍：串行复用一个请求
     ACaptureRequest* onceReq_ = nullptr;

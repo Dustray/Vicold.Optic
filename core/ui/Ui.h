@@ -28,9 +28,13 @@ public:
     bool attach(ANativeWindow* win);     // EGL + 字体（幂等）
     void detach();
     bool attached() const { return gl_.ready(); }
-    ANativeWindow* previewWindow() { return gl_.previewWindow(); }
-    int32_t previewW() { return gl_.previewW(); }
-    int32_t previewH() { return gl_.previewH(); }
+    // slot：0=逻辑主摄 / 1=超广角直连 / 2=长焦直连（多流常驻会话，见 CameraEngine）
+    ANativeWindow* previewWindow(int slot) { return gl_.previewWindow(slot); }
+    // 引擎切带通知：target slot 变更后，frame() 在新源首帧到达时才切换显示（旧画面保持，
+    // 无黑帧）；切换前旧画面仍被 crop 实时补差，FOV 持续跟手。
+    void setPreviewSlot(int slot) { previewTarget_.store(slot, std::memory_order_release); }
+    int32_t previewW(int slot = 0) { return gl_.previewW(slot); }
+    int32_t previewH(int slot = 0) { return gl_.previewH(slot); }
 
     void setStaticText(int32_t rawW, int32_t rawH) { rawW_ = rawW; rawH_ = rawH; }
     void setUvRot(int rot) { uvRotOverride_ = rot; }
@@ -140,6 +144,11 @@ private:
     int savedCount_ = 4;                                // toast 文案 n/4
     std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
     std::atomic<int> shotUsed_{0}, shotTotal_{0};
+
+    // 预览源切换（多流常驻会话）：target = 引擎要求的带；active = 实际显示源。
+    // 两者在 target 首帧到达时同步（frame()），期间显示源保持有效画面。
+    std::atomic<int> previewTarget_{0};
+    int previewActive_ = 0;
 
     // 直方图
     int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};

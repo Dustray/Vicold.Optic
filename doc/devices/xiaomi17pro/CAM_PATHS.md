@@ -44,28 +44,47 @@
 - 诊断覆盖键（controls.txt）：`tele_phys=N`、`phys_min=N`、`uw_phys=N`、`uw=0/1`、`cam=N`。
 - 物理直连模式下 RAW 拍摄（快门/ZSL/shot_raw）被拒（该物理镜头无 RAW 流），toast 如实提示。
 
-## 4. 会话重建与退役墓地（防 UAF）
+## 4. 多流常驻会话（现行实现，2026-09-29 晚）
 
-- 会话签名（`L` / `P:3` / `P:4` + `+R`）变化 → `rebuildSession()`：旧会话 `close()` 后进
-  **墓地**（`retired_`），延迟 1.5s 析构。立即析构会触发框架回调线程
-  （`C2N-dev-looper`）UAF：`FORTIFY: pthread_mutex_lock called on a destroyed mutex` → SIGABRT。
-- 墓地由 run 循环每轮 `reapRetired()` 回收。
-- 预览看门狗：>1.2s 无 result → 重发 setRepeating（最多 12 次）；耗尽后**整链路重连**
-  自愈，不再永久黑屏。
+跨带**不再重建会话**。启动时一次 `ACameraManager_createCaptureSession` 配齐全部输出：
+
+- 3 路预览 `ACaptureSessionPhysicalOutput`：slot0 = 逻辑 L、slot1 = 物理 3（uw）、slot2 = 物理 4（tele）；
+- 可选第 4 路：RAW 逻辑输出（与预览同一会话）。
+- **HAL 实测接受该 4 输出组合**（pandora / CamX，30fps 下无流饥饿）。
+
+跨带切换 = `ACameraDevice_createCaptureRequest_withPhysicalIds` 换 repeating 请求
+（请求按签名缓存于 `CaptureSession::reqCache_`，不重复建请求）+ GL 侧 `setPreviewSlot`
+切纹理源（新源首帧到达才切显示，旧画面保持 → 无黑帧）。纹理永不失效。
+
+- 会话只在启动 / 设备重连 / 致命错误时重建；重建仍走退役墓地（防 UAF，见下）。
+- HAL 拒绝多流组合时自动降级单流重建路径（`multiStreamFailed_`）。
+- RAW 环只在逻辑带出帧：repeating 为 `P:3`/`P:4` 时 RAW 流暂停（帧率计冻结属正常），
+  回逻辑带自动恢复；拍摄键在物理带仍被拒（该镜头无 RAW 流）。
+- 预览看门狗与墓地机制保留：>1.2s 无 result → 重发 setRepeating；重建后旧会话延迟 1.5s 析构
+  （立即析构会触发 `C2N-dev-looper` UAF → SIGABRT）。
 
 ## 5. 真机验证记录（2026-09-29）
 
-- 全段阶梯（2.0→L、3.0→P:4、5.0→P:4、10.0→P:4、0.7→P:3、回 2.0→L）：**全程 0 断流**
-  （修复前 5.0x 断流 5 次、10.0x 持续死锁、0.7x 每 1.2s 断流）。
-- 压力：10 次快速跨带拖动（12 次会话重建）→ 0 断流 0 崩溃，29.3fps，RAW 环持续。
-- HAL 错误仅出现在会话重建瞬间（各 ~7 条，良性瞬态）；稳定运行期 0 错误。
-- FOV 证据：`img/uw_on.png`（0.7x 超广角）vs `img/uw_shot.png`（1.0x 主摄）；
-  导轨 0.7 状态：`img/uw_rail.png`（读数 16mm）。
+多流常驻会话（controls.txt 推 zoom，与触摸同一条 commitSession 路径）：
+
+- 冷启动：4 输出会话被 HAL 接受，30.1fps，gaps=0（max 46ms），RAW 30.6fps。
+- **14 次快速跨带往返（L↔P:3↔P:4）：0 会话重建**，max gap 恒定 118ms
+  （旧实现每次重建 ~285ms + 黑帧闪烁）；其中 P:4↔P:3 物理直连互切 **0 gap**。
+- RAW 拍摄：逻辑带 `zsl_shutter=1` → ZSL 4 帧、4 张 DNG（各 25.7MB）正常落盘；
+  物理带 RAW 流按设计暂停、回逻辑带自动恢复（实测 total 冻结→恢复）。
+- 预览渲染：slot 切换无黑帧，UI/AF/HUD 正常（`build/screen2.png`）。
+
+单流重建时期的历史结论（仍适用于降级路径）：
+
+- 全段阶梯 0 断流（修复前 5.0x 断流 5 次、10.0x 持续死锁、0.7x 每 1.2s 断流）。
+- 带内实时重发 0 丢帧（gaps=0, max 47ms）；卡顿全部来自跨带会话重建（~285ms 冻结）。
 
 ## 6. 已知限制 / 遗留
 
 - 物理直连下 result 元数据 `zoomRatio` 报**相对值**（10x 显示 3.80）；用户倍率以导轨/HUD 为准。
-- 物理直连模式无 RAW（能力限制，非缺陷）。
+- 物理直连带无 RAW 流（能力限制）：RAW 环暂停、拍摄被拒；仅逻辑带可拍 RAW。
+- 逻辑↔物理带切换仍有 ~118ms 的 HAL 结果间隔（传感器模式切换固有，约 3-4 帧），
+  GL 侧以旧画面保持 + 首帧到达才切显示兜底，无黑帧；物理↔物理互切无间隔。
 
 ## 7. 平滑拖拽变焦（2026-09-29）
 
@@ -88,6 +107,6 @@
 - onUp 用松手位置重算终值（快速甩动时输入管线丢弃末尾 MOVE，实测旧逻辑停在 8.76 而非 10.0）。
 - 带间滞回：uw 退出 z≥1.03、tele 退出 z≥teleMin−0.08（进带阈值不变），
   防导轨在边界微动触发重建风暴（实测边界摆动 3 次重建 → 0）。
-- 下拉越带（tele→main、main→uw）无法用裁切模拟变宽，重建仍在拖动途中发生
-  （每次 1~3 个帧断裂，~300ms）；彻底消除需多读出流方案（会话常驻双预览流，
-  GL 切纹理源），列为后续优化。
+- 下拉越带（tele→main、main→uw）无法用裁切模拟变宽，旧单流实现中重建发生在拖动途中
+  （每次 1~3 个帧断裂，~300ms）—— **已由第 4 节多流常驻会话彻底消除**（跨带 0 重建，
+  仅剩 ~118ms HAL 切换间隔，无黑帧）。

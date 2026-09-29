@@ -234,25 +234,38 @@ bool Gl::attach(ANativeWindow* win) {
 
 void Gl::detach() {
     if (impl_.dpy != EGL_NO_DISPLAY) {
-        {
-            std::lock_guard<std::mutex> l(impl_.pendM);
-            if (impl_.pending) AImage_delete(impl_.pending);
-            impl_.pending = nullptr;
-        }
-        for (auto& t : impl_.pv) {
-            if (t.tex) glDeleteTextures(1, &t.tex);
-            if (t.eglImg != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(impl_.dpy, t.eglImg);
-            if (t.ahb) AHardwareBuffer_release(t.ahb);
+        for (int i = 0; i < kSrcN; ++i) {
+            Source& s = src_[i];
+            {
+                std::lock_guard<std::mutex> l(s.pendM);
+                if (s.pending) AImage_delete(s.pending);
+                s.pending = nullptr;
+            }
+            for (auto& t : s.pv) {
+                if (t.tex) glDeleteTextures(1, &t.tex);
+                if (t.eglImg != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(impl_.dpy, t.eglImg);
+                if (t.ahb) AHardwareBuffer_release(t.ahb);
+            }
+            if (s.reader) {
+                AImageReader_setImageListener(s.reader, nullptr);
+                AImageReader_delete(s.reader);
+            }
+            // Source 含 std::mutex 不可整体赋值，逐字段复位
+            s.reader = nullptr;
+            s.win = nullptr;
+            s.w = s.h = 0;
+            s.frameNo = -1;
+            s.logged = false;
+            for (auto& t : s.pv) t = {};
+            s.lastTex = 0;
+            s.listener = {};
+            s.pending = nullptr;
         }
         if (impl_.atlasTex) glDeleteTextures(1, &impl_.atlasTex);
         if (impl_.progPreview) glDeleteProgram(impl_.progPreview);
         if (impl_.progRect) glDeleteProgram(impl_.progRect);
         if (impl_.progText) glDeleteProgram(impl_.progText);
         if (impl_.progSolid) glDeleteProgram(impl_.progSolid);
-        if (impl_.reader) {
-            AImageReader_setImageListener(impl_.reader, nullptr);
-            AImageReader_delete(impl_.reader);
-        }
         eglMakeCurrent(impl_.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (impl_.surf != EGL_NO_SURFACE) eglDestroySurface(impl_.dpy, impl_.surf);
         if (impl_.ctx != EGL_NO_CONTEXT) eglDestroyContext(impl_.dpy, impl_.ctx);
@@ -262,11 +275,6 @@ void Gl::detach() {
     impl_.dpy = EGL_NO_DISPLAY;
     impl_.surf = EGL_NO_SURFACE;
     impl_.ctx = EGL_NO_CONTEXT;
-    impl_.reader = nullptr;
-    impl_.previewWindow = nullptr;
-    impl_.pvW = impl_.pvH = 0;
-    impl_.frameNo = -1;
-    for (auto& t : impl_.pv) t = {};
     impl_.progPreview = impl_.progRect = impl_.progText = impl_.progSolid = 0;
     impl_.uPv = {};
     impl_.uRect = {};
@@ -280,8 +288,6 @@ void Gl::detach() {
     impl_.ascentPx = 0;
     impl_.lastTex = 0;
     impl_.fontOk = false;
-    impl_.listener = {};
-    impl_.listenerHits = 0;
     win_ = nullptr;
 }
 
@@ -289,73 +295,78 @@ bool Gl::ready() const { return impl_.dpy != EGL_NO_DISPLAY && impl_.surf != EGL
 int32_t Gl::width() const { return winW_; }
 int32_t Gl::height() const { return winH_; }
 
-bool Gl::makePreviewSource(int32_t w, int32_t h) {
+bool Gl::makePreviewSource(int slot, int32_t w, int32_t h) {
     if (!ready()) return false;
-    if (impl_.reader) return true;
-    // 17 Pro 实测：YUV_420_888 ImageReader 流 HAL 侧持续产帧（dumpsys Frames produced 正常增长）
-    // 但 consumer 侧恒 NO_BUFFER_AVAILABLE（伴随厂商 HAL 的 FrameInsert/undistort 报错），
-    // 推断小米 HAL 劫持了 YUV ImageReader 通路；RGBA_8888 同样不供帧（不在保证格式表内）。
-    // 改走标准零拷贝路径：PRIV(0x22) + GPU_SAMPLED_IMAGE → EGLImage → samplerExternalOES。
-    // 代价：PRIV 无法 CPU 读，直方图暂空（后续走 GL 降采样统计，见 M7.1）。
+    if (slot < 0 || slot >= kSrcN) return false;
+    Source& s = src_[slot];
+    if (s.reader) return true;
+    // 17 Pro 实测：YUV/RGBA ImageReader 通路被小米 HAL 劫持不供帧，
+    // 走标准零拷贝路径：PRIV(0x22) + GPU_SAMPLED_IMAGE → EGLImage → samplerExternalOES。
+    // maxImages=3（acquireLatest 语义只需浅队列）；三路源 ×3 buffer 控制内存。
     uint64_t usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
-    if (AImageReader_newWithUsage(w, h, AIMAGE_FORMAT_PRIVATE, usage, 4, &impl_.reader) !=
+    if (AImageReader_newWithUsage(w, h, AIMAGE_FORMAT_PRIVATE, usage, 3, &s.reader) !=
             AMEDIA_OK ||
-        !impl_.reader) {
-        LOGE("preview AImageReader_new failed");
+        !s.reader) {
+        LOGE("preview AImageReader_new failed (slot=%d)", slot);
         return false;
     }
 
     // 关键：本机实测必须在回调线程里 acquire，否则轮询 acquire 恒 NO_BUFFER_AVAILABLE
-    impl_.listenerHits = 0;
-    impl_.listener = {this, &Gl::onPreviewAvailable};
-    if (AImageReader_setImageListener(impl_.reader, &impl_.listener) != AMEDIA_OK) {
-        LOGE("preview setImageListener failed");
+    s.gl = this;
+    s.listener = {&s, &Gl::onPreviewAvailable};
+    if (AImageReader_setImageListener(s.reader, &s.listener) != AMEDIA_OK) {
+        LOGE("preview setImageListener failed (slot=%d)", slot);
         return false;
     }
-    if (AImageReader_getWindow(impl_.reader, &impl_.previewWindow) != AMEDIA_OK ||
-        !impl_.previewWindow) {
-        LOGE("preview reader window failed");
+    if (AImageReader_getWindow(s.reader, &s.win) != AMEDIA_OK || !s.win) {
+        LOGE("preview reader window failed (slot=%d)", slot);
         return false;
     }
-    impl_.pvW = w;
-    impl_.pvH = h;
-    LOGI("preview source ready: %dx%d PRIV(GPU)", w, h);
+    s.w = w;
+    s.h = h;
+    LOGI("preview source ready: slot=%d %dx%d PRIV(GPU)", slot, w, h);
     return true;
 }
 
-ANativeWindow* Gl::previewWindow() { return impl_.previewWindow; }
-int32_t Gl::previewW() { return impl_.pvW; }
-int32_t Gl::previewH() { return impl_.pvH; }
+ANativeWindow* Gl::previewWindow(int slot) {
+    if (slot < 0 || slot >= kSrcN) return nullptr;
+    return src_[slot].win;
+}
+int32_t Gl::previewW(int slot) const {
+    return (slot >= 0 && slot < kSrcN) ? src_[slot].w : 0;
+}
+int32_t Gl::previewH(int slot) const {
+    return (slot >= 0 && slot < kSrcN) ? src_[slot].h : 0;
+}
 
 void Gl::onPreviewAvailable(void* ctx, AImageReader* reader) {
-    auto* self = static_cast<Gl*>(ctx);
-    if (!self || !reader) return;
-    if (++self->impl_.listenerHits == 1) LOGI("preview frames flowing");
+    auto* s = static_cast<Source*>(ctx);
+    if (!s || !reader || !s->gl) return;
 
     // 回调线程取最新帧；旧 pending 直接丢弃（等价 acquireLatest 语义）
     AImage* img = nullptr;
     if (AImageReader_acquireLatestImage(reader, &img) != AMEDIA_OK || !img) return;
-    std::lock_guard<std::mutex> l(self->impl_.pendM);
-    if (self->impl_.pending) AImage_delete(self->impl_.pending);
-    self->impl_.pending = img;
+    std::lock_guard<std::mutex> l(s->pendM);
+    if (s->pending) AImage_delete(s->pending);
+    s->pending = img;
 }
 
-void Gl::importPreviewImage(AImage* img) {
+void Gl::importPreviewImage(Source& s, AImage* img) {
     AHardwareBuffer* ahb = nullptr;
     if (AImage_getHardwareBuffer(img, &ahb) != AMEDIA_OK || !ahb) return;
 
     // 缓存：同一 AHardwareBuffer 循环复用（maxImages=3）
-    for (auto& t : impl_.pv) {
+    for (auto& t : s.pv) {
         if (t.ahb == ahb) {
             if (t.tex) glBindTexture(GL_TEXTURE_EXTERNAL_OES, t.tex);
-            impl_.lastTex = t.tex;
+            s.lastTex = t.tex;
             return;
         }
     }
-    Impl::PvTex* slot = nullptr;
-    for (auto& t : impl_.pv)
+    Source::PvTex* slot = nullptr;
+    for (auto& t : s.pv)
         if (!t.ahb) { slot = &t; break; }
-    if (!slot) slot = &impl_.pv[0];
+    if (!slot) slot = &s.pv[0];
     if (slot->tex) glDeleteTextures(1, &slot->tex);
     if (slot->eglImg != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(impl_.dpy, slot->eglImg);
     if (slot->ahb) AHardwareBuffer_release(slot->ahb);
@@ -385,22 +396,24 @@ void Gl::importPreviewImage(AImage* img) {
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, slot->eglImg);
     slot->ahb = ahb;
-    impl_.lastTex = slot->tex;
+    s.lastTex = slot->tex;
 }
 
-int64_t Gl::acquirePreview(int32_t histR[64], int32_t histG[64], int32_t histB[64]) {
-    if (!ready() || !impl_.reader) return impl_.frameNo;
+bool Gl::acquirePreview(int slot, int32_t histR[64], int32_t histG[64], int32_t histB[64]) {
+    if (!ready() || slot < 0 || slot >= kSrcN) return false;
+    Source& s = src_[slot];
+    if (!s.reader) return false;
 
     // 取回调线程攒下的最新帧；无新帧时保持上一帧纹理与直方图不动
     AImage* img = nullptr;
     {
-        std::lock_guard<std::mutex> l(impl_.pendM);
-        img = impl_.pending;
-        impl_.pending = nullptr;
+        std::lock_guard<std::mutex> l(s.pendM);
+        img = s.pending;
+        s.pending = nullptr;
     }
-    if (!img) return impl_.frameNo;
+    if (!img) return false;
 
-    importPreviewImage(img);
+    importPreviewImage(s, img);
 
     std::memset(histR, 0, 64 * sizeof(int32_t));
     std::memset(histG, 0, 64 * sizeof(int32_t));
@@ -419,12 +432,12 @@ int64_t Gl::acquirePreview(int32_t histR[64], int32_t histG[64], int32_t histB[6
         AImage_getPlanePixelStride(img, 0, &ypx);
         AImage_getPlanePixelStride(img, 1, &upx);
         AImage_getPlanePixelStride(img, 2, &vpx);
-        int px = std::max(1, impl_.pvW / 16), py = std::max(1, impl_.pvH / 16);
-        for (int32_t y = 0; y < impl_.pvH; y += py) {
+        int px = std::max(1, s.w / 16), py = std::max(1, s.h / 16);
+        for (int32_t y = 0; y < s.h; y += py) {
             const uint8_t* yrow = yd + size_t(y) * ys;
             const uint8_t* urow = ud + size_t(y / 2) * us;
             const uint8_t* vrow = vd + size_t(y / 2) * vs;
-            for (int32_t x = 0; x < impl_.pvW; x += px) {
+            for (int32_t x = 0; x < s.w; x += px) {
                 int Y = yrow[size_t(x) * ypx];
                 int U = urow[size_t(x / 2) * upx] - 128;
                 int V = vrow[size_t(x / 2) * vpx] - 128;
@@ -439,7 +452,8 @@ int64_t Gl::acquirePreview(int32_t histR[64], int32_t histG[64], int32_t histB[6
     }
 
     AImage_delete(img);
-    return ++impl_.frameNo;
+    ++s.frameNo;
+    return true;
 }
 
 bool Gl::bakeFont(float bakedPx) {
@@ -608,12 +622,15 @@ void Gl::clear(const Rgba& c) {
 
 // uvRot < 0 = 自动：源/目标同为横（或同为竖）就不转，否则转 90°。
 // 这是纯几何判断，只保证画面不侧躺；若整机是反的（差 180°），用 controls.txt 的 uvrot=2 覆盖。
-void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot) {
-    GLuint tex = impl_.lastTex;
+// srcSlot：预览源（0=逻辑 / 1=uw / 2=tele）——多流常驻会话下纹理永不失效。
+void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot) {
+    if (srcSlot < 0 || srcSlot >= kSrcN) return;
+    Source& s = src_[srcSlot];
+    GLuint tex = s.lastTex;
     if (!tex) return;
 
-    if (uvRot < 0 && impl_.pvW > 0 && impl_.pvH > 0 && w > 0 && h > 0) {
-        bool srcLand = impl_.pvW >= impl_.pvH;
+    if (uvRot < 0 && s.w > 0 && s.h > 0 && w > 0 && h > 0) {
+        bool srcLand = s.w >= s.h;
         bool dstLand = w >= h;
         uvRot = (srcLand == dstLand) ? 0 : 1;
     }
@@ -622,17 +639,16 @@ void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot) {
     // cover 裁切：源与目标的"有效宽高比"不等时，按长边方向的中心子矩形取样，避免拉伸变形。
     // 旋转 90/270 后画面有效宽高比是 pvH/pvW。
     float cx = 1.f, cy = 1.f;
-    if (impl_.pvW > 0 && impl_.pvH > 0 && w > 0 && h > 0) {
-        float sa = (uvRot & 1) ? float(impl_.pvH) / float(impl_.pvW)
-                               : float(impl_.pvW) / float(impl_.pvH);
+    if (s.w > 0 && s.h > 0 && w > 0 && h > 0) {
+        float sa = (uvRot & 1) ? float(s.h) / float(s.w) : float(s.w) / float(s.h);
         float da = float(w) / float(h);
         if (sa > da) cx = da / sa;
         else cy = sa / da;
     }
-    if (!impl_.rotLogged) {
-        impl_.rotLogged = true;
-        LOGI("preview orient: src=%dx%d dst=%dx%d rot=%d crop=(%.3f,%.3f)",
-             impl_.pvW, impl_.pvH, w, h, uvRot & 3, cx, cy);
+    if (!s.logged) {
+        s.logged = true;
+        LOGI("preview orient: slot=%d src=%dx%d dst=%dx%d rot=%d crop=(%.3f,%.3f)",
+             srcSlot, s.w, s.h, w, h, uvRot & 3, cx, cy);
     }
     // 数字变焦：与 cover 裁切同域（uCrop < 1 = 取中心子矩形 = 放大），等比缩小取样窗
     if (previewZoom_ > 1.f) {

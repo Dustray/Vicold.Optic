@@ -58,6 +58,9 @@ private:
     // 直连请求应写的相对数字变焦：长焦 = z/teleNativeZoom（0 = 不写，超广角恒原生 FOV）
     float physZoom() const;
     void refreshPhysIds();   // 按覆盖键（uw_phys/tele_phys/phys_min）+ 探测值刷新物理布局缓存
+    // band 签名："L"（逻辑主摄）/ "P:"+uwPhysId_（超广角直连）/ "P:"+telePhysId_（长焦直连）
+    std::vector<ANativeWindow*> bandTargets(const std::string& sig) const;  // 该带 repeating 目标
+    int slotFromSig(const std::string& sig) const;                          // 该带 GL 预览源槽位
     void pollControls();
     // 注意：必须复用同一实例（成员）。此前每轮新建局部 ControlFile，内容比对状态被重置，
     // 导致 controls.txt 全量重放 —— UI 刚设置的 zoom 会在 100ms 后被文件里的旧值盖回
@@ -66,7 +69,6 @@ private:
     void drainUiCmds();
     void triggerBurst();
     void applyControl(const std::string& k, const std::string& v, bool& changed);
-    std::vector<ANativeWindow*> sessionTargets() const;
     void onFrameResult(const FrameResult& r);
 
     CameraDevice cam_;
@@ -100,7 +102,13 @@ private:
     std::string telePhysId_;    // 当前生效的长焦物理 ID（forcedTelePhys_ > 自动探测）
     float teleMinZoom_ = 1e9f;  // 长焦直连起始倍率（默认 = teleNativeZoom，即恰在 SAT 切换点前绕开融合）
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连
-    std::string sessionSig_;          // 会话组成签名（L/P:cameraId +R），用于检测是否需重建
+    std::string sessionSig_;          // 当前 active band（"L"/"P:cameraId"，见 bandTargets）
+    // 多流常驻会话（M-MC）：逻辑 + uw + tele 三路预览输出一次 configure，跨带只切换
+    // repeating 请求（无 endConfigure ~290ms 冻结、纹理常驻无黑帧）。
+    // HAL 拒绝组合时降级单流（multiStreamFailed_ 记忆，跨带回退为会话重建）。
+    bool multiStream_ = false;
+    bool multiStreamFailed_ = false;
+    bool lastRawRing_ = false;        // 单流降级模式下检测 RAW 进出 repeating（需重建）
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问

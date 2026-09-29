@@ -95,7 +95,9 @@ bool Ui::attach(ANativeWindow* win) {
         }
     }
     if (pw <= 0 || ph <= 0) { pw = 1920; ph = 1440; }
-    gl_.makePreviewSource(pw, ph);
+    // 三路预览源一次建齐（0=逻辑 / 1=uw / 2=tele）：AImageReader 创建无 GL 依赖。
+    // 单流降级模式下 slot1/2 空闲（未挂会话不出帧，无开销）。
+    for (int i = 0; i < 3; ++i) gl_.makePreviewSource(i, pw, ph);
 
     // cover：等比铺满。横向溢出优先裁掉左侧摄像头避让区（80 设计 px 的留白），
     // 剩余再两侧均分——这样无论系统为挖孔保留多宽，快门都不会被裁；纵向溢出两侧均分。
@@ -537,7 +539,11 @@ int Ui::resolveUvRot() const {
 
 void Ui::frame() {
     if (!attached()) return;
-    gl_.acquirePreview(histR_, histG_, histB_);
+    // 取目标槽位的帧：新带首帧到达前返回 false，显示源保持旧画面（crop 继续补差，
+    // FOV 跟手）；到达后切换显示源 —— 多流常驻下纹理永不失效，无黑帧闪烁。
+    const int tgt = previewTarget_.load(std::memory_order_acquire);
+    const bool got = gl_.acquirePreview(tgt, histR_, histG_, histB_);
+    if (got && tgt != previewActive_) previewActive_ = tgt;
 
     gl_.beginFrame(kBg);
 
@@ -572,7 +578,7 @@ void Ui::frame() {
         gl_.setPreviewZoom(cropSmooth_);
     }
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
-                    int(dim(kPreviewH)), resolveUvRot());
+                    int(dim(kPreviewH)), resolveUvRot(), previewActive_);
     drawPreviewOverlay();
 
     // ---- 左侧：摄像头避让区（真机只留黑，虚线为设计标注不绘制）----

@@ -96,7 +96,9 @@ void CameraEngine::run(std::string dataDir) {
                 if (stallRetries_ < 12) {
                     LOGW("preview stall %lldms, re-issuing setRepeating (retry %d, zoom=%.2f)",
                          (long long)since, stallRetries_, settings_.zoomRatio);
-                    session_->setRepeating(sessionTargets(), settings_, physZoom());
+                    const std::string phys = activePhysId();
+                    session_->setRepeating(sessionSig_, bandTargets(sessionSig_), settings_, phys,
+                                           physZoom());
                     ++stallRetries_;
                     lastResultMs_ = nowMs();   // 冷却，避免 100ms 内重复重发
                 } else {
@@ -255,22 +257,31 @@ float CameraEngine::physZoom() const {
     return 0.f;
 }
 
-std::vector<ANativeWindow*> CameraEngine::sessionTargets() const {
-    std::vector<ANativeWindow*> outs;
-    if (ui_ && ui_->attached()) outs.push_back(ui_->previewWindow());
-    // 超广角/长焦物理直连时不含 RAW：RAW 流仅主摄支持（M0：后置 RAW 仅 1 条）
-    if (raw_ && raw_->ringMode() && !sessionIsPhysical_) outs.push_back(raw_->window());
-    return outs;
+std::vector<ANativeWindow*> CameraEngine::bandTargets(const std::string& sig) const {
+    std::vector<ANativeWindow*> t;
+    if (sig == "L") {
+        t.push_back(ui_->previewWindow(0));
+        if (raw_ && raw_->ringMode()) t.push_back(raw_->window());
+    } else if (!uwPhysId_.empty() && sig == "P:" + uwPhysId_) {
+        t.push_back(ui_->previewWindow(1));
+    } else {
+        t.push_back(ui_->previewWindow(2));
+    }
+    return t;
 }
 
+int CameraEngine::slotFromSig(const std::string& sig) const {
+    if (sig == "L") return 0;
+    if (!uwPhysId_.empty() && sig == "P:" + uwPhysId_) return 1;
+    return 2;
+}
+
+// 重建会话：优先多流常驻（一次 configure 全部带），HAL 拒绝组合则降级单流。
+// 多流模式下本函数只在启动/设备重连/致命错误时调用（跨带走 commitSession 换请求）。
 bool CameraEngine::rebuildSession() {
     if (!cam_.opened() || !ui_ || !ui_->attached()) return false;
 
     refreshPhysIds();
-    const std::string phys = activePhysId();
-    std::vector<ANativeWindow*> outs;
-    outs.push_back(ui_->previewWindow());
-    if (phys.empty() && raw_ && raw_->ringMode()) outs.push_back(raw_->window());
 
     auto sess = std::make_unique<CaptureSession>();
     sess->onFrameResult = [this](const FrameResult& r) { onFrameResult(r); };
@@ -278,22 +289,54 @@ bool CameraEngine::rebuildSession() {
 
     // 旧会话 close 后进墓地延迟析构（防止 in-flight 回调 UAF），再建新会话
     retireSession();
-    if (!sess->create(cam_.handle(), outs, phys)) {
+
+    // ---- 多流常驻：L + uw + tele (+RAW) 一次 configure ----
+    if (!multiStreamFailed_) {
+        std::vector<CaptureSession::OutDesc> outs = {{ui_->previewWindow(0), nullptr}};
+        if (!uwPhysId_.empty()) outs.push_back({ui_->previewWindow(1), uwPhysId_.c_str()});
+        if (!telePhysId_.empty()) outs.push_back({ui_->previewWindow(2), telePhysId_.c_str()});
+        if (raw_) outs.push_back({raw_->window(), nullptr});
+        if (sess->create(cam_.handle(), outs)) {
+            session_ = std::move(sess);
+            multiStream_ = true;
+            sessionSig_.clear();              // 强制 commitSession 发首个 repeating
+            physBand_ = activePhysId();
+            LOGI("multi-stream session created (L+uw:%s+tele:%s%s)", uwPhysId_.c_str(),
+                 telePhysId_.c_str(), raw_ ? "+RAW" : "");
+            commitSession(false);
+            return true;
+        }
+        LOGE("multi-stream session rejected by HAL, falling back to single-stream rebuilds");
+        multiStreamFailed_ = true;
+        sess = std::make_unique<CaptureSession>();
+        sess->onFrameResult = [this](const FrameResult& r) { onFrameResult(r); };
+        sess->onFrameFailed = [](int reason) { LOGW("capture failed reason=%d", reason); };
+    }
+
+    // ---- 单流降级：按当前带重建（跨带 = 会话重建，旧行为）----
+    multiStream_ = false;
+    const std::string phys = activePhysId();
+    std::vector<ANativeWindow*> outs;
+    outs.push_back(ui_->previewWindow(0));
+    if (phys.empty() && raw_ && raw_->ringMode()) outs.push_back(raw_->window());
+
+    CaptureSession::OutDesc od{outs[0], phys.empty() ? nullptr : phys.c_str()};
+    if (!sess->create(cam_.handle(), {od})) {
         LOGE("rebuildSession: create failed (phys=%s)", phys.c_str());
         return false;
     }
-    if (!sess->setRepeating(outs, settings_, physZoom())) {
+    lastRawRing_ = raw_ && raw_->ringMode();
+    sessionSig_ = phys.empty() ? std::string("L") : "P:" + phys;
+    if (!sess->setRepeating(sessionSig_, outs, settings_, phys, physZoom())) {
         LOGE("rebuildSession: setRepeating failed");
         return false;
     }
     session_ = std::move(sess);
     sessionIsPhysical_ = !phys.empty();
-    physBand_ = phys;   // 滞回基准同步到新带
-    const bool rawInSession = raw_ && raw_->ringMode() && phys.empty();
-    sessionSig_ = (phys.empty() ? std::string("L") : "P:" + phys) + (rawInSession ? "+R" : "");
-    LOGI("session rebuilt: %s (zoom=%.2f physZoom=%.2f uwPhys=%s telePhys=%s)",
-         sessionSig_.c_str(), settings_.zoomRatio, physZoom(), uwPhysId_.c_str(),
-         telePhysId_.c_str());
+    physBand_ = phys;
+    if (ui_) ui_->setPreviewSlot(slotFromSig(sessionSig_));
+    LOGI("single-stream session rebuilt: %s (zoom=%.2f physZoom=%.2f)", sessionSig_.c_str(),
+         settings_.zoomRatio, physZoom());
     return true;
 }
 
@@ -301,22 +344,54 @@ void CameraEngine::commitSession(bool settingsChanged) {
     if (!session_) return;
     refreshPhysIds();
     const std::string phys = activePhysId();
-    const bool rawInSession = raw_ && raw_->ringMode() && phys.empty();
-    const std::string sig = (phys.empty() ? std::string("L") : "P:" + phys) +
-                            (rawInSession ? "+R" : "");
-    if (sig != sessionSig_) {
-        LOGI("session mode change: %s -> %s (zoom=%.2f uw=%d teleMin=%.2f rawRing=%d)",
-             sessionSig_.c_str(), sig.c_str(), settings_.zoomRatio, static_cast<int>(uwAllowed_),
-             teleMinZoom_, raw_ ? (int)raw_->ringMode() : -1);
+    const std::string sig = phys.empty() ? std::string("L") : "P:" + phys;
+    const bool rawRing = raw_ && raw_->ringMode();
+    const bool rawRingChanged = rawRing != lastRawRing_;
+    lastRawRing_ = rawRing;
+
+    if (multiStream_) {
+        // ---- 多流常驻：跨带只换 repeating 请求（无 endConfigure，无纹理失效）----
+        if (sig != sessionSig_) {
+            LOGI("band switch: %s -> %s (zoom=%.2f physZoom=%.2f)",
+                 sessionSig_.c_str(), sig.c_str(), settings_.zoomRatio, physZoom());
+            if (session_->setRepeating(sig, bandTargets(sig), settings_, phys, physZoom())) {
+                sessionSig_ = sig;
+                sessionIsPhysical_ = !phys.empty();
+                physBand_ = phys;
+                if (ui_) ui_->setPreviewSlot(slotFromSig(sig));
+            } else {
+                LOGE("band switch failed, rebuilding session");
+                if (!rebuildSession()) {
+                    LOGE("rebuild failed, reconnecting");
+                    closeSession();
+                    ++reconnects_;
+                }
+                return;
+            }
+        } else if (settingsChanged || rawRingChanged) {
+            // 同带内设置变化（含 RAW 进出 → targets 变化，setRepeating 内部重建请求）
+            session_->setRepeating(sig, bandTargets(sig), settings_, phys, physZoom());
+        }
+        physBand_ = phys;
+        return;
+    }
+
+    // ---- 单流降级：跨带 / RAW 进出 → 会话重建 ----
+    if (sig != sessionSig_ || rawRingChanged) {
+        LOGI("session mode change: %s -> %s (zoom=%.2f rawRing=%d)", sessionSig_.c_str(),
+             sig.c_str(), settings_.zoomRatio, (int)rawRing);
         if (!rebuildSession()) {
             LOGE("rebuild failed, reconnecting");
             closeSession();
             ++reconnects_;
         }
     } else if (settingsChanged) {
-        session_->setRepeating(sessionTargets(), settings_, physZoom());
+        std::vector<ANativeWindow*> outs;
+        outs.push_back(ui_->previewWindow(0));
+        if (phys.empty() && rawRing) outs.push_back(raw_->window());
+        session_->setRepeating(sig, outs, settings_, phys, physZoom());
     }
-    if (session_) physBand_ = phys;   // 滞回基准随当前判定刷新（重建分支 rebuildSession 已设）
+    if (session_) physBand_ = phys;
 }
 
 void CameraEngine::pollControls() {
