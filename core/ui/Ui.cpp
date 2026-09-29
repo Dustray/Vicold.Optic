@@ -144,12 +144,13 @@ static double nowSec() {
 
 // 拖拽变焦节流下发：≥120ms 才入队一次（onMove 里 1e-4 去抖之后仍会高频满足，
 // 这里卡时间闸）。引擎线程每轮循环还会把积压命令合并成一次提交，
-// 实际 setRepeating 频率 ≈ 8/s 上限，对 HAL 安全（分带直连已绕开坏损融合管线）。
-void Ui::pushZoomLive() {
+// 实际 setRepeating 频率 ≈ 8/s 上限（带内实测 0 丢帧）。
+void Ui::pushZoomLive(float camTarget) {
     const double now = nowSec();
     if (now - lastZoomPush_ < 0.12) return;
-    pushCmd(Cmd::SET_ZOOM, zoom_);
+    pushCmd(Cmd::SET_ZOOM, camTarget);
     lastZoomPush_ = now;
+    lastCamPush_ = camTarget;
 }
 
 void Ui::onInputEvent(AInputEvent* e) {
@@ -212,15 +213,16 @@ float Ui::zoomFromY(float y) const {
 void Ui::onMove(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
-            float v = zoomFromY(y);
-            if (std::fabs(v - zoom_) > 1e-4f) {
-                zoom_ = v;
-                // 拖拽中节流实时下发，预览跟手（onUp 再补发一次终值）。
-                // 当初"拖拽只更新显示"的规避源于误诊：断流真因是融合管线坏区，
-                // 已由多摄分带物理直连绕开（doc/devices/xiaomi17pro/CAM_PATHS.md），
-                // 节流后的实时 setRepeating（~8/s，引擎每轮还会合并）对 HAL 安全。
-                pushZoomLive();
-            }
+            zoom_ = zoomFromY(y);
+            // 相机侧目标：主摄带内实时跟随（0 丢帧）；越带（上拉超过长焦阈值）时
+            // 钳在阈值下方，越带部分由 GL 数字裁切模拟，松手才推真实值 ——
+            // 跨带会话重建 ~285ms 冻结（真机实测）不再出现在拖动途中。
+            // 判定用 appliedZoom_（当前出图所处带），拖拽始于长焦带时不钳制。
+            float cam = zoom_;
+            if (appliedZoom_.load(std::memory_order_acquire) < teleMin_ - 0.05f &&
+                cam > teleMin_ - 0.08f)
+                cam = teleMin_ - 0.08f;
+            if (std::fabs(cam - lastCamPush_) > 1e-4f) pushZoomLive(cam);
             break;
         }
         case Drag::ISO: {
@@ -263,11 +265,13 @@ void Ui::onUp(float x, float y) {
     // （节流窗口内最后一次移动可能还没推给引擎）。
     switch (drag_) {
         case Drag::ZOOM: {
-            // 用松手位置重算终值（不依赖最后一次 MOVE，见 zoomFromY 注释）
+            // 用松手位置重算终值（不依赖最后一次 MOVE，见 zoomFromY 注释），
+            // 推真实值：跨带则引擎此刻重建会话（冻结只发生在落位瞬间）
             float v = zoomFromY(y);
             if (std::fabs(v - zoom_) > 1e-4f) zoom_ = v;
             pushCmd(Cmd::SET_ZOOM, zoom_);
             lastZoomPush_ = nowSec();
+            lastCamPush_ = zoom_;
             break;
         }
         case Drag::ISO:  pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_])); break;
@@ -541,6 +545,14 @@ void Ui::frame() {
     gl_.beginFrame(kBg);
 
     // ---- 预览（相机 → GL 纹理）----
+    // 平滑变焦 GL 裁切：显示 FOV = appliedZoom（相机已出图），目标 = zoom_，
+    // 差值由 GL 数字裁切补齐；相机逐步追赶（result 回传 appliedZoom），收敛后恒为 1，
+    // 无跳变。zoom-out 期间 crop < 1 钳回 1（GL 无法扩 FOV，等相机切带）。
+    {
+        const float az = appliedZoom_.load(std::memory_order_acquire);
+        const float crop = (az > 0.01f) ? zoom_ / az : 1.f;
+        gl_.setPreviewZoom(std::clamp(crop, 1.f, 4.f));
+    }
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                     int(dim(kPreviewH)), resolveUvRot());
     drawPreviewOverlay();

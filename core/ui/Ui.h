@@ -50,6 +50,14 @@ public:
         shotTotal_.store(total, std::memory_order_release);
     }
 
+    // ---- 平滑拖拽变焦（引擎线程回传）----
+    // appliedZoom = 当前出图帧对应的用户倍率；拖拽中相机侧钳在带内实时跟随，
+    // 越带部分由 GL 数字裁切模拟（crop = zoom_/applied），收敛后恒回 1，无跳变。
+    // 跨带会话重建 ~285ms 冻结（真机实测），只发生在松手落位时，拖动中不再出现。
+    void setAppliedZoom(float z) { appliedZoom_.store(z, std::memory_order_release); }
+    // 长焦直连阈值（引擎按机型探测下发；无长焦 = 极大值，UI 永不钳制）
+    void setTeleMin(float z) { teleMin_ = z; }
+
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
 
@@ -112,7 +120,10 @@ private:
     bool shutterDown_ = false;
     double lastShotAt_ = 0;
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
-    void pushZoomLive();
+    float lastCamPush_ = 0.f;   // 上次下发给相机的目标值（拖拽钳制判定用）
+    std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前出图的用户倍率
+    float teleMin_ = 2.63f;                 // 长焦直连阈值（setTeleMin 下发）
+    void pushZoomLive(float camTarget);
 
     // 动效
     float flashA_ = 0;

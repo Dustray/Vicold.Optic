@@ -72,6 +72,9 @@ public:
                      const Rgba& fill, const Rgba& border, float borderW);
     // 批量纯色三角形（像素坐标）：网格线/直方图柱等，单次 draw 出一批，避免逐图元开销
     void triangles(const float* xy, int vertexCount, const Rgba& c);
+    // 预览数字变焦（≥1）：与 cover 裁切同域相乘，中心放大取样。拖拽平滑变焦用 ——
+    // 相机侧追赶期间由 GL 补齐 FOV 差值，收敛后恒回 1（无跳变）。
+    void setPreviewZoom(float z) { previewZoom_ = z > 1.f ? z : 1.f; }
     void swap();
 
 private:
@@ -123,6 +126,7 @@ private:
     void importPreviewImage(AImage* img);
     ANativeWindow* win_ = nullptr;
     int32_t winW_ = 0, winH_ = 0;
+    float previewZoom_ = 1.f;            // 预览数字变焦（setPreviewZoom；默认 1 = 不裁切）
 };
 
 } // namespace optic::ui

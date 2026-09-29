@@ -634,6 +634,11 @@ void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot) {
         LOGI("preview orient: src=%dx%d dst=%dx%d rot=%d crop=(%.3f,%.3f)",
              impl_.pvW, impl_.pvH, w, h, uvRot & 3, cx, cy);
     }
+    // 数字变焦：与 cover 裁切同域（uCrop < 1 = 取中心子矩形 = 放大），等比缩小取样窗
+    if (previewZoom_ > 1.f) {
+        cx /= previewZoom_;
+        cy /= previewZoom_;
+    }
 
     glUseProgram(impl_.progPreview);
     glActiveTexture(GL_TEXTURE0);

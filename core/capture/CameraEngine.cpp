@@ -139,6 +139,8 @@ bool CameraEngine::openSession() {
     // HUD 显示真实 RAW 分辨率（由机型探测结果下发，不写死）
     if (ui_) {
         ui_->setStaticText(t.pixelW, t.pixelH);
+        // 平滑拖拽变焦用：长焦直连阈值（无长焦 = 极大值，UI 永不钳制）
+        ui_->setTeleMin(t.teleNativeZoom > 0.f ? t.teleNativeZoom : 1e9f);
         ui_->setSensorOrientation(t.sensorOrientation);   // 预览定向的真值来源之一
     }
 
@@ -226,6 +228,12 @@ std::string CameraEngine::activePhysId() const {
     // （否则冷启动直接进物理直连，2026-09-29 真机复现过）。
     const float z = settings_.zoomRatio;
     if (z <= 0.f) return "";
+    // 带间滞回：当前在物理带内时，退出阈值低于进入阈值，防止导轨在边界微动
+    // 触发会话重建风暴（真机实测：uw 边界 0.86↔1.00 摆动 3 次重建）。
+    if (physBand_ == uwPhysId_ && uwAllowed_ && z < 1.03f) return uwPhysId_;
+    if (physBand_ == telePhysId_ && !telePhysId_.empty() && z >= teleMinZoom_ - 0.08f)
+        return telePhysId_;
+    // 常规判定（进入新带）
     if (z < 1.0f - 1e-3f)
         return (uwAllowed_ && !uwPhysId_.empty()) ? uwPhysId_ : std::string();
     // 高倍区走长焦直连（teleMinZoom_ 默认 = 长焦原生倍率，恰在 SAT 融合坏区之前切换）
@@ -234,12 +242,16 @@ std::string CameraEngine::activePhysId() const {
 }
 
 float CameraEngine::physZoom() const {
-    // 仅长焦直连写相对数字变焦（z/原生倍率 ≥1）；超广角直连恒原生 FOV。
+    // 直连请求写相对数字变焦 = 用户倍率 / 带基（rel 1.0 = 该镜头原生 FOV）：
+    //   超广角带基 = 0.7（用户 0.7 = 超广角原生，0.7–1.0 → rel 1.0–1.43，段内连续变焦）
+    //   长焦带基   = teleNativeZoom（用户 z ≥ 2.63 → rel z/2.63，段内连续变焦）
+    // 写相对值只作用于物理直连请求自身，不进逻辑融合管线（坏区）。
     const float z = settings_.zoomRatio;
-    if (z > 0.f && z >= teleMinZoom_ && !telePhysId_.empty()) {
-        const auto& t = cam_.traits();
-        if (t.teleNativeZoom > 0.f) return std::max(1.0f, z / t.teleNativeZoom);
-    }
+    if (z <= 0.f) return 0.f;
+    const std::string phys = activePhysId();
+    if (phys == uwPhysId_ && !uwPhysId_.empty()) return std::max(1.0f, z / 0.7f);
+    if (phys == telePhysId_ && !telePhysId_.empty() && teleMinZoom_ < 1e8f)
+        return std::max(1.0f, z / teleMinZoom_);
     return 0.f;
 }
 
@@ -276,6 +288,7 @@ bool CameraEngine::rebuildSession() {
     }
     session_ = std::move(sess);
     sessionIsPhysical_ = !phys.empty();
+    physBand_ = phys;   // 滞回基准同步到新带
     const bool rawInSession = raw_ && raw_->ringMode() && phys.empty();
     sessionSig_ = (phys.empty() ? std::string("L") : "P:" + phys) + (rawInSession ? "+R" : "");
     LOGI("session rebuilt: %s (zoom=%.2f physZoom=%.2f uwPhys=%s telePhys=%s)",
@@ -303,6 +316,7 @@ void CameraEngine::commitSession(bool settingsChanged) {
     } else if (settingsChanged) {
         session_->setRepeating(sessionTargets(), settings_, physZoom());
     }
+    if (session_) physBand_ = phys;   // 滞回基准随当前判定刷新（重建分支 rebuildSession 已设）
 }
 
 void CameraEngine::pollControls() {
@@ -548,10 +562,30 @@ int64_t CameraEngine::nowMs() const {
 void CameraEngine::onFrameResult(const FrameResult& r) {
     frameCount_++;
     lastResultMs_ = nowMs();
+
+    // 帧节奏探针
+    if (lastFrameMs_ != 0) {
+        const int64_t gap = lastResultMs_ - lastFrameMs_;
+        if (gap > 70) ++frameGaps_;
+        if (gap > maxGapMs_) maxGapMs_ = gap;
+    }
+    lastFrameMs_ = lastResultMs_;
+
     if (firstTs_ == 0) firstTs_ = r.timestampNs;
     lastTs_ = r.timestampNs;
 
     if (raw_) raw_->onFrameResult(r);
+
+    // 回传当前出图帧对应的"用户倍率"（UI 平滑变焦的锚点）：
+    // result 里的 zoomRatio 在物理直连下是相对值，需按带基换算回用户域。
+    float userZoom = r.zoomRatio;
+    if (sessionIsPhysical_) {
+        if (sessionSig_ == "P:" + uwPhysId_)
+            userZoom = r.zoomRatio * 0.7f;
+        else if (teleMinZoom_ < 1e8f)
+            userZoom = r.zoomRatio * teleMinZoom_;
+    }
+    if (ui_) ui_->setAppliedZoom(userZoom);
 
     if (forceLog_ || frameCount_ % 120 == 0) {
         forceLog_ = false;
@@ -569,6 +603,8 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
                  static_cast<unsigned long long>(frameCount_), fps, r.iso,
                  static_cast<long long>(r.exposureNs), r.zoomRatio);
         }
+        LOGI("pacing: gaps>70ms=%d max=%lldms (frames=%llu)", frameGaps_,
+             (long long)maxGapMs_, static_cast<unsigned long long>(frameCount_));
     }
 }
 

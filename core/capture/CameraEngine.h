@@ -51,6 +51,10 @@ private:
     //   z ∈ [0.7, 1.0) → 超广角直连；z ≥ teleMinZoom_ → 长焦直连；其余 → 逻辑。
     // 本机逻辑融合管线两个坏区（sub-1.0 与高倍数字区），物理直连绕开（2026-09-29 真机确诊）。
     std::string activePhysId() const;
+    // 当前实际所处带（= uwPhysId_ / telePhysId_ / 空），滞回判定基准（activePhysId 读）。
+    // 每次 commit/rebuild 后更新。滞回防边界抖动：uw 退出需 z ≥ 1.03，
+    // tele 退出需 z ≥ teleMinZoom_-0.08 —— 否则导轨在阈值附近微动会触发会话重建风暴。
+    std::string physBand_;
     // 直连请求应写的相对数字变焦：长焦 = z/teleNativeZoom（0 = 不写，超广角恒原生 FOV）
     float physZoom() const;
     void refreshPhysIds();   // 按覆盖键（uw_phys/tele_phys/phys_min）+ 探测值刷新物理布局缓存
@@ -113,6 +117,13 @@ private:
     int64_t lastResultMs_ = 0;
     int64_t nowMs() const;
     int stallRetries_ = 0;
+
+    // 帧节奏探针：相邻 result 间隔 >70ms（30fps 标称 33ms）计一次"节奏断裂"。
+    // 用于区分卡顿来源：带内 setRepeating 重发（间歇性小断裂）vs 跨带会话重建
+    // （一次大断裂数百 ms）。
+    int frameGaps_ = 0;
+    int64_t maxGapMs_ = 0;
+    int64_t lastFrameMs_ = 0;
 };
 
 } // namespace optic::capture
