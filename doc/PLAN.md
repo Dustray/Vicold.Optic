@@ -140,6 +140,44 @@ struct IOpticDevice {
 
 **退出标准**：预览流畅无丢帧 ✅；手动参数实时生效 ✅；RAW 帧能取出且元数据完整 ✅（iso=89 真实值）；快门回溯可用 ✅。
 
+### M-UI — 原生 GL 专业界面 【P0，2026-09-29】✅ 真机验证通过
+
+> 设计原型 `camera-ui.html`（1560×720 横屏设计空间）的 C++ 实现，无 Java/Kotlin、无 View 层。
+> - `core/ui/Gl.*`：EGL/GLES2 底座。预览帧经 AImageReader(RGBA_8888 + GPU_SAMPLED_IMAGE)
+>   → AHardwareBuffer → EGLImage → 2D 纹理零拷贝上屏；sdf 圆角矩形（填充+描边）；
+>   stb_truetype 烘焙设备字体（MiSans 优先）出 ASCII + 常用 CJK 图集；纯色批 `triangles()`。
+> - `core/ui/Ui.*`：设计空间 cover 缩放（等比铺满 + 双向居中裁切），输入反变换命中。
+>   左导轨变焦（0.7×–10× 对数 + 档位吸附 + mm/× 切换）、右导轨 ISO/曝光时间、
+>   曝光补偿 ±3 EV（中心吸附）、快门（按下缩放 + 白闪 + toast）、HUD chips、
+>   实时 RGB 直方图（64-bin，每 16 像素采样）、三分构图网格、AF 框十字标记、时钟/电池。
+> - 交互闭环：UI 命令经队列交引擎线程，与 controls.txt 走同一 `triggerBurst()` 配额闸门。
+>
+> **本轮修复（编译阻塞 + 正确性）**
+> - 补 `EGL_EGLEXT_PROTOTYPES`/`GL_GLEXT_PROTOTYPES`、`STB_TRUETYPE_IMPLEMENTATION`：13 处编译错误
+> - 着色器 Y 轴翻转：原映射把设计空间 y=0 投到屏幕底部 → 整个 UI 与预览上下颠倒
+> - `text()` 顶点 stride 误用 16 字节（两条独立数组应为 8）→ 越界读
+> - 预览纹理在 `AImage_delete` 后继续使用 → 补 `AHardwareBuffer_acquire/release`
+> - 字体图集行数按 16px 估 → CJK 会静默丢字形，改为按 1em 估
+> - 坐标变换缺 `offX_`（横向溢出未居中，绘制与触摸命中不一致）；尺寸误用 `screenY()` 混入偏移
+> - 快门配额 1 → 8（1 次/启动无法用于真机评估），并增加 `notifyShot` 回执，
+>   toast 如实显示「配额已用尽 n/N」而非假装已保存
+>
+> **真机验证（2026-09-29，全部通过）**
+> - V-UI1：RGBA_8888 预览输出 HAL 接受，零拷贝上屏 30fps ✅
+> - V-UI2：uvrot 自动解析正确（着色器 Y 翻转 + 顶点旋转），cover 裁切正常 ✅
+> - V-UI3：MiSans CJK 图集渲染正常（16mm 读数、toast 中文）✅
+> - V-UI4：叠加层满帧运行，预览不受影响 ✅
+> - 导轨变焦 0.7–10 全段可用（依赖多摄分带机制，见 devices/xiaomi17pro/CAM_PATHS.md）✅
+
+### M-MC — 多摄分带：物理直连绕开坏损融合管线 【P0，2026-09-29】✅ 真机验证通过
+
+> Xiaomi 17 Pro 逻辑多摄的 ZOOM_RATIO 融合管线存在两个坏区（sub-1.0 超广角段、
+> ≥2.63x SAT 长焦段），每 ~1.2s 断流。修法：按变焦自动分带，坏区段走物理摄像头
+> 直连（`ACaptureSessionPhysicalOutput` + `withPhysicalIds`），彻底绕开融合。
+> 详细机制、根因链与真机数据见 `doc/devices/xiaomi17pro/CAM_PATHS.md`。
+> 顺带修复：会话重建 UAF（退役墓地）、AE/AF/AWB TYPE_BYTE、冷启动误入超广角、
+> ControlFile 全量重放（松手回弹根因）、看门狗耗尽后整链路重连自愈。
+
 ### M2 — RAW/DNG 输出链路 【P0，2 周】◐ 首光完成（2026-09-29）
 
 > **状态（2026-09-29）：DNG 端到端打通 ✅**
