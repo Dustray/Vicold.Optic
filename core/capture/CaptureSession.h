@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/capture/CaptureSettings.h"
@@ -54,6 +55,12 @@ public:
     // physId 非空 = 该带为物理直连（withPhysicalIds 建请求，skipZoom + 可选相对变焦）。
     bool setRepeating(const std::string& band, const std::vector<ANativeWindow*>& targets,
                       const CaptureSettings& s, const std::string& physId, float physZoom = 0.f);
+    // 方案 A（全目标常驻）：一个 repeating 请求同时驱动全部 targets（三路预览 + RAW）。
+    // physZooms = 各物理摄的相对变焦（withPhysicalIds 建请求 + 逐摄写 ZOOM_RATIO，0 = 不写；
+    // 逻辑流 zoom 由 s.zoomRatio 给出，调用方钳在干净带内）。请求按 "ALL" 缓存，
+    // 设置/变焦变化只改 entry 重发 —— 跨带、带内全部 0 间隔。
+    bool setRepeatingAll(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s,
+                         const std::vector<std::pair<std::string, float>>& physZooms);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
     std::function<void(const FrameResult&)> onFrameResult;

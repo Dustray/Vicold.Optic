@@ -4,7 +4,7 @@
 // 触发/控制源（统一经 triggerBurst()/applyControl 的配额闸门）：
 //   1. GL UI（core/ui/Ui 命令队列，setUi 注入）
 //   2. controls.txt（过渡通道；一次性命令自消费，见 pollControls）
-// 持久键：ae iso exp_us ss ev af focus_d awb zoom raw_mode save_quota uvrot fps_log
+// 持久键：ae iso exp_us ss ev af focus_d awb zoom raw_mode save_quota uvrot fps_log disp
 // 一次性键：zsl_shutter=N shot_raw=1
 
 #include <atomic>
@@ -46,10 +46,12 @@ private:
     bool rebuildSession();              // 按当前模式（逻辑/超广角物理/长焦物理）重建会话
     void retireSession();               // 旧会话 close 后进墓地（延迟析构防回调 UAF）
     void reapRetired();                 // 回收超过宽限期的退役会话
-    void commitSession(bool settingsChanged);  // 模式变化→重建，仅设置变化→重发 repeating
+    void commitSession(bool settingsChanged);  // ALL 常驻：设置变化只改 entry 重发；单流降级：模式变化→重建
+    CaptureSettings effSettings() const;       // ALL 请求的逻辑流 zoom 钳在干净带内（防踩融合坏区）
     // 当前 zoom 应直连的物理 ID（空 = 逻辑多摄）：
     //   z ∈ [0.7, 1.0) → 超广角直连；z ≥ teleMinZoom_ → 长焦直连；其余 → 逻辑。
     // 本机逻辑融合管线两个坏区（sub-1.0 与高倍数字区），物理直连绕开（2026-09-29 真机确诊）。
+    // ALL 常驻模式下仅用于决定 GL 显示源（请求不再随带切换）。
     std::string activePhysId() const;
     // 当前实际所处带（= uwPhysId_ / telePhysId_ / 空），滞回判定基准（activePhysId 读）。
     // 每次 commit/rebuild 后更新。滞回防边界抖动：uw 退出需 z ≥ 1.03，
@@ -57,6 +59,11 @@ private:
     std::string physBand_;
     // 直连请求应写的相对数字变焦：长焦 = z/teleNativeZoom（0 = 不写，超广角恒原生 FOV）
     float physZoom() const;
+    // ALL 请求逐摄相对变焦表：uw = z/0.7、tele = z/teleMin（≤1 钳 1 = 原生 FOV，
+    // 超范围由 HAL 按各摄 zoomRatioRange 钳制）。三路流恒渲染同一用户 FOV，
+    // 跨带切显示源时画面内容连续；三路常流还使 AE/AWB 持续收敛（切换色彩已稳定）。
+    // 副作用：更新 relUw_/relTele_ 缓存。
+    std::vector<std::pair<std::string, float>> allPhysZooms();
     void refreshPhysIds();   // 按覆盖键（uw_phys/tele_phys/phys_min）+ 探测值刷新物理布局缓存
     // band 签名："L"（逻辑主摄）/ "P:"+uwPhysId_（超广角直连）/ "P:"+telePhysId_（长焦直连）
     std::vector<ANativeWindow*> bandTargets(const std::string& sig) const;  // 该带 repeating 目标
@@ -108,7 +115,9 @@ private:
     // HAL 拒绝组合时降级单流（multiStreamFailed_ 记忆，跨带回退为会话重建）。
     bool multiStream_ = false;
     bool multiStreamFailed_ = false;
-    bool lastRawRing_ = false;        // 单流降级模式下检测 RAW 进出 repeating（需重建）
+    bool lastRawRing_ = false;        // 检测 RAW 进出 repeating（ALL 请求目标集变化 → 重建）
+    // ALL 请求逐摄写入的相对变焦缓存（onFrameResult 的 appliedZoom 回传换算用）
+    float relUw_ = 0.f, relTele_ = 0.f;
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问

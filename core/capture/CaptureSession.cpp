@@ -160,6 +160,68 @@ bool CaptureSession::setRepeating(const std::string& band, const std::vector<ANa
     return true;
 }
 
+bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
+                                     const CaptureSettings& s,
+                                     const std::vector<std::pair<std::string, float>>& physZooms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!session_ || targets.empty()) return false;
+
+    BandReq& b = bands_["ALL"];
+    if (targets != b.wins || !b.req) {
+        // 目标集变化（或首次）⇒ 重建请求：withPhysicalIds 声明物理流成员，
+        // 逻辑流输出（RAW）照常交付 —— RAW 恒出帧，全带可拍。
+        if (b.req) { ACaptureRequest_free(b.req); b.req = nullptr; }
+        for (auto* t : b.tgts) ACameraOutputTarget_free(t);
+        b.tgts.clear();
+        b.physId.clear();
+        if (!physZooms.empty()) {
+            std::vector<const char*> ids;
+            ids.reserve(physZooms.size());
+            for (const auto& [id, z] : physZooms) ids.push_back(id.c_str());
+            ACameraIdList plist{};
+            plist.numCameras = static_cast<int>(ids.size());
+            plist.cameraIds = ids.data();
+            if (ACameraDevice_createCaptureRequest_withPhysicalIds(device_, TEMPLATE_PREVIEW,
+                                                                   &plist, &b.req) != ACAMERA_OK ||
+                !b.req) {
+                LOGE("createCaptureRequest_withPhysicalIds failed (ALL, %zu phys)", ids.size());
+                return false;
+            }
+        } else if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &b.req) !=
+                   ACAMERA_OK) {
+            LOGE("createCaptureRequest(ALL) failed");
+            return false;
+        }
+        for (ANativeWindow* w : targets) {
+            ACameraOutputTarget* t = nullptr;
+            if (ACameraOutputTarget_create(w, &t) != ACAMERA_OK || !t) {
+                LOGE("output target create failed (ALL)");
+                return false;
+            }
+            b.tgts.push_back(t);
+            ACaptureRequest_addTarget(b.req, t);
+        }
+        b.wins = targets;
+    }
+
+    // 逻辑 zoom 由调用方（CameraEngine::effSettings）钳在干净带内；
+    // 物理流逐摄覆盖相对变焦（per-physical 键优先于逻辑值）。
+    applySettings(b.req, s, false, 0.f);
+    for (const auto& [id, z] : physZooms) {
+        if (z > 0.f)
+            ACaptureRequest_setEntry_physicalCamera_float(b.req, id.c_str(),
+                                                          ACAMERA_CONTROL_ZOOM_RATIO, 1, &z);
+    }
+    int seqId = 0;
+    ACaptureRequest* reqArr[1] = {b.req};
+    if (ACameraCaptureSession_setRepeatingRequest(session_, &capCbs_, 1, reqArr, &seqId) !=
+        ACAMERA_OK) {
+        LOGE("setRepeatingRequest failed (band=ALL)");
+        return false;
+    }
+    return true;
+}
+
 bool CaptureSession::captureOnce(const std::vector<ANativeWindow*>& targets,
                                  const CaptureSettings& s) {
     std::lock_guard<std::mutex> lock(mutex_);

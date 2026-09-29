@@ -30,9 +30,13 @@ public:
     bool attached() const { return gl_.ready(); }
     // slot：0=逻辑主摄 / 1=超广角直连 / 2=长焦直连（多流常驻会话，见 CameraEngine）
     ANativeWindow* previewWindow(int slot) { return gl_.previewWindow(slot); }
-    // 引擎切带通知：target slot 变更后，frame() 在新源首帧到达时才切换显示（旧画面保持，
-    // 无黑帧）；切换前旧画面仍被 crop 实时补差，FOV 持续跟手。
+    // 引擎切带通知（纯 GL 显示层，不动请求）：目标源有帧即切换显示并交叉淡化 150ms
+    //（遮跨镜头 AE/AWB/内容跳变），期间旧画面持续叠加淡出。
     void setPreviewSlot(int slot) { previewTarget_.store(slot, std::memory_order_release); }
+    // 三路常流帧计数（诊断：确认 uw/tele 在非显示带也在持续出帧/收敛）
+    int64_t slotFrames(int i) const {
+        return i >= 0 && i < 3 ? slotFrames_[i].load(std::memory_order_relaxed) : -1;
+    }
     int32_t previewW(int slot = 0) { return gl_.previewW(slot); }
     int32_t previewH(int slot = 0) { return gl_.previewH(slot); }
 
@@ -125,12 +129,10 @@ private:
     double lastShotAt_ = 0;
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
     float lastCamPush_ = 0.f;   // 上次下发给相机的目标值
-    std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前出图的用户倍率
-    // 拖拽变焦双模式（防闪烁核心，见 Ui::frame 注释）：
-    //   zoom_ >= appliedZoom（放大）→ 相机冻结不发命令，GL 裁切 crop = zoom_/az 补足；
-    //   zoom_ <  appliedZoom（缩小）→ crop 恒 1，相机节流实时跟随。
-    // az 是帧元数据、纹理像素滞后数帧，二者若同时活跃会互搏错位 —— 上面的分野
-    // 保证任一时刻只有一方在动；az 真实变化时 cropSmooth_ 立即归一（同帧切换）。
+    std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前显示源出图的用户倍率
+    // 拖拽变焦（ALL 常流下简化）：相机全向实时跟随（双向 pushZoomLive，带内 0 间隔重发），
+    // crop = zoom_/az 只补元数据与像素间的滞后差（≈1）；az 变化时 cropSmooth_ 立即归一
+    //（元数据与像素同帧绑定，防双向补偿互搏错位 —— 旧架构闪烁根因）。
     float lastAz_ = 0.f;        // 上次见到的 appliedZoom（变化检测 → crop 归一）
     float cropSmooth_ = 1.f;    // GL 裁切平滑值（指数趋近目标，帧率无关）
     double lastCropT_ = 0;      // 上一帧时刻（平滑器 dt）
@@ -145,10 +147,15 @@ private:
     std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
     std::atomic<int> shotUsed_{0}, shotTotal_{0};
 
-    // 预览源切换（多流常驻会话）：target = 引擎要求的带；active = 实际显示源。
-    // 两者在 target 首帧到达时同步（frame()），期间显示源保持有效画面。
+    // 预览源切换（ALL 常流）：target = 引擎按带要求的显示源；active = 实际显示源。
     std::atomic<int> previewTarget_{0};
     int previewActive_ = 0;
+    // 跨带显示切换的交叉淡化（150ms）：旧源纹理叠画淡出，遮跨镜头 AE/AWB/内容跳变
+    int fadeFrom_ = -1;
+    float fadeT_ = 0.f;
+
+    // 三路常流帧计数（frame() 每帧 drain 全部源时累加）
+    std::atomic<int64_t> slotFrames_[3] = {};
 
     // 直方图
     int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};

@@ -51,8 +51,9 @@ static const char* kFsPreview =
     "#extension GL_OES_EGL_image_external : require\n"
     "precision mediump float;\n"
     "uniform samplerExternalOES uTex;\n"
+    "uniform float uAlpha;\n"
     "varying vec2 vUv;\n"
-    "void main(){ gl_FragColor = texture2D(uTex, vUv); }\n";
+    "void main(){ gl_FragColor = uAlpha * texture2D(uTex, vUv); }\n";
 
 static const char* kVsRect =
     "attribute vec2 aPos;\n"
@@ -211,6 +212,7 @@ bool Gl::attach(ANativeWindow* win) {
     impl_.uPv.tex = glGetUniformLocation(impl_.progPreview, "uTex");
     impl_.uPv.rot = glGetUniformLocation(impl_.progPreview, "uRot");
     impl_.uPv.crop = glGetUniformLocation(impl_.progPreview, "uCrop");
+    impl_.uPv.alpha = glGetUniformLocation(impl_.progPreview, "uAlpha");
     impl_.uRect.viewport = glGetUniformLocation(impl_.progRect, "uViewport");
     impl_.uRect.quad = glGetUniformLocation(impl_.progRect, "uQuad");
     impl_.uRect.center = glGetUniformLocation(impl_.progRect, "uCenter");
@@ -623,7 +625,8 @@ void Gl::clear(const Rgba& c) {
 // uvRot < 0 = 自动：源/目标同为横（或同为竖）就不转，否则转 90°。
 // 这是纯几何判断，只保证画面不侧躺；若整机是反的（差 180°），用 controls.txt 的 uvrot=2 覆盖。
 // srcSlot：预览源（0=逻辑 / 1=uw / 2=tele）——多流常驻会话下纹理永不失效。
-void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot) {
+void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot,
+                     float alpha) {
     if (srcSlot < 0 || srcSlot >= kSrcN) return;
     Source& s = src_[srcSlot];
     GLuint tex = s.lastTex;
@@ -665,6 +668,7 @@ void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int 
     glUniform4f(impl_.uPv.uv, 0.f, 0.f, 1.f, 1.f);
     glUniform1f(impl_.uPv.rot, float(uvRot & 3));
     glUniform2f(impl_.uPv.crop, cx, cy);
+    glUniform1f(impl_.uPv.alpha, alpha);
     glEnableVertexAttribArray(impl_.aPv);
     glVertexAttribPointer(impl_.aPv, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);

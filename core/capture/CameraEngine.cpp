@@ -96,9 +96,14 @@ void CameraEngine::run(std::string dataDir) {
                 if (stallRetries_ < 12) {
                     LOGW("preview stall %lldms, re-issuing setRepeating (retry %d, zoom=%.2f)",
                          (long long)since, stallRetries_, settings_.zoomRatio);
-                    const std::string phys = activePhysId();
-                    session_->setRepeating(sessionSig_, bandTargets(sessionSig_), settings_, phys,
-                                           physZoom());
+                    if (sessionSig_ == "ALL") {
+                        session_->setRepeatingAll(bandTargets("ALL"), effSettings(),
+                                                  allPhysZooms());
+                    } else {
+                        const std::string phys = activePhysId();
+                        session_->setRepeating(sessionSig_, bandTargets(sessionSig_),
+                                               effSettings(), phys, physZoom());
+                    }
                     ++stallRetries_;
                     lastResultMs_ = nowMs();   // 冷却，避免 100ms 内重复重发
                 } else {
@@ -257,8 +262,26 @@ float CameraEngine::physZoom() const {
     return 0.f;
 }
 
+std::vector<std::pair<std::string, float>> CameraEngine::allPhysZooms() {
+    const float z = settings_.zoomRatio > 0.f ? settings_.zoomRatio : 1.0f;
+    relUw_ = !uwPhysId_.empty() ? std::max(1.0f, z / 0.7f) : 0.f;
+    relTele_ = (!telePhysId_.empty() && teleMinZoom_ < 1e8f) ? std::max(1.0f, z / teleMinZoom_)
+                                                             : 0.f;
+    std::vector<std::pair<std::string, float>> v;
+    if (relUw_ > 0.f) v.push_back({uwPhysId_, relUw_});
+    if (relTele_ > 0.f) v.push_back({telePhysId_, relTele_});
+    return v;
+}
+
 std::vector<ANativeWindow*> CameraEngine::bandTargets(const std::string& sig) const {
     std::vector<ANativeWindow*> t;
+    if (sig == "ALL") {
+        // 探针：全部输出一次挂上（三路预览 + RAW 环）——请求不再随带切换
+        for (int s = 0; s < 3; ++s)
+            if (ANativeWindow* w = ui_->previewWindow(s)) t.push_back(w);
+        if (raw_ && raw_->ringMode()) t.push_back(raw_->window());
+        return t;
+    }
     if (sig == "L") {
         t.push_back(ui_->previewWindow(0));
         if (raw_ && raw_->ringMode()) t.push_back(raw_->window());
@@ -271,7 +294,7 @@ std::vector<ANativeWindow*> CameraEngine::bandTargets(const std::string& sig) co
 }
 
 int CameraEngine::slotFromSig(const std::string& sig) const {
-    if (sig == "L") return 0;
+    if (sig == "L" || sig == "ALL") return 0;
     if (!uwPhysId_.empty() && sig == "P:" + uwPhysId_) return 1;
     return 2;
 }
@@ -340,27 +363,35 @@ bool CameraEngine::rebuildSession() {
     return true;
 }
 
+// ALL 请求的逻辑流 zoom 钳在干净带内（防踩融合坏区）；物理流由逐摄键独立变焦，
+// 不受此钳制影响（allPhysZooms 用原始 settings_.zoomRatio 换算）。
+CaptureSettings CameraEngine::effSettings() const {
+    if (!multiStream_) return settings_;
+    CaptureSettings s = settings_;
+    const float zmax = teleMinZoom_ < 1e8f ? std::min(2.5f, teleMinZoom_ - 0.05f) : 2.5f;
+    s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
+    return s;
+}
+
 void CameraEngine::commitSession(bool settingsChanged) {
     if (!session_) return;
     refreshPhysIds();
     const std::string phys = activePhysId();
-    const std::string sig = phys.empty() ? std::string("L") : "P:" + phys;
     const bool rawRing = raw_ && raw_->ringMode();
     const bool rawRingChanged = rawRing != lastRawRing_;
     lastRawRing_ = rawRing;
 
     if (multiStream_) {
-        // ---- 多流常驻：跨带只换 repeating 请求（无 endConfigure，无纹理失效）----
-        if (sig != sessionSig_) {
-            LOGI("band switch: %s -> %s (zoom=%.2f physZoom=%.2f)",
-                 sessionSig_.c_str(), sig.c_str(), settings_.zoomRatio, physZoom());
-            if (session_->setRepeating(sig, bandTargets(sig), settings_, phys, physZoom())) {
-                sessionSig_ = sig;
-                sessionIsPhysical_ = !phys.empty();
-                physBand_ = phys;
-                if (ui_) ui_->setPreviewSlot(slotFromSig(sig));
+        // ---- 方案 A 全目标常驻：repeating 恒为 ALL（三路预览+RAW），跨带零请求切换 ----
+        // 只有 RAW 进出会改目标集（重建请求）；其余变化复用请求只改 entry 重发（0 间隔）。
+        if (sessionSig_ != "ALL" || rawRingChanged) {
+            LOGI("ALL repeating (re)build: rawRing=%d zoom=%.2f", (int)rawRing,
+                 settings_.zoomRatio);
+            if (session_->setRepeatingAll(bandTargets("ALL"), effSettings(), allPhysZooms())) {
+                sessionSig_ = "ALL";
+                sessionIsPhysical_ = false;   // RAW 恒出帧，全带可拍
             } else {
-                LOGE("band switch failed, rebuilding session");
+                LOGE("ALL repeating failed, rebuilding session");
                 if (!rebuildSession()) {
                     LOGE("rebuild failed, reconnecting");
                     closeSession();
@@ -368,15 +399,18 @@ void CameraEngine::commitSession(bool settingsChanged) {
                 }
                 return;
             }
-        } else if (settingsChanged || rawRingChanged) {
-            // 同带内设置变化（含 RAW 进出 → targets 变化，setRepeating 内部重建请求）
-            session_->setRepeating(sig, bandTargets(sig), settings_, phys, physZoom());
+        } else if (settingsChanged) {
+            session_->setRepeatingAll(bandTargets("ALL"), effSettings(), allPhysZooms());
         }
+        // 显示源切换：纯 GL 层（不动请求），按滞回带判定（activePhysId 内含滞回状态机）
         physBand_ = phys;
+        if (ui_)
+            ui_->setPreviewSlot(slotFromSig(phys.empty() ? std::string("L") : "P:" + phys));
         return;
     }
 
     // ---- 单流降级：跨带 / RAW 进出 → 会话重建 ----
+    const std::string sig = phys.empty() ? std::string("L") : "P:" + phys;
     if (sig != sessionSig_ || rawRingChanged) {
         LOGI("session mode change: %s -> %s (zoom=%.2f rawRing=%d)", sessionSig_.c_str(),
              sig.c_str(), settings_.zoomRatio, (int)rawRing);
@@ -460,6 +494,9 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             settings_.awbOn = on;
             changed = true;
         }
+    } else if (k == "disp") {
+        // 诊断：手动切显示源（0=逻辑 1=超广 2=长焦；纯 GL 层，不动请求）
+        if (ui_) ui_->setPreviewSlot(std::clamp(std::atoi(v.c_str()), 0, 2));
     } else if (k == "zoom") {
         if (!t.hasZoomRatio) {
             LOGW("zoom not supported on %s", t.id.c_str());
@@ -538,7 +575,8 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGW("shot_raw requires raw_mode=once");
             return;
         }
-        if (!activePhysId().empty()) {
+        if (!multiStream_ && !activePhysId().empty()) {
+            // 单流降级模式下物理带 repeating 无 RAW 流；ALL 常驻下 RAW 恒出帧，全带可拍
             LOGW("shot_raw unavailable in physical direct mode (no RAW on uw/tele)");
             return;
         }
@@ -612,7 +650,8 @@ void CameraEngine::triggerBurst() {
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;
     }
-    if (!activePhysId().empty()) {
+    if (!multiStream_ && !activePhysId().empty()) {
+        // 单流降级模式下物理带 repeating 无 RAW 流；ALL 常驻下 RAW 恒出帧，全带可拍
         LOGW("trigger unavailable in physical direct mode (no RAW on uw/tele)");
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;
@@ -654,7 +693,16 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
     // 回传当前出图帧对应的"用户倍率"（UI 平滑变焦的锚点）：
     // result 里的 zoomRatio 在物理直连下是相对值，需按带基换算回用户域。
     float userZoom = r.zoomRatio;
-    if (sessionIsPhysical_) {
+    if (multiStream_ && sessionSig_ == "ALL") {
+        // ALL 模式：result 元数据是逻辑流的（被钳在干净带内），显示源的应用倍率
+        // 按当前显示带换算 —— 物理流 applied = 写入的相对值 × 带基。
+        if (physBand_ == uwPhysId_ && relUw_ > 0.f) {
+            userZoom = relUw_ * 0.7f;
+        } else if (physBand_ == telePhysId_ && relTele_ > 0.f && teleMinZoom_ < 1e8f) {
+            userZoom = relTele_ * teleMinZoom_;
+        }
+        // 逻辑带：r.zoomRatio 即真实应用值
+    } else if (sessionIsPhysical_) {
         if (sessionSig_ == "P:" + uwPhysId_)
             userZoom = r.zoomRatio * 0.7f;
         else if (teleMinZoom_ < 1e8f)
@@ -680,6 +728,10 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
         }
         LOGI("pacing: gaps>70ms=%d max=%lldms (frames=%llu)", frameGaps_,
              (long long)maxGapMs_, static_cast<unsigned long long>(frameCount_));
+        if (multiStream_ && sessionSig_ == "ALL" && ui_)
+            LOGI("slot frames: L=%lld uw=%lld tele=%lld",
+                 (long long)ui_->slotFrames(0), (long long)ui_->slotFrames(1),
+                 (long long)ui_->slotFrames(2));
     }
 }
 

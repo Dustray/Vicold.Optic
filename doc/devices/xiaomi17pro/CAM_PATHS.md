@@ -30,49 +30,51 @@
 
 结论：**凡是让逻辑请求跨进融合坏区的用法都不可用**；绕过方式 = 物理直连（其他 app 正是这么做的）。
 
-## 3. 通用分带机制（现行实现）
+## 3. 通用分带机制（显示源判定，现行实现）
 
-`CameraEngine::activePhysId()` 按用户变焦 z 自动选择会话路径：
+`CameraEngine::activePhysId()` 按用户变焦 z 判定应显示哪路流（带间滞回防边界抖动）：
 
-| z | 会话签名 | 实现 |
+| z | 显示源 | 该带变焦写入 |
 |---|---|---|
-| `[0.7, 1.0)` | `P:3` | 超广角物理直连，恒原生 FOV（不写 ZOOM_RATIO） |
-| `[1.0, 2.63)` | `L` / `L+R` | 逻辑主摄，写 ZOOM_RATIO=z，RAW 环随会话 |
-| `[2.63, 10]` | `P:4` | 长焦物理直连，写**相对数字变焦** `z/2.63`（10x → 3.80x） |
+| `[0.7, 1.0)` | 超广角物理流 | 逐摄相对变焦 `z/0.7`（0.7–1.0 段真实连续变焦） |
+| `[1.0, 2.63)` | 逻辑主摄流 | 逻辑 ZOOM_RATIO=z |
+| `[2.63, 10]` | 长焦物理流 | 逐摄相对变焦 `z/2.63`（10x → 3.80x） |
 
-- 切换点 = `teleNativeZoom`（2.63），恰在 SAT 坏区开始之前切走，逻辑请求永远不进坏区。
+- 切换点 = `teleNativeZoom`（2.63），恰在 SAT 坏区开始之前切走，逻辑流永远不进坏区。
 - 诊断覆盖键（controls.txt）：`tele_phys=N`、`phys_min=N`、`uw_phys=N`、`uw=0/1`、`cam=N`。
-- 物理直连模式下 RAW 拍摄（快门/ZSL/shot_raw）被拒（该物理镜头无 RAW 流），toast 如实提示。
 
-## 4. 多流常驻会话（现行实现，2026-09-29 晚）
+## 4. ALL 全目标常驻会话（现行实现，2026-09-29 晚）
 
-跨带**不再重建会话**。启动时一次 `ACameraManager_createCaptureSession` 配齐全部输出：
+**一个 repeating 请求挂全部输出，永不再换**。启动时一次 configure 配齐：
 
 - 3 路预览 `ACaptureSessionPhysicalOutput`：slot0 = 逻辑 L、slot1 = 物理 3（uw）、slot2 = 物理 4（tele）；
-- 可选第 4 路：RAW 逻辑输出（与预览同一会话）。
-- **HAL 实测接受该 4 输出组合**（pandora / CamX，30fps 下无流饥饿）。
-
-跨带切换 = `ACameraDevice_createCaptureRequest_withPhysicalIds` 换 repeating 请求
-（请求按签名缓存于 `CaptureSession::reqCache_`，不重复建请求）+ GL 侧 `setPreviewSlot`
-切纹理源（新源首帧到达才切显示，旧画面保持 → 无黑帧）。纹理永不失效。
-
+- 第 4 路：RAW 逻辑输出（与预览同一会话）。
+- repeating 请求经 `createCaptureRequest_withPhysicalIds([3,4])` 创建（`CaptureSession::setRepeatingAll`，
+  按 "ALL" 缓存），**逐摄写 ZOOM_RATIO**（`ACaptureRequest_setEntry_physicalCamera_float`，API 29）：
+  uw = max(1, z/0.7)、tele = max(1, z/teleMin)、逻辑 = 钳在 [1.0, teleMin−0.05] 干净带 ——
+  **三路流恒渲染同一用户 FOV**，跨带切显示源时画面内容连续。
+- **跨带切换 = 纯 GL 显示层**（`Ui::setPreviewSlot` + 150ms 交叉淡化），请求零动作、会话零重建；
+  带内变焦 = 同一请求改 entry 重发（复用缓存请求，0 间隔）。
+- 三路常流副产物：uw/tele 的 AE/AWB 持续收敛，切换瞬间色彩已稳定（业界"预收敛"思路白拿）。
+- RAW 恒出帧 → **全带可拍 RAW**（物理带的 DNG 来自主摄逻辑流，FOV=主摄当前倍率）。
 - 会话只在启动 / 设备重连 / 致命错误时重建；重建仍走退役墓地（防 UAF，见下）。
-- HAL 拒绝多流组合时自动降级单流重建路径（`multiStreamFailed_`）。
-- RAW 环只在逻辑带出帧：repeating 为 `P:3`/`P:4` 时 RAW 流暂停（帧率计冻结属正常），
-  回逻辑带自动恢复；拍摄键在物理带仍被拒（该镜头无 RAW 流）。
-- 预览看门狗与墓地机制保留：>1.2s 无 result → 重发 setRepeating；重建后旧会话延迟 1.5s 析构
-  （立即析构会触发 `C2N-dev-looper` UAF → SIGABRT）。
+- HAL 拒绝 4 输出组合时自动降级单流重建路径（`multiStreamFailed_`；降级模式物理带无 RAW、拍摄被拒）。
+- 三路 reader 每帧必须全部 drain（不消费会撑满 maxImages=3 队列拖累整条 repeating）。
+- 预览看门狗与墓地机制保留：>1.2s 无 result → 重发 setRepeating（ALL 请求同路径）；
+  重建后旧会话延迟 1.5s 析构（立即析构会触发 `C2N-dev-looper` UAF → SIGABRT）。
 
 ## 5. 真机验证记录（2026-09-29）
 
-多流常驻会话（controls.txt 推 zoom，与触摸同一条 commitSession 路径）：
+ALL 全目标常驻会话（controls.txt 推 zoom，与触摸同一条 commitSession 路径）：
 
-- 冷启动：4 输出会话被 HAL 接受，30.1fps，gaps=0（max 46ms），RAW 30.6fps。
-- **14 次快速跨带往返（L↔P:3↔P:4）：0 会话重建**，max gap 恒定 118ms
-  （旧实现每次重建 ~285ms + 黑帧闪烁）；其中 P:4↔P:3 物理直连互切 **0 gap**。
-- RAW 拍摄：逻辑带 `zsl_shutter=1` → ZSL 4 帧、4 张 DNG（各 25.7MB）正常落盘；
-  物理带 RAW 流按设计暂停、回逻辑带自动恢复（实测 total 冻结→恢复）。
-- 预览渲染：slot 切换无黑帧，UI/AF/HUD 正常（`build/screen2.png`）。
+- 冷启动：4 输出 + withPhysicalIds([3,4]) 请求被 HAL 接受，30fps，gaps=0，RAW 30.6fps，
+  三路 slot 帧计数逐秒同步增长（L=uw=tele，真三路常流）。
+- **10 次跨带往返（0.7↔10.0 全覆盖）：0 请求重建、0 会话重建、0 新增 gap**
+  （压测全程 max gap 恒为启动时一次 71ms；对比：换请求方案每次跨带 118ms，
+  最初的单流重建方案 ~285ms + 黑帧）。
+- 显示源切换：0.8x 超广视角 / 8.0x 长焦窄视角截屏确认 FOV 正确切换（`build/v_uw*.png`、`v_tele*.png`）。
+- **物理带 RAW 拍摄解锁**：8.0x 长焦带 `zsl_shutter=1` → ZSL 4 帧、4 张 DNG（各 25.7MB）落盘
+  （DNG 来自主摄逻辑流，FOV=主摄当前倍率）。
 
 单流重建时期的历史结论（仍适用于降级路径）：
 
@@ -81,10 +83,13 @@
 
 ## 6. 已知限制 / 遗留
 
-- 物理直连下 result 元数据 `zoomRatio` 报**相对值**（10x 显示 3.80）；用户倍率以导轨/HUD 为准。
-- 物理直连带无 RAW 流（能力限制）：RAW 环暂停、拍摄被拒；仅逻辑带可拍 RAW。
-- 逻辑↔物理带切换仍有 ~118ms 的 HAL 结果间隔（传感器模式切换固有，约 3-4 帧），
-  GL 侧以旧画面保持 + 首帧到达才切显示兜底，无黑帧；物理↔物理互切无间隔。
+- ALL 常驻下 result 元数据 `zoomRatio` 是**逻辑流**的（钳在干净带内）；
+  UI 的 appliedZoom 由引擎按显示带换算（relUw×0.7 / relTele×teleMin / 逻辑原值）。
+- 物理带拍摄的 DNG 来自主摄逻辑流（RAW 只挂逻辑输出），FOV ≠ 当前显示的超广/长焦视角。
+- 三传感器常开：功耗高于单流方案（方案 A 的固有代价，换取零切换卡顿）。
+- controls.txt 的 zoom 不联动 UI 导轨读数（UI 本地状态，触摸路径不受影响）。
+- 跨镜头色彩/亮度差异仍在（三路各自收敛，主摄与副摄的 AE/AWB 目标不同），
+  GL 150ms 交叉淡化兜底；彻底统一需 HAL 级 3A 同步（SAT 内部行为，应用层不可达）。
 
 ## 7. 平滑拖拽变焦（2026-09-29）
 
@@ -98,15 +103,13 @@
 
 结论：带内实时重发零丢帧；**卡顿全部来自跨带会话重建（~285ms 冻结）**。
 
-现行机制：
-- 带内实时跟随：拖拽 ≥120ms 节流下发 SET_ZOOM（引擎每轮合并 → ≤8 次 setRepeating/s）。
-  超广角带也写相对数字变焦（rel = z/0.7），0.7–1.0 段真实连续变焦。
-- 上拉越带（主摄→长焦）：相机侧钳在 teleMin−0.08，越带部分由 **GL 数字裁切**模拟
-  （crop = zoom_/appliedZoom，引擎按 result 回传 appliedZoom），松手才推真实值触发重建
-  —— 拖动途中 0 冻结，冻结只发生在落位瞬间（自然节拍）。
+现行机制（ALL 常驻后简化）：
+- 全向实时跟随：拖拽 ≥120ms 节流下发 SET_ZOOM（引擎每轮合并 → ≤8 次重发/s，复用同一请求
+  改 entry，带内/跨带全部 0 间隔）；不再需要"放大方向冻结相机"的双模式 —— 跨带已零代价，
+  松手无任何请求切换。
+- crop = zoom_/appliedZoom 仅补元数据与像素间 1~2 帧滞后差（拖拽中 ≈1），
+  az 变化时 cropSmooth 立即归一（防双向补偿互搏错位）。
+- 跨带瞬间：显示 slot 切换 + **150ms 交叉淡化**（旧源叠画淡出）遮跨镜头 AE/AWB/内容跳变。
 - onUp 用松手位置重算终值（快速甩动时输入管线丢弃末尾 MOVE，实测旧逻辑停在 8.76 而非 10.0）。
-- 带间滞回：uw 退出 z≥1.03、tele 退出 z≥teleMin−0.08（进带阈值不变），
-  防导轨在边界微动触发重建风暴（实测边界摆动 3 次重建 → 0）。
-- 下拉越带（tele→main、main→uw）无法用裁切模拟变宽，旧单流实现中重建发生在拖动途中
-  （每次 1~3 个帧断裂，~300ms）—— **已由第 4 节多流常驻会话彻底消除**（跨带 0 重建，
-  仅剩 ~118ms HAL 切换间隔，无黑帧）。
+- 带间滞回保留：uw 退出 z≥1.03、tele 退出 z≥teleMin−0.08 —— 防显示源在边界高频抖动
+  （切换虽零代价，FOV/色彩仍会在两路间来回跳）。

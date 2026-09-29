@@ -68,7 +68,9 @@ public:
 
     void beginFrame(const Rgba& c);   // viewport + 清屏
     void clear(const Rgba& c);
-    void drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot = 0);
+    // alpha < 1 用于跨带显示切换的交叉淡化（新源为底、旧源叠画淡出）
+    void drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot = 0,
+                     float alpha = 1.f);
     // 圆角矩形：填充 + 描边（borderA.a<=0 跳过描边）
     void roundedRect(float cx, float cy, float w, float h, float radius,
                      const Rgba& fill, const Rgba& border, float borderW);
@@ -110,7 +112,7 @@ private:
         struct U {
             GLint rect = -1, viewport = -1, uv = -1, tex = -1, center = -1, half = -1,
                   radius = -1, fill = -1, border = -1, borderW = -1, color = -1, quad = -1,
-                  rot = -1, crop = -1;
+                  rot = -1, crop = -1, alpha = -1;
         } uPv, uRect, uText, uSolid;
         // 属性 location 缓存（避免每次 draw 走 glGetAttribLocation 字符串查找）
         GLint aPv = -1, aRect = -1, aText = -1, aUv = -1, aSolid = -1;

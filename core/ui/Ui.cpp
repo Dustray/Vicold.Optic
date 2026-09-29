@@ -216,12 +216,9 @@ void Ui::onMove(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
             zoom_ = zoomFromY(y);
-            // 双模式（防闪烁，详见 Ui::frame 注释）：放大方向相机完全冻结
-            // （纹理不变、crop 单调连续，零时序错位），缩小方向 crop 恒 1、
-            // 相机节流跟随（带内实测 0 丢帧）。跨带会话重建只发生在松手落位
-            // 或缩小穿越带界（物理限制，GL 无法模拟变宽）。
-            const float az = appliedZoom_.load(std::memory_order_acquire);
-            if (zoom_ < az - 1e-3f) pushZoomLive(zoom_);
+            // ALL 常流：相机全向实时跟随（双向节流下发，带内重发 0 间隔）；
+            // 跨带由引擎切显示 slot（纯 GL 层），无请求切换、无松手落位重建。
+            pushZoomLive(zoom_);
             break;
         }
         case Drag::ISO: {
@@ -265,7 +262,7 @@ void Ui::onUp(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
             // 用松手位置重算终值（不依赖最后一次 MOVE，见 zoomFromY 注释），
-            // 推真实值：跨带则引擎此刻重建会话（冻结只发生在落位瞬间）
+            // 推真实值精确落位（拖拽中已实时下发，此处只补节流窗口内的末段差值）
             float v = zoomFromY(y);
             if (std::fabs(v - zoom_) > 1e-4f) zoom_ = v;
             pushCmd(Cmd::SET_ZOOM, zoom_);
@@ -539,25 +536,39 @@ int Ui::resolveUvRot() const {
 
 void Ui::frame() {
     if (!attached()) return;
-    // 取目标槽位的帧：新带首帧到达前返回 false，显示源保持旧画面（crop 继续补差，
-    // FOV 跟手）；到达后切换显示源 —— 多流常驻下纹理永不失效，无黑帧闪烁。
+    // 三路常流：每帧必须 drain 全部 reader（不消费会撑满 maxImages=3 队列，
+    // HAL 会拖慢/掐断整条 repeating）；直方图只统计当前显示源。
     const int tgt = previewTarget_.load(std::memory_order_acquire);
-    const bool got = gl_.acquirePreview(tgt, histR_, histG_, histB_);
-    if (got && tgt != previewActive_) previewActive_ = tgt;
+    {
+        int32_t dr[64], dg[64], db[64];
+        bool tgtGot = false;
+        for (int s = 0; s < 3; ++s) {
+            const bool main = (s == tgt);
+            if (gl_.acquirePreview(s, main ? histR_ : dr, main ? histG_ : dg,
+                                   main ? histB_ : db)) {
+                slotFrames_[s].fetch_add(1, std::memory_order_relaxed);
+                if (main) tgtGot = true;
+            }
+        }
+        // 切换显示源：目标源有帧才切（旧画面保持），并启动 150ms 交叉淡化
+        if (tgtGot && tgt != previewActive_) {
+            if (previewActive_ >= 0) {
+                fadeFrom_ = previewActive_;
+                fadeT_ = 1.f;
+            }
+            previewActive_ = tgt;
+        }
+    }
 
     gl_.beginFrame(kBg);
 
     // ---- 预览（相机 → GL 纹理）----
-    // 拖拽变焦防闪烁（核心机制）：
-    //  - appliedZoom（az）是帧【元数据】，GL 纹理像素滞后它数帧 —— 二者若同时
-    //    活跃变化（相机阶梯跟随 × crop 反向补偿），FOV 会来回错位 = 闪烁。
-    //  - 放大拖拽：相机冻结（az 恒定），crop = zoom_/az 随手指单调变化，
-    //    FOV = 纹理(az) × crop 精确等于 zoom_，零错位零延迟。
-    //  - 缩小拖拽：GL 无法扩 FOV，crop 恒 1，相机真实跟随（FOV=az 轻微滞后但平滑）。
-    //  - az 一旦变化（相机真实变焦生效）：cropSmooth 立即归一 —— 元数据与像素
-    //    同帧绑定，切换是单次跳变；若此时还让 crop 从高位平滑下降，会和纹理
-    //    过渡叠加冲高（实测闪烁来源之一），必须瞬时归一。
-    //  - crop 上限 16：超广角 0.7 拖到 10x 时 crop≈14.3（暂态数字裁切，糊但可用）。
+    // 拖拽变焦（ALL 常流下的收敛机制）：
+    //  - 相机全向实时跟随（双向 pushZoomLive，引擎复用同一请求改 entry 重发，0 间隔）；
+    //  - az（appliedZoom）是显示源的应用倍率，纹理像素滞后它 1~2 帧 —— crop =
+    //    zoom_/az 只补这个滞后差（拖拽中 ≈1.x 微量），az 变化时立即归一防双向补偿
+    //    互搏错位（旧架构闪烁根因，机制保留作滞后兜底）。
+    //  - 跨带瞬间：显示源切换 + 交叉淡化 150ms 遮跨镜头 AE/AWB/内容跳变。
     {
         const float az = appliedZoom_.load(std::memory_order_acquire);
         if (az != lastAz_) {
@@ -568,7 +579,7 @@ void Ui::frame() {
         if (drag_ == Drag::ZOOM && zoom_ < az - 1e-3f) {
             target = 1.f;                                   // 缩小拖拽：相机跟随
         } else {
-            target = (az > 0.01f) ? zoom_ / az : 1.f;       // 放大拖拽/静止收敛期：补差
+            target = (az > 0.01f) ? zoom_ / az : 1.f;       // 放大拖拽/静止收敛期：补滞后差
         }
         target = std::clamp(target, 1.f, 16.f);
         const double t = nowSec();
@@ -576,9 +587,13 @@ void Ui::frame() {
         lastCropT_ = t;
         cropSmooth_ += (target - cropSmooth_) * (1.f - std::exp(-dt * 20.f));
         gl_.setPreviewZoom(cropSmooth_);
+        if (fadeT_ > 0.f) fadeT_ = std::max(0.f, fadeT_ - dt / 0.15f);
     }
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                     int(dim(kPreviewH)), resolveUvRot(), previewActive_);
+    if (fadeT_ > 0.f && fadeFrom_ >= 0 && fadeFrom_ != previewActive_)
+        gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
+                        int(dim(kPreviewH)), resolveUvRot(), fadeFrom_, fadeT_);
     drawPreviewOverlay();
 
     // ---- 左侧：摄像头避让区（真机只留黑，虚线为设计标注不绘制）----
