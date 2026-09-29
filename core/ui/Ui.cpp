@@ -563,31 +563,34 @@ void Ui::frame() {
     gl_.beginFrame(kBg);
 
     // ---- 预览（相机 → GL 纹理）----
-    // 拖拽变焦（ALL 常流下的收敛机制）：
-    //  - 相机全向实时跟随（双向 pushZoomLive，引擎复用同一请求改 entry 重发，0 间隔）；
-    //  - az（appliedZoom）是显示源的应用倍率，纹理像素滞后它 1~2 帧 —— crop =
-    //    zoom_/az 只补这个滞后差（拖拽中 ≈1.x 微量），az 变化时立即归一防双向补偿
-    //    互搏错位（旧架构闪烁根因，机制保留作滞后兜底）。
-    //  - 跨带瞬间：显示源切换 + 交叉淡化 150ms 遮跨镜头 AE/AWB/内容跳变。
+    // 逻辑显示带（slot 0）：相机实时跟随（带内改 entry 重发 0 间隔），crop 恒 1。
+    // 物理显示带（slot 1/2，quirk physPerKeyZoom=false —— pandora 的 CamX 忽略
+    // per-physical 变焦键，物理流恒原生 FOV）：带内变焦由 GL 裁切补足，crop =
+    // zoom_/az，az = 带基常量（引擎回传）—— 拖动中 az 不变，crop 单调连续，
+    // 无旧双模式「az 每帧刷新 → crop 重置爬升」的泵动闪烁。跨带时 az 跳变 =
+    // 带基切换，边界处 crop ≈ 1（uw 出带 1.03/0.7≈1.47→落位即目标，tele 出带
+    // 2.55/2.63≈0.97→钳 1），slot 切换瞬间直接落位到目标 crop，无过渡闪烁。
     {
         const float az = appliedZoom_.load(std::memory_order_acquire);
-        if (az != lastAz_) {
-            cropSmooth_ = 1.f;
-            lastAz_ = az;
-        }
-        float target;
-        if (drag_ == Drag::ZOOM && zoom_ < az - 1e-3f) {
-            target = 1.f;                                   // 缩小拖拽：相机跟随
-        } else {
-            target = (az > 0.01f) ? zoom_ / az : 1.f;       // 放大拖拽/静止收敛期：补滞后差
-        }
-        target = std::clamp(target, 1.f, 16.f);
+        float target = 1.f;
+        if (previewActive_ != 0 && az > 0.01f)
+            target = std::clamp(zoom_ / az, 1.f, 16.f);
         const double t = nowSec();
         const float dt = lastCropT_ > 0 ? float(t - lastCropT_) : 0.016f;
         lastCropT_ = t;
-        cropSmooth_ += (target - cropSmooth_) * (1.f - std::exp(-dt * 20.f));
+        if (previewActive_ != lastCropSlot_) {
+            cropSmooth_ = target;       // 显示源切换：直接落位（边界处目标 ≈1 或换带基）
+            lastCropSlot_ = previewActive_;
+        } else {
+            cropSmooth_ += (target - cropSmooth_) * (1.f - std::exp(-dt * 20.f));
+        }
         gl_.setPreviewZoom(cropSmooth_);
         if (fadeT_ > 0.f) fadeT_ = std::max(0.f, fadeT_ - dt / 0.15f);
+        // 诊断（低频）：crop 链路四要素实况（2026-09-30 排查物理带 crop 未生效）
+        static int dbgN = 0;
+        if (++dbgN % 150 == 0)
+            LOGI("crop dbg: slot=%d zoom=%.2f az=%.2f crop=%.3f", previewActive_, zoom_, az,
+                 cropSmooth_);
     }
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                     int(dim(kPreviewH)), resolveUvRot(), previewActive_);

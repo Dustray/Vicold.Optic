@@ -65,6 +65,10 @@ public:
     void setAppliedZoom(float z) { appliedZoom_.store(z, std::memory_order_release); }
     // 长焦直连阈值（引擎按机型探测下发；无长焦 = 极大值，UI 永不钳制）
     void setTeleMin(float z) { teleMin_ = z; }
+    // 外部 zoom 同步（controls.txt 诊断通道）：UI 内部 zoom_ 是 crop 补偿与导轨读数的
+    // 基准，诊断值不联动会让 crop 停在旧值（2026-09-30 截图验证失真的根因）。
+    // 导轨把手位置不搬动（视觉跳变），仅同步数值状态。
+    void setZoomExternal(float z) { zoom_ = z; }
 
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
@@ -130,12 +134,12 @@ private:
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
     float lastCamPush_ = 0.f;   // 上次下发给相机的目标值
     std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前显示源出图的用户倍率
-    // 拖拽变焦（ALL 常流下简化）：相机全向实时跟随（双向 pushZoomLive，带内 0 间隔重发），
-    // crop = zoom_/az 只补元数据与像素间的滞后差（≈1）；az 变化时 cropSmooth_ 立即归一
-    //（元数据与像素同帧绑定，防双向补偿互搏错位 —— 旧架构闪烁根因）。
-    float lastAz_ = 0.f;        // 上次见到的 appliedZoom（变化检测 → crop 归一）
-    float cropSmooth_ = 1.f;    // GL 裁切平滑值（指数趋近目标，帧率无关）
-    double lastCropT_ = 0;      // 上一帧时刻（平滑器 dt）
+    // ALL 常流：逻辑带相机实时跟随（crop=1）；物理带（quirk physPerKeyZoom=false）
+    // 带内变焦由 GL 裁切补足 —— crop = zoom_/az，az = 带基常量（引擎回传），
+    // 带内 az 稳定 → crop 单调连续无泵动；slot 切换瞬间 crop 直接落位（lastCropSlot_）。
+    float cropSmooth_ = 1.f;    // GL 裁切平滑值（指数趋近，帧率无关）
+    int lastCropSlot_ = 0;      // 上次计算 crop 时的显示 slot（切换 → 直接落位）
+    double lastCropT_ = 0;      // 上一帧时刻（淡化计时 dt）
     float teleMin_ = 2.63f;                 // 长焦直连阈值（setTeleMin 下发）
     void pushZoomLive(float camTarget);
 

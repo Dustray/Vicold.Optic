@@ -650,8 +650,9 @@ void Gl::drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int 
     }
     if (!s.logged) {
         s.logged = true;
-        LOGI("preview orient: slot=%d src=%dx%d dst=%dx%d rot=%d crop=(%.3f,%.3f)",
-             srcSlot, s.w, s.h, w, h, uvRot & 3, cx, cy);
+        LOGI("preview orient: slot=%d src=%dx%d dst=%dx%d rot=%d crop=(%.3f,%.3f) "
+             "uCropLoc=%d pvZoom=%.3f",
+             srcSlot, s.w, s.h, w, h, uvRot & 3, cx, cy, impl_.uPv.crop, previewZoom_);
     }
     // 数字变焦：与 cover 裁切同域（uCrop < 1 = 取中心子矩形 = 放大），等比缩小取样窗
     if (previewZoom_ > 1.f) {

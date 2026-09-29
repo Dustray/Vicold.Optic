@@ -262,14 +262,77 @@ float CameraEngine::physZoom() const {
     return 0.f;
 }
 
-std::vector<std::pair<std::string, float>> CameraEngine::allPhysZooms() {
+// 诊断：快照各物理摄的逐键变焦能力（per-physical ZOOM_RATIO / CROP_REGION 是否在
+// 该物理摄的 availableRequestKeys 里，及 zoomRatioRange / activeArray 供回退换算）。
+// ALL 模式带内连续变焦完全依赖 per-physical ZOOM_RATIO 真正生效；键缺失或 HAL 忽略
+// 时表现为「长焦固定在原生焦段」（2026-09-29 真机症状）。
+void CameraEngine::probePhysCaps() {
+    const std::string ids[2] = {uwPhysId_, telePhysId_};
+    for (const std::string& pid : ids) {
+        if (pid.empty()) continue;
+        ACameraMetadata* md = nullptr;
+        if (ACameraManager_getCameraCharacteristics(cam_.manager(), pid.c_str(), &md) !=
+                ACAMERA_OK ||
+            !md)
+            continue;
+        PhysCaps c;
+        ACameraMetadata_const_entry e{};
+        if (ACameraMetadata_getConstEntry(md, ACAMERA_REQUEST_AVAILABLE_REQUEST_KEYS, &e) ==
+            ACAMERA_OK) {
+            for (uint32_t i = 0; i < e.count; ++i) {
+                if (e.data.i32[i] == ACAMERA_CONTROL_ZOOM_RATIO) c.zoomKey = true;
+                if (e.data.i32[i] == ACAMERA_SCALER_CROP_REGION) c.cropKey = true;
+            }
+        }
+        if (ACameraMetadata_getConstEntry(md, ACAMERA_CONTROL_ZOOM_RATIO_RANGE, &e) ==
+                ACAMERA_OK &&
+            e.count >= 2) {
+            c.zmin = e.data.f[0];
+            c.zmax = e.data.f[1];
+        }
+        if (ACameraMetadata_getConstEntry(md, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &e) ==
+                ACAMERA_OK &&
+            e.count >= 4) {
+            for (int i = 0; i < 4; ++i) c.aa[i] = e.data.i32[i];
+        }
+        LOGI("phys %s caps: ZOOM_RATIO=%d CROP_REGION=%d range=[%.2f,%.2f] aa=%dx%d",
+             pid.c_str(), (int)c.zoomKey, (int)c.cropKey, c.zmin, c.zmax, c.aa[2], c.aa[3]);
+        physCaps_[pid] = c;
+        ACameraMetadata_free(md);
+    }
+}
+
+std::vector<CaptureSession::PhysZoom> CameraEngine::allPhysZooms() {
     const float z = settings_.zoomRatio > 0.f ? settings_.zoomRatio : 1.0f;
-    relUw_ = !uwPhysId_.empty() ? std::max(1.0f, z / 0.7f) : 0.f;
-    relTele_ = (!telePhysId_.empty() && teleMinZoom_ < 1e8f) ? std::max(1.0f, z / teleMinZoom_)
-                                                             : 0.f;
-    std::vector<std::pair<std::string, float>> v;
-    if (relUw_ > 0.f) v.push_back({uwPhysId_, relUw_});
-    if (relTele_ > 0.f) v.push_back({telePhysId_, relTele_});
+    const bool perKey = cam_.traits().physPerKeyZoom;
+    // az 回传换算基准：perKey=true（HAL 执行 per-physical 变焦）→ rel = z/带基，
+    // az = rel×带基 = 用户倍率；perKey=false（pandora：键被忽略，物理流恒原生 FOV）
+    // → rel 恒 1，az = 带基常量（UI 用 crop = z/az 补带内变焦，带内 az 稳定无泵动）。
+    relUw_ = !uwPhysId_.empty() ? (perKey ? std::max(1.0f, z / 0.7f) : 1.0f) : 0.f;
+    relTele_ = (!telePhysId_.empty() && teleMinZoom_ < 1e8f)
+                   ? (perKey ? std::max(1.0f, z / teleMinZoom_) : 1.0f)
+                   : 0.f;
+    std::vector<CaptureSession::PhysZoom> v;
+    // 键不生效就不写：防未来 ROM 部分生效时与 GL 裁切叠加成双重变焦
+    if (!perKey) return v;
+    auto make = [this](const std::string& id, float rel) {
+        CaptureSession::PhysZoom pz;
+        pz.id = id;
+        pz.rel = rel;
+        const auto it = physCaps_.find(id);
+        if (it != physCaps_.end() && it->second.cropKey && it->second.aa[2] > 0) {
+            const float inv = 1.f / std::max(rel, 1.0f);
+            const int cw = int(it->second.aa[2] * inv) & ~1;   // 传感器 crop 常要求偶对齐
+            const int ch = int(it->second.aa[3] * inv) & ~1;
+            pz.crop[0] = it->second.aa[0] + (it->second.aa[2] - cw) / 2;
+            pz.crop[1] = it->second.aa[1] + (it->second.aa[3] - ch) / 2;
+            pz.crop[2] = cw;
+            pz.crop[3] = ch;
+        }
+        return pz;
+    };
+    if (relUw_ > 0.f) v.push_back(make(uwPhysId_, relUw_));
+    if (relTele_ > 0.f) v.push_back(make(telePhysId_, relTele_));
     return v;
 }
 
@@ -305,6 +368,7 @@ bool CameraEngine::rebuildSession() {
     if (!cam_.opened() || !ui_ || !ui_->attached()) return false;
 
     refreshPhysIds();
+    probePhysCaps();
 
     auto sess = std::make_unique<CaptureSession>();
     sess->onFrameResult = [this](const FrameResult& r) { onFrameResult(r); };
@@ -402,10 +466,17 @@ void CameraEngine::commitSession(bool settingsChanged) {
         } else if (settingsChanged) {
             session_->setRepeatingAll(bandTargets("ALL"), effSettings(), allPhysZooms());
         }
-        // 显示源切换：纯 GL 层（不动请求），按滞回带判定（activePhysId 内含滞回状态机）
+        // 显示源切换：纯 GL 层（不动请求），按滞回带判定（activePhysId 内含滞回状态机）。
+        // slot 变化才打日志（拖拽期间 commitSession 每 120ms 一次，防淹没 logcat）。
         physBand_ = phys;
-        if (ui_)
-            ui_->setPreviewSlot(slotFromSig(phys.empty() ? std::string("L") : "P:" + phys));
+        const int dispSlot = slotFromSig(phys.empty() ? std::string("L") : "P:" + phys);
+        if (ui_) {
+            if (dispSlot != lastDispSlot_)
+                LOGI("display slot -> %d (z=%.2f phys=%s)", dispSlot, settings_.zoomRatio,
+                     phys.c_str());
+            lastDispSlot_ = dispSlot;
+            ui_->setPreviewSlot(dispSlot);
+        }
         return;
     }
 
@@ -506,6 +577,7 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin, t.zoomMax);
         if (z != settings_.zoomRatio) {
             settings_.zoomRatio = z;
+            if (ui_) ui_->setZoomExternal(z);   // UI crop 基准 / 导轨读数联动
             changed = true;
         }
     } else if (k == "uw") {
@@ -575,9 +647,10 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGW("shot_raw requires raw_mode=once");
             return;
         }
-        if (!multiStream_ && !activePhysId().empty()) {
-            // 单流降级模式下物理带 repeating 无 RAW 流；ALL 常驻下 RAW 恒出帧，全带可拍
-            LOGW("shot_raw unavailable in physical direct mode (no RAW on uw/tele)");
+        if (!activePhysId().empty()) {
+            // 物理带 DNG = 主摄逻辑流（zoom 钳 ≤2.5），与预览 FOV 不一致 —— 拒拍是
+            // 诚实行为（ALL 常驻下曾放行过，实测 8x 预览落盘 2.5x FOV DNG，已撤销）
+            LOGW("shot_raw unavailable in physical band (no matching RAW)");
             return;
         }
         if (savesUsed_ >= saveQuota_) {
@@ -650,9 +723,10 @@ void CameraEngine::triggerBurst() {
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;
     }
-    if (!multiStream_ && !activePhysId().empty()) {
-        // 单流降级模式下物理带 repeating 无 RAW 流；ALL 常驻下 RAW 恒出帧，全带可拍
-        LOGW("trigger unavailable in physical direct mode (no RAW on uw/tele)");
+    if (!activePhysId().empty()) {
+        // 物理带 DNG = 主摄逻辑流（zoom 钳 ≤2.5），与预览 FOV 不一致 —— 拒拍是
+        // 诚实行为（ALL 常驻下曾放行过，实测 8x 预览落盘 2.5x FOV DNG，已撤销）
+        LOGW("trigger unavailable in physical band (no matching RAW)");
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;
     }
