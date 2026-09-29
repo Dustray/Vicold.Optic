@@ -121,7 +121,9 @@ void CameraEngine::run(std::string dataDir) {
             continue;
         }
 
-        std::this_thread::sleep_for(100ms);
+        // 50ms 拾取节拍：UI 命令（拖拽实时变焦）最坏延迟 = UI 节流 120ms + 本轮 50ms，
+        // 平均 ~95ms；其余轮内工作（看门狗/墓地回收）都很轻，不影响功耗。
+        std::this_thread::sleep_for(50ms);
     }
     closeSession();
     LOGI("engine exit");

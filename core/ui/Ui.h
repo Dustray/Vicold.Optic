@@ -71,6 +71,7 @@ private:
     void onDown(float dx, float dy);
     void onMove(float dx, float dy);
     void onUp(float dx, float dy);
+    float zoomFromY(float y) const;   // 导轨 y 位置 → 变焦值（含档位吸附）
     void draw();
     void drawTracks();
     void drawPreviewOverlay();
@@ -110,6 +111,8 @@ private:
     enum class Drag { NONE, ZOOM, ISO, SS, EV } drag_ = Drag::NONE;
     bool shutterDown_ = false;
     double lastShotAt_ = 0;
+    double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
+    void pushZoomLive();
 
     // 动效
     float flashA_ = 0;

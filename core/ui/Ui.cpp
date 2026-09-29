@@ -142,6 +142,16 @@ static double nowSec() {
                .count() / 1000.0;
 }
 
+// 拖拽变焦节流下发：≥120ms 才入队一次（onMove 里 1e-4 去抖之后仍会高频满足，
+// 这里卡时间闸）。引擎线程每轮循环还会把积压命令合并成一次提交，
+// 实际 setRepeating 频率 ≈ 8/s 上限，对 HAL 安全（分带直连已绕开坏损融合管线）。
+void Ui::pushZoomLive() {
+    const double now = nowSec();
+    if (now - lastZoomPush_ < 0.12) return;
+    pushCmd(Cmd::SET_ZOOM, zoom_);
+    lastZoomPush_ = now;
+}
+
 void Ui::onInputEvent(AInputEvent* e) {
     if (AInputEvent_getType(e) != AINPUT_EVENT_TYPE_MOTION) return;
     int32_t action = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK;
@@ -183,21 +193,33 @@ void Ui::onDown(float x, float y) {
     }
 }
 
+// 导轨 y 位置 → 变焦值（对数刻度 + 档位吸附）。onMove/onUp 共用，
+// onUp 必须用松手位置重算：快速甩动时输入管线会丢弃末尾若干 MOVE，
+// 若只信最后一次 MOVE，终值会停在中途（实测 150ms 甩动停在 8.76 而非 10.0）。
+float Ui::zoomFromY(float y) const {
+    float f = 1 - (y - kZoomTrackY - kPadF * kZoomTrackH) /
+                      (kUsableF * kZoomTrackH);
+    f = std::clamp(f, 0.f, 1.f);
+    float v = kZoomMin * std::pow(kZoomMax / kZoomMin, f);
+    // 设计档位 / 整数档吸附
+    for (float s : kZoomStops)
+        if (std::fabs(v - s) < 0.13f) { v = s; break; }
+    for (int s = 1; s <= 10; ++s)
+        if (std::fabs(v - float(s)) < 0.13f) { v = float(s); break; }
+    return std::clamp(v, kZoomMin, kZoomMax);
+}
+
 void Ui::onMove(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
-            float f = 1 - (y - kZoomTrackY - kPadF * kZoomTrackH) /
-                              (kUsableF * kZoomTrackH);
-            f = std::clamp(f, 0.f, 1.f);
-            float v = kZoomMin * std::pow(kZoomMax / kZoomMin, f);
-            // 设计档位 / 整数档吸附
-            for (float s : kZoomStops)
-                if (std::fabs(v - s) < 0.13f) { v = s; break; }
-            for (int s = 1; s <= 10; ++s)
-                if (std::fabs(v - float(s)) < 0.13f) { v = float(s); break; }
+            float v = zoomFromY(y);
             if (std::fabs(v - zoom_) > 1e-4f) {
-                zoom_ = std::clamp(v, kZoomMin, kZoomMax);
-                // 拖拽中只更新显示，命令延到 onUp 统一下发（见 onUp 注释）
+                zoom_ = v;
+                // 拖拽中节流实时下发，预览跟手（onUp 再补发一次终值）。
+                // 当初"拖拽只更新显示"的规避源于误诊：断流真因是融合管线坏区，
+                // 已由多摄分带物理直连绕开（doc/devices/xiaomi17pro/CAM_PATHS.md），
+                // 节流后的实时 setRepeating（~8/s，引擎每轮还会合并）对 HAL 安全。
+                pushZoomLive();
             }
             break;
         }
@@ -237,10 +259,17 @@ void Ui::onMove(float x, float y) {
 }
 
 void Ui::onUp(float x, float y) {
-    // 松手时一次性下发当前值：拖拽期间只更新 UI 显示，避免每帧多次 setRepeating 触发
-    // 本机 HAL 把预览流静默掐断（表现为预览抽搐/卡死）。单次下发对 HAL 是稳定的。
+    // 松手补发当前值兜底：拖拽中已节流实时下发（pushZoomLive），此处保证终值精确落位
+    // （节流窗口内最后一次移动可能还没推给引擎）。
     switch (drag_) {
-        case Drag::ZOOM: pushCmd(Cmd::SET_ZOOM, zoom_); break;
+        case Drag::ZOOM: {
+            // 用松手位置重算终值（不依赖最后一次 MOVE，见 zoomFromY 注释）
+            float v = zoomFromY(y);
+            if (std::fabs(v - zoom_) > 1e-4f) zoom_ = v;
+            pushCmd(Cmd::SET_ZOOM, zoom_);
+            lastZoomPush_ = nowSec();
+            break;
+        }
         case Drag::ISO:  pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_])); break;
         case Drag::SS:   pushCmd(Cmd::SET_EXP_US, 1e6f / float(kSsStops[ssIdx_])); break;   // µs
         case Drag::EV:   pushCmd(Cmd::SET_EV, ev_); pushCmd(Cmd::SET_AE, aeOn_ ? 1.f : 0.f); break;
