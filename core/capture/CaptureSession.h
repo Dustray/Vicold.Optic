@@ -36,10 +36,12 @@ public:
     CaptureSession(const CaptureSession&) = delete;
     CaptureSession& operator=(const CaptureSession&) = delete;
 
-    bool create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs);
+    bool create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs,
+                const std::string& physicalId = {});
     void close();
 
-    bool setRepeating(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
+    bool setRepeating(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s,
+                      float physZoom = 0.f);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
     std::function<void(const FrameResult&)> onFrameResult;
@@ -57,13 +59,17 @@ private:
     static void onCaptureFailed(void* ctx, ACameraCaptureSession*, ACaptureRequest*,
                                 ACameraCaptureFailure* failure);
 
-    void applySettings(ACaptureRequest* req, const CaptureSettings& s) const;
+    // skipZoom=true 时物理直连不写用户 zoomRatio（物理镜头以自身原生 FOV 出图）；
+    // physZoom>0 时改写该相对数字变焦（长焦直连的 z/teleNative，HAL 侧自行钳制）。
+    void applySettings(ACaptureRequest* req, const CaptureSettings& s, bool skipZoom = false,
+                       float physZoom = 0.f) const;
     void closeLocked(); // mutex_ 已持有时使用（create 复用）
 
     ACameraDevice* device_ = nullptr;
     ACameraCaptureSession* session_ = nullptr;
     ACaptureSessionOutputContainer* container_ = nullptr;
     std::vector<ACaptureSessionOutput*> outputs_;
+    std::string physicalId_;   // 非空 = 预览输出直连该物理摄像头（绕过逻辑多摄融合）
 
     // repeating：目标集不变时复用请求，仅更新 entry
     ACaptureRequest* repeating_ = nullptr;

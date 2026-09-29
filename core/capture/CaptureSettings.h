@@ -13,6 +13,7 @@ struct CaptureSettings {
     bool aeOn = true;
     int32_t iso = 0;              // aeOn=false 时生效
     int64_t exposureNs = 0;       // aeOn=false 时生效
+    int32_t evSteps = 0;          // AE 曝光补偿步数（aeOn=true 时生效，范围来自 characteristics）
     // AF
     bool afOn = true;
     float focusDistance = 0.f;    // 屈光度；afOn=false 时生效
@@ -22,14 +23,14 @@ struct CaptureSettings {
     float zoomRatio = 0.f;        // 0 = 不设置（保持默认）
 
     // 应用到请求；返回是否有改动（调用方决定是否重发 repeating）
-    void apply(ACaptureRequest* req) const;
+    void apply(ACaptureRequest* req, bool skipZoom = false) const;
 };
 
 // 两个设置是否要求重发 repeating（粗粒度：任一字段变化即重发）
 inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
     return a.aeOn != b.aeOn || a.iso != b.iso || a.exposureNs != b.exposureNs ||
-           a.afOn != b.afOn || a.focusDistance != b.focusDistance || a.awbOn != b.awbOn ||
-           a.zoomRatio != b.zoomRatio;
+           a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
+           a.awbOn != b.awbOn || a.zoomRatio != b.zoomRatio;
 }
 
 } // namespace optic::capture

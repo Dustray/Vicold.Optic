@@ -8,8 +8,10 @@ add_library(optic_core STATIC
     capture/RawCapture.cpp
     capture/CameraEngine.cpp
     dng/DngWriter.cpp
+    ui/Gl.cpp
+    ui/Ui.cpp
 )
 
 target_include_directories(optic_core PUBLIC "${CMAKE_SOURCE_DIR}")
 target_compile_options(optic_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_link_libraries(optic_core PUBLIC camera2ndk mediandk android log)
+target_link_libraries(optic_core PUBLIC camera2ndk mediandk android log EGL GLESv2)

@@ -11,10 +11,17 @@
         android:hasCode="false"
         android:extractNativeLibs="true"
         android:allowBackup="false">
+        <!-- 设计空间为 1560×720 横屏；sensorLandscape 允许左右横屏切换（反向横屏对握持友好）；
+             Fullscreen 主题隐藏状态栏；always 延伸进打孔区——设计稿左侧 80px 避让区正好容纳前摄挖孔，
+             否则系统在挖孔侧保留 150px，窗口变窄导致快门被 cover 裁切 -->
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
             android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:windowLayoutInDisplayCutoutMode="always"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale">
             <meta-data android:name="android.app.lib_name" android:value="optic"/>
             <intent-filter>

@@ -31,18 +31,30 @@ FrameResult parseResult(const ACameraMetadata* result) {
 
 CaptureSession::~CaptureSession() { close(); }
 
-bool CaptureSession::create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs) {
+bool CaptureSession::create(ACameraDevice* dev, const std::vector<ANativeWindow*>& outputs,
+                            const std::string& physicalId) {
     std::lock_guard<std::mutex> lock(mutex_);
     closeLocked();
     device_ = dev;
+    physicalId_ = physicalId;
     if (!dev || outputs.empty()) return false;
 
     if (ACaptureSessionOutputContainer_create(&container_) != ACAMERA_OK) return false;
-    for (ANativeWindow* w : outputs) {
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        ANativeWindow* w = outputs[i];
         ACaptureSessionOutput* out = nullptr;
-        if (ACaptureSessionOutput_create(w, &out) != ACAMERA_OK || !out) {
-            LOGE("session output create failed");
-            return false;
+        // 第一个输出（预览）在物理直连模式下绑定到指定物理摄像头，绕过逻辑多摄融合管线。
+        // 其余输出（如 RAW）保持逻辑输出（物理模式下列表仅含预览，不会走到这里）。
+        if (i == 0 && !physicalId_.empty()) {
+            if (ACaptureSessionPhysicalOutput_create(w, physicalId_.c_str(), &out) != ACAMERA_OK || !out) {
+                LOGE("physical session output create failed (phys=%s)", physicalId_.c_str());
+                return false;
+            }
+        } else {
+            if (ACaptureSessionOutput_create(w, &out) != ACAMERA_OK || !out) {
+                LOGE("session output create failed");
+                return false;
+            }
         }
         if (ACaptureSessionOutputContainer_add(container_, out) != ACAMERA_OK) {
             ACaptureSessionOutput_free(out);
@@ -93,7 +105,7 @@ void CaptureSession::closeLocked() {
 }
 
 bool CaptureSession::setRepeating(const std::vector<ANativeWindow*>& targets,
-                                  const CaptureSettings& s) {
+                                  const CaptureSettings& s, float physZoom) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!session_ || targets.empty()) return false;
 
@@ -102,9 +114,24 @@ bool CaptureSession::setRepeating(const std::vector<ANativeWindow*>& targets,
         if (repeating_) { ACaptureRequest_free(repeating_); repeating_ = nullptr; }
         for (auto* t : repeatingTgts_) ACameraOutputTarget_free(t);
         repeatingTgts_.clear();
-        if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &repeating_) != ACAMERA_OK) {
-            LOGE("createCaptureRequest(repeating) failed");
-            return false;
+        if (!physicalId_.empty()) {
+            // 直连物理摄像头：用 withPhysicalIds 建请求，使 HAL 直接交付该物理镜头画面，
+            // 不进入逻辑多摄融合（本机超广角融合管线已损坏）。
+            ACameraIdList plist{};
+            const char* pid = physicalId_.c_str();
+            plist.numCameras = 1;
+            plist.cameraIds = &pid;
+            if (ACameraDevice_createCaptureRequest_withPhysicalIds(device_, TEMPLATE_PREVIEW, &plist,
+                                                                  &repeating_) != ACAMERA_OK ||
+                !repeating_) {
+                LOGE("createCaptureRequest_withPhysicalIds failed (phys=%s)", physicalId_.c_str());
+                return false;
+            }
+        } else {
+            if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &repeating_) != ACAMERA_OK) {
+                LOGE("createCaptureRequest(repeating) failed");
+                return false;
+            }
         }
         for (ANativeWindow* w : targets) {
             ACameraOutputTarget* t = nullptr;
@@ -118,7 +145,7 @@ bool CaptureSession::setRepeating(const std::vector<ANativeWindow*>& targets,
         repeatingWins_ = targets;
     }
 
-    applySettings(repeating_, s);
+    applySettings(repeating_, s, !physicalId_.empty(), physZoom);
     int seqId = 0;
     ACaptureRequest* reqArr[1] = {repeating_};
     if (ACameraCaptureSession_setRepeatingRequest(session_, &capCbs_, 1, reqArr, &seqId) !=
@@ -156,8 +183,13 @@ bool CaptureSession::captureOnce(const std::vector<ANativeWindow*>& targets,
     return true;
 }
 
-void CaptureSession::applySettings(ACaptureRequest* req, const CaptureSettings& s) const {
-    s.apply(req);
+void CaptureSession::applySettings(ACaptureRequest* req, const CaptureSettings& s, bool skipZoom,
+                                   float physZoom) const {
+    s.apply(req, skipZoom);
+    // 物理直连 + 相对数字变焦（>0 才写；值域按该物理镜头自身 zoomRatioRange，HAL 钳制）
+    if (skipZoom && physZoom > 0.f) {
+        ACaptureRequest_setEntry_float(req, ACAMERA_CONTROL_ZOOM_RATIO, 1, &physZoom);
+    }
 }
 
 void CaptureSession::onSessionClosed(void*, ACameraCaptureSession*) {}

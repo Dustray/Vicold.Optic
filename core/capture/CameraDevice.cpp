@@ -3,6 +3,8 @@
 
 #include <cstring>
 #include <sys/system_properties.h>
+#include <utility>
+#include <vector>
 
 namespace optic::capture {
 
@@ -50,6 +52,9 @@ bool CameraDevice::readTraits(const char* id) {
         traits_.isoMax = e.data.i32[1];
     }
     if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_ZOOM_RATIO_RANGE, &e) == ACAMERA_OK && e.count >= 2) {
+        // 保留原始下限（可能 <1.0，即超广角）。是否暴露 sub-1.0 由引擎 controls.txt 的
+        // uw=1 决定；默认不暴露（引擎侧钳到 1.0），因为本机超广角物理镜头在逻辑多摄切换下
+        // 会周期性断流（CamX SetCurrentflushOffset NULL）。待确诊是流配置问题还是硬件缺陷。
         traits_.zoomMin = e.data.f[0];
         traits_.zoomMax = e.data.f[1];
         traits_.hasZoomRatio = true;
@@ -77,6 +82,14 @@ bool CameraDevice::readTraits(const char* id) {
             std::memcpy(traits_.cfaPattern, kCfa[idx], 4);
     }
 
+    if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &e) == ACAMERA_OK && e.count >= 2) {
+        traits_.evMin = e.data.i32[0];
+        traits_.evMax = e.data.i32[1];
+    }
+    if (ACameraMetadata_getConstEntry(chars, ACAMERA_CONTROL_AE_COMPENSATION_STEP, &e) == ACAMERA_OK && e.count >= 2 && e.data.r[1].denominator != 0) {
+        traits_.evStep = float(e.data.r[0].numerator) / float(e.data.r[1].denominator);
+    }
+
     // 逻辑摄的物理成员 id（byte[n]，'\0' 分隔的字符串）
     if (traits_.logical &&
         ACameraMetadata_getConstEntry(chars, ACAMERA_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS, &e) == ACAMERA_OK) {
@@ -90,11 +103,60 @@ bool CameraDevice::readTraits(const char* id) {
         }
     }
 
+    // 探测物理镜头布局：逻辑摄的物理成员按焦距排序 —— 最短=超广角、最长=长焦、
+    // 居中者=主摄。本机 [3 2 4] = 2.57mm(超广) / 6.62mm(主) / 17.42mm(长焦≈2.63x)。
+    // 逻辑多摄的 ZOOM_RATIO 融合管线在本机有两个坏区：sub-1.0（超广角融合）与
+    // 高倍数字区（≥~4，SAT/长焦融合），两者都要物理直连绕开（见 CameraEngine）。
+    if (traits_.logical && !traits_.physicalIds.empty()) {
+        float fMin = 1e9f, fMax = 0.f, fMain = 0.f;
+        std::string minId, maxId;
+        std::vector<std::pair<std::string, float>> fmap;   // (id, focal)
+        for (auto& pid : traits_.physicalIds) {
+            ACameraMetadata* pc = nullptr;
+            if (ACameraManager_getCameraCharacteristics(manager_, pid.c_str(), &pc) != ACAMERA_OK || !pc)
+                continue;
+            ACameraMetadata_const_entry fe{};
+            if (ACameraMetadata_getConstEntry(pc, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &fe) ==
+                    ACAMERA_OK &&
+                fe.count > 0) {
+                float fl = fe.data.f[0];
+                fmap.emplace_back(pid, fl);
+                if (fl < fMin) { fMin = fl; minId = pid; }
+                if (fl > fMax) { fMax = fl; maxId = pid; }
+            }
+            ACameraMetadata_free(pc);
+        }
+        // 主摄 = 非（最短/最长）的那一个；成员只有 2 个时主摄 = 较长焦者（无长焦）
+        if (fmap.size() >= 3) {
+            for (auto& [pid, fl] : fmap) {
+                if (pid != minId && pid != maxId) { fMain = fl; break; }
+            }
+            if (fMain > 0.f && maxId != minId) {
+                traits_.telePhysicalId = maxId;
+                traits_.teleNativeZoom = fMax / fMain;
+            }
+        } else if (fmap.size() == 2) {
+            fMain = fMax;
+        }
+        if (fMain > 0.f) traits_.mainFocal = fMain;
+        if (minId.empty()) {
+            LOGW("physical lens detection failed (no focal length for members)");
+        } else {
+            traits_.uwPhysicalId = minId;
+            if (traits_.telePhysicalId.empty())
+                LOGI("phys layout: uw=%s(%.2fmm) main=%.2fmm (no tele)", minId.c_str(), fMin, fMain);
+            else
+                LOGI("phys layout: uw=%s(%.2fmm) main=%.2fmm tele=%s(%.2fmm, %.2fx)",
+                     minId.c_str(), fMin, fMain, traits_.telePhysicalId.c_str(), fMax,
+                     traits_.teleNativeZoom);
+        }
+    }
+
     ACameraMetadata_free(chars);
     return true;
 }
 
-bool CameraDevice::openFirstBack() {
+bool CameraDevice::openFirstBack(const std::string& forcedId) {
     close();
     manager_ = ACameraManager_create();
     if (!manager_) return false;
@@ -103,15 +165,23 @@ bool CameraDevice::openFirstBack() {
     if (ACameraManager_getCameraIdList(manager_, &ids) != ACAMERA_OK || !ids) return false;
 
     std::string chosen;
-    for (int i = 0; i < ids->numCameras && chosen.empty(); ++i) {
-        ACameraMetadata* chars = nullptr;
-        if (ACameraManager_getCameraCharacteristics(manager_, ids->cameraIds[i], &chars) != ACAMERA_OK) continue;
-        ACameraMetadata_const_entry e{};
-        if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_FACING, &e) == ACAMERA_OK && e.count > 0 &&
-            e.data.u8[0] == ACAMERA_LENS_FACING_BACK) {
-            chosen = ids->cameraIds[i];
+    if (!forcedId.empty()) {
+        // 诊断用：直接打开指定 ID（如物理超广角 2），绕过逻辑多摄 ZOOM_RATIO 切换管线
+        for (int i = 0; i < ids->numCameras; ++i) {
+            if (forcedId == ids->cameraIds[i]) { chosen = forcedId; break; }
         }
-        ACameraMetadata_free(chars);
+        if (chosen.empty()) LOGW("forced camera %s not in id list", forcedId.c_str());
+    } else {
+        for (int i = 0; i < ids->numCameras && chosen.empty(); ++i) {
+            ACameraMetadata* chars = nullptr;
+            if (ACameraManager_getCameraCharacteristics(manager_, ids->cameraIds[i], &chars) != ACAMERA_OK) continue;
+            ACameraMetadata_const_entry e{};
+            if (ACameraMetadata_getConstEntry(chars, ACAMERA_LENS_FACING, &e) == ACAMERA_OK && e.count > 0 &&
+                e.data.u8[0] == ACAMERA_LENS_FACING_BACK) {
+                chosen = ids->cameraIds[i];
+            }
+            ACameraMetadata_free(chars);
+        }
     }
     ACameraManager_deleteCameraIdList(ids);
     if (chosen.empty()) {

@@ -1,0 +1,131 @@
+#pragma once
+// M-UI：camera-ui.html 设计的 C++ GL 实现。
+// 设计空间 1560×720（横屏），等比 cover 到屏幕；UI/渲染/输入同在 glue 线程；
+// 设置命令经队列传引擎线程应用（iso/ss/zoom/ev/ae/shot 全走 triggerBurst 同款配额闸门）。
+// 参考原型：/camera-ui.html（布局常量 1:1 移植）。
+
+#include <android/input.h>
+#include <android/native_window.h>
+
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "core/ui/Gl.h"
+
+namespace optic::ui {
+
+class Ui {
+public:
+    struct Cmd {
+        enum Type { SET_ISO, SET_EXP_US, SET_ZOOM, SET_EV, SET_AE, SHOT } type = SET_ISO;
+        float v = 0;
+    };
+
+    ~Ui();                               // 析构出线（Gl::Impl 完整性在 Ui.cpp）
+    bool attach(ANativeWindow* win);     // EGL + 字体（幂等）
+    void detach();
+    bool attached() const { return gl_.ready(); }
+    ANativeWindow* previewWindow() { return gl_.previewWindow(); }
+    int32_t previewW() { return gl_.previewW(); }
+    int32_t previewH() { return gl_.previewH(); }
+
+    void setStaticText(int32_t rawW, int32_t rawH) { rawW_ = rawW; rawH_ = rawH; }
+    void setUvRot(int rot) { uvRotOverride_ = rot; }
+    // 定向的两个真值输入（比"猜方向"可靠）：
+    //   sensorDeg  = ACAMERA_SENSOR_ORIENTATION（缓冲需顺时针转多少度才在"本机自然方向"下正立）
+    //   displayRot = Surface.ROTATION_*（0/1/2/3；屏幕图形相对机身已顺时针转了 rot*90°）
+    // 二者齐全时 rot = (displayRot*90 - sensorDeg)/90 mod 4，横屏两个方向都能自动对。
+    void setSensorOrientation(int deg) { sensorDeg_ = deg; }
+    void setDisplayRot(int r) { displayRot_ = r; }
+    // 注入应用数据目录：attach 时读 controls.txt 的 preview_w/preview_h（机型调参用）
+    void setDataDir(const std::string& dir) { dataDir_ = dir; }
+
+    // 引擎线程回传本次快门是否被配额放行（toast 据此给真实反馈）
+    void notifyShot(bool accepted, int used, int total) {
+        shotOk_.store(accepted ? 1 : 0, std::memory_order_release);
+        shotUsed_.store(used, std::memory_order_release);
+        shotTotal_.store(total, std::memory_order_release);
+    }
+
+    void onInputEvent(AInputEvent* e);   // glue 线程
+    void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
+
+    // 引擎线程消费
+    bool popCmd(Cmd* out);
+
+    // 屏幕像素 → 设计空间（输入命中用，坐标系原点左上）
+    float toDesignX(float px) const { return (px - offX_) / scale_; }
+    float toDesignY(float py) const { return (py - offY_) / scale_; }
+
+private:
+    // 设计空间常量（camera-ui.html 移植）
+    static constexpr float kStageW = 1560, kStageH = 720;
+    // 变焦范围 0.7–10：sub-1.0 走超广角物理直连（引擎侧 uwActive 判定，见 CameraEngine）。
+    // 0.7–1.0 区间预览为超广角原生 FOV（物理直连不写 ZOOM_RATIO，段内无数字变焦）。
+    static constexpr float kZoomMin = 0.7f, kZoomMax = 10.f, kZoomBaseMm = 23.f;
+    static constexpr int kRingFrames = 4;
+
+    void onDown(float dx, float dy);
+    void onMove(float dx, float dy);
+    void onUp(float dx, float dy);
+    void draw();
+    void drawTracks();
+    void drawPreviewOverlay();
+    void drawHistogram(float x, float y, float w, float h);
+    void drawGrid(float x, float y, float w, float h);
+    void drawVTicks(float tx, float ty, float tw, float th,
+                    const std::vector<float>& fracs, const std::vector<char>& major);
+    // cover 缩放：长度只乘 scale_；位置再加居中偏移（cover 下 offX/offY 恒 ≤ 0）
+    float dim(float designLen) const { return designLen * scale_; }
+    float screenX(float designX) const { return designX * scale_ + offX_; }
+    float screenY(float designY) const { return designY * scale_ + offY_; }
+
+    Gl gl_;
+    float scale_ = 1.f;
+    float offX_ = 0.f, offY_ = 0.f;
+    int uvRotOverride_ = -1;                            // controls.txt 的 uvrot 强制值
+    int sensorDeg_ = 90;                                // 缺省 90（手机常规挂载）
+    int displayRot_ = -1;                               // -1 表示还没取到
+    int resolveUvRot() const;                           // -1=交给 Gl 做几何自动判断
+    std::string dataDir_;
+
+    // UI 状态
+    static constexpr int kIsoStopsN = 8;
+    static constexpr int kSsStopsN = 9;
+    static const int kIsoStops[kIsoStopsN];
+    static const int kSsStops[kSsStopsN];               // 分母（1/x s）
+    static constexpr float kZoomStops[6] = {0.7f, 1, 2, 3, 5, 10};
+    int isoIdx_ = 2;
+    int ssIdx_ = 3;
+    float zoom_ = 1.0f;   // 与引擎初始状态一致（引擎 zoomRatio=0 未设置 ≈ 原生 1.0）
+    float ev_ = -0.3f;
+    bool aeOn_ = true;
+    int zoomUnit_ = 0;                                  // 0=mm 1=×
+    bool gridOn_ = true;
+
+    // 触摸
+    enum class Drag { NONE, ZOOM, ISO, SS, EV } drag_ = Drag::NONE;
+    bool shutterDown_ = false;
+    double lastShotAt_ = 0;
+
+    // 动效
+    float flashA_ = 0;
+    double flashUntil_ = 0;
+    double toastUntil_ = 0;
+    int savedCount_ = 4;                                // toast 文案 n/4
+    std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
+    std::atomic<int> shotUsed_{0}, shotTotal_{0};
+
+    // 直方图
+    int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};
+    int32_t rawW_ = 4096, rawH_ = 3072;
+
+    std::mutex cmdM_;
+    std::deque<Cmd> cmds_;
+    void pushCmd(Cmd::Type t, float v);
+};
+
+} // namespace optic::ui

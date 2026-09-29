@@ -1,67 +1,24 @@
-// Vicold.Optic — NativeActivity 入口（M1：JNI 拍摄按钮 + 权限 + 引擎驱动）
-// 无 .java/.kt 源码；按钮经 JNI 叠加在 content FrameLayout 上。
-// ★ View 操作必须在主线程：android_main 跑在 glue 工作线程（非 Looper），
-//   直接 addView 会抛 "Animators may only be run on Looper threads"。
-//   修法：覆盖 ANativeActivity 的 onWindowFocusChanged 回调（主线程执行），
-//   hasFocus=true 时创建按钮，并链回 glue 原回调。
-// 引擎线程轮询 isPressed() 取上升沿触发一次 burst（受每启动配额保护）。
- 
+// Vicold.Optic — NativeActivity 入口（GL UI + 权限 + 引擎驱动）
+// UI 全部由 core/ui 的 GL 渲染器绘制（camera-ui.html 设计的 C++ 实现），
+// 本文件只做生命周期/权限/输入接线，无 .java/.kt，无 View 层。
+// 线程：glue 线程 = UI/渲染/输入；引擎线程 = 会话/拍摄（经队列通信）。
+
 #include <android/log.h>
 #include <android_native_app_glue.h>
-#include <jni.h>
- 
+
 #include <chrono>
-#include <thread>
- 
+
 #include "core/capture/CameraEngine.h"
- 
+#include "core/ui/Ui.h"
+
 #define LOG_TAG "Optic"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
- 
+
 namespace {
- 
+
 constexpr const char* kPerm = "android.permission.CAMERA";
-constexpr int kAndroidRIdContent = 16908290;   // android.R.id.content
-constexpr int kGravityBottomCenterH = 0x51;    // BOTTOM | CENTER_HORIZONTAL
-constexpr int kWrapContent = -2;
- 
-JavaVM* g_vm = nullptr;
-jobject g_shutterBtn = nullptr;                // GlobalRef
-ANativeActivityCallbacks g_origCallbacks{};    // glue 原回调（链回用）
- 
-JNIEnv* jniEnv() {
-    JNIEnv* env = nullptr;
-    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK) return env;
-    g_vm->AttachCurrentThread(&env, nullptr);
-    return env;
-}
- 
-// 取当前挂起异常的可读消息，用我们的 LOGE 打印（不依赖 stderr）
-void logPendingException(JNIEnv* env, const char* where) {
-    if (!env->ExceptionCheck()) return;
-    jthrowable ex = env->ExceptionOccurred();
-    env->ExceptionClear();
-    const char* what = "unknown";
-    jstring msg = nullptr;
-    jclass throwableCls = env->FindClass("java/lang/Throwable");
-    if (throwableCls) {
-        jmethodID getMsg = env->GetMethodID(throwableCls, "getMessage", "()Ljava/lang/String;");
-        if (getMsg) msg = static_cast<jstring>(env->CallObjectMethod(ex, getMsg));
-    }
-    if (msg) what = env->GetStringUTFChars(msg, nullptr);
-    LOGE("btn: %s threw: %s", where, what);
-    if (msg) { env->ReleaseStringUTFChars(msg, what); env->DeleteLocalRef(msg); }
-    env->DeleteLocalRef(ex);
-    if (throwableCls) env->DeleteLocalRef(throwableCls);
-}
- 
-bool checkClear(JNIEnv* env, const char* where) {
-    if (!env->ExceptionCheck()) return true;
-    logPendingException(env, where);
-    return false;
-}
- 
+
 bool permissionGranted(android_app* app) {
     JNIEnv* env = nullptr;
     if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
@@ -74,7 +31,7 @@ bool permissionGranted(android_app* app) {
     env->DeleteLocalRef(cls);
     return r == 0;
 }
- 
+
 void requestPermission(android_app* app) {
     JNIEnv* env = nullptr;
     if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
@@ -90,7 +47,7 @@ void requestPermission(android_app* app) {
     env->DeleteLocalRef(perm);
     env->DeleteLocalRef(cls);
 }
- 
+
 void ensurePermission(android_app* app) {
     if (permissionGranted(app)) return;
     LOGI("requesting camera permission");
@@ -99,168 +56,225 @@ void ensurePermission(android_app* app) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     LOGI("permission after wait: %s", permissionGranted(app) ? "granted" : "DENIED");
 }
- 
-// ★ 主线程执行（经 onWindowFocusChanged 回调）：创建按钮
-void createShutterButton(ANativeActivity* activity) {
-    if (g_shutterBtn) return;
-    JNIEnv* env = jniEnv();
-    env->ExceptionClear();
- 
-    jclass btnCls = env->FindClass("android/widget/Button");
-    if (!checkClear(env, "FindClass Button")) return;
-    jmethodID ctor = env->GetMethodID(btnCls, "<init>", "(Landroid/content/Context;)V");
-    jobject btn = env->NewObject(btnCls, ctor, activity->clazz);
-    if (!checkClear(env, "NewObject Button")) return;
- 
-    jmethodID setText = env->GetMethodID(btnCls, "setText", "(Ljava/lang/CharSequence;)V");
-    jstring label = env->NewStringUTF("拍摄 RAW");
-    env->CallVoidMethod(btn, setText, label);
-    env->DeleteLocalRef(label);
-    if (!checkClear(env, "setText")) return;
- 
-    jclass viewCls = env->FindClass("android/view/View");
-    jmethodID setBg = env->GetMethodID(viewCls, "setBackgroundColor", "(I)V");
-    env->CallVoidMethod(btn, setBg, static_cast<jint>(0xFFFF0000));   // 调试红底
-    if (!checkClear(env, "setBackgroundColor")) return;
- 
-    jmethodID getWindow = env->GetMethodID(env->GetObjectClass(activity->clazz),
-                                           "getWindow", "()Landroid/view/Window;");
-    jobject window = env->CallObjectMethod(activity->clazz, getWindow);
-    jmethodID getDecor = env->GetMethodID(env->GetObjectClass(window),
-                                          "getDecorView", "()Landroid/view/View;");
-    jobject decor = env->CallObjectMethod(window, getDecor);
-    if (!checkClear(env, "getWindow/getDecorView")) return;
- 
-    // 子窗口方案：按钮挂独立 surface，合成在相机预览之上（主窗口 surface 被相机直写覆盖）
-    jmethodID getToken = env->GetMethodID(viewCls, "getWindowToken", "()Landroid/os/IBinder;");
-    jobject token = env->CallObjectMethod(decor, getToken);
-    if (!checkClear(env, "getWindowToken")) return;
-    if (!token) { LOGE("btn: window token not ready"); return; }
 
-    jclass ctxCls = env->FindClass("android/content/Context");
-    jfieldID fWs = env->GetStaticFieldID(ctxCls, "WINDOW_SERVICE", "Ljava/lang/String;");
-    jstring wsName = static_cast<jstring>(env->GetStaticObjectField(ctxCls, fWs));
-    jmethodID getSysSvc = env->GetMethodID(env->GetObjectClass(activity->clazz),
-        "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jobject wm = env->CallObjectMethod(activity->clazz, getSysSvc, wsName);
-    if (!checkClear(env, "getSystemService(WINDOW_SERVICE)")) return;
-    if (!wm) { LOGE("btn: window manager not found"); return; }
-
-    jclass lpCls = env->FindClass("android/view/WindowManager$LayoutParams");
-    if (!checkClear(env, "FindClass WM$LayoutParams") || !lpCls) { logPendingException(env, "FindClass WM$LayoutParams"); return; }
-    jmethodID lpCtor = env->GetMethodID(lpCls, "<init>", "(IIIII)V");   // (w, h, type, flags, format)
-    if (!lpCtor || !checkClear(env, "GetMethodID LayoutParams<init>")) { logPendingException(env, "lpCtor lookup"); return; }
-    // w=WRAP_CONTENT, h=WRAP_CONTENT, type=TYPE_APPLICATION_PANEL(1000), flags=0, format=TRANSLUCENT(-3)
-    jobject lp = env->NewObject(lpCls, lpCtor, kWrapContent, kWrapContent, 1000, 0, -3);
-    if (!checkClear(env, "NewObject LayoutParams")) return;
-
-    jfieldID gravityField = env->GetFieldID(lpCls, "gravity", "I");
-    if (!gravityField || !checkClear(env, "gravity field")) { logPendingException(env, "gravity field"); return; }
-    env->SetIntField(lp, gravityField, kGravityBottomCenterH);
-    jfieldID yField = env->GetFieldID(lpCls, "y", "I");
-    if (!yField || !checkClear(env, "y field")) { logPendingException(env, "y field"); return; }
-    env->SetIntField(lp, yField, 200);   // gravity=BOTTOM 时 y 为自底向上的偏移
-
-    jfieldID tokenField = env->GetFieldID(lpCls, "token", "Landroid/os/IBinder;");
-    if (!tokenField || !checkClear(env, "GetFieldID token")) { logPendingException(env, "token field"); return; }
-    env->SetObjectField(lp, tokenField, token);
-    if (!checkClear(env, "LayoutParams.token")) return;
-
-    jmethodID wmAddView = env->GetMethodID(env->GetObjectClass(wm), "addView",
-        "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    env->CallVoidMethod(wm, wmAddView, btn, lp);
-    if (!checkClear(env, "wm.addView")) return;
- 
-    jmethodID bringFront = env->GetMethodID(viewCls, "bringToFront", "()V");
-    env->CallVoidMethod(btn, bringFront);
-    jmethodID setElev = env->GetMethodID(viewCls, "setElevation", "(F)V");
-    env->CallVoidMethod(btn, setElev, 24.0f);
-    if (!checkClear(env, "bringToFront/setElevation")) return;
- 
-    g_shutterBtn = env->NewGlobalRef(btn);
-    LOGI("shutter button created");
+// 安全查找：GetMethodID/GetStaticMethodID 找不到时会抛 NoSuchMethodError（不是返回 null），
+// 未清的 pending exception 会让下一次 JNI 调用直接 abort，所以每次查找后立即清理。
+static jmethodID lookupMethod(JNIEnv* env, jclass cls, const char* name, const char* sig,
+                              bool isStatic) {
+    if (!cls) return nullptr;
+    jmethodID m = isStatic ? env->GetStaticMethodID(cls, name, sig)
+                           : env->GetMethodID(cls, name, sig);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return m;
 }
- 
-void destroyShutterButton(android_app* app) {
-    if (!g_shutterBtn) return;
-    JNIEnv* env = jniEnv();
-    jclass viewCls = env->FindClass("android/view/View");
-    jmethodID getParent = env->GetMethodID(viewCls, "getParent", "()Landroid/view/ViewParent;");
-    jobject parent = env->CallObjectMethod(g_shutterBtn, getParent);
-    if (parent) {
-        jmethodID removeView = env->GetMethodID(env->GetObjectClass(parent), "removeView", "(Landroid/view/View;)V");
-        env->CallVoidMethod(parent, removeView, g_shutterBtn);
-        env->DeleteLocalRef(parent);
+
+// 全屏沉浸：隐藏状态栏/导航栏 + 不让 decor 避让 insets。
+// 否则 MIUI 在横屏下让窗口避让系统栏（实测一侧留 150px），cover 缩放会把快门裁掉一条。
+// 注意：必须在 UI 线程调用（见 android_main 里的 onWindowFocusChanged 钩子）。
+// statusBars()/navigationBars() 在嵌套类 android.view.WindowInsets$Type 上。
+void hideSystemBars(android_app* app) {
+    JNIEnv* env = nullptr;
+    if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+
+    jobject activity = app->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getWindow = lookupMethod(env, actCls, "getWindow", "()Landroid/view/Window;", false);
+    jobject window = getWindow ? env->CallObjectMethod(activity, getWindow) : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(actCls);
+    if (!window) return;
+
+    jclass winCls = env->GetObjectClass(window);
+    jmethodID setDecorFits =
+        lookupMethod(env, winCls, "setDecorFitsSystemWindows", "(Z)V", false);
+    LOGI("hideBars: window=%d setDecorFits=%d", window != nullptr, setDecorFits != nullptr);
+    if (setDecorFits) {
+        env->CallVoidMethod(window, setDecorFits, JNI_FALSE);
+        if (env->ExceptionCheck()) env->ExceptionClear();
     }
-    checkClear(env, "removeView");   // 非 Iooper 线程可能抛，容忍（进程即将退出）
-    env->DeleteGlobalRef(g_shutterBtn);
-    g_shutterBtn = nullptr;
-    LOGI("shutter button removed");
+
+    jmethodID getCtrl =
+        lookupMethod(env, winCls, "getInsetsController",
+                     "()Landroid/view/WindowInsetsController;", false);
+    jobject ctrl = getCtrl ? env->CallObjectMethod(window, getCtrl) : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    LOGI("hideBars: ctrl=%d", ctrl != nullptr);
+    env->DeleteLocalRef(winCls);
+    if (ctrl) {
+        jclass ctrlCls = env->GetObjectClass(ctrl);
+        jclass typeCls = env->FindClass("android/view/WindowInsets$Type");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jint types = 0;
+        if (jmethodID m = lookupMethod(env, typeCls, "statusBars", "()I", true))
+            types |= env->CallStaticIntMethod(typeCls, m);
+        if (jmethodID m = lookupMethod(env, typeCls, "navigationBars", "()I", true))
+            types |= env->CallStaticIntMethod(typeCls, m);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+
+        LOGI("hideBars: typeCls=%d types=%d", typeCls != nullptr, types);
+        if (jmethodID hide = lookupMethod(env, ctrlCls, "hide", "(I)V", false); hide && types) {
+            env->CallVoidMethod(ctrl, hide, types);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE：滑动时临时显示，不改变窗口布局
+        if (jmethodID setBeh = lookupMethod(env, ctrlCls, "setSystemBarsBehavior", "(I)V", false)) {
+            env->CallVoidMethod(ctrl, setBeh, 2);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        if (ctrlCls) env->DeleteLocalRef(ctrlCls);
+        if (typeCls) env->DeleteLocalRef(typeCls);
+        env->DeleteLocalRef(ctrl);
+    }
+    env->DeleteLocalRef(window);
 }
- 
-// 引擎线程轮询：按钮是否被按住（上升沿判定在引擎内）
-bool shutterPressed() {
-    if (!g_shutterBtn) return false;
-    JNIEnv* env = jniEnv();
-    jclass cls = env->GetObjectClass(g_shutterBtn);
-    jmethodID isPressed = env->GetMethodID(cls, "isPressed", "()Z");
-    return env->CallBooleanMethod(g_shutterBtn, isPressed);
+
+// 屏幕旋转角：Surface.ROTATION_*（0/1/2/3），即"绘制图形相对机身自然方向顺时针转了 rot*90°"。
+// 预览定向 = (displayRot*90 - sensorOrientation)/90 mod 4；取不到就退回几何自动判断。
+// 优先 Activity.getDisplay()（API30+），失败再退 getWindowManager().getDefaultDisplay()。
+int displayRotation(android_app* app) {
+    JNIEnv* env = nullptr;
+    if (!app || !app->activity || app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+        return -1;
+    jobject activity = app->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jobject disp = nullptr;
+
+    if (jmethodID m = lookupMethod(env, actCls, "getDisplay", "()Landroid/view/Display;", false)) {
+        disp = env->CallObjectMethod(activity, m);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    if (!disp) {
+        jmethodID gw =
+            lookupMethod(env, actCls, "getWindowManager", "()Landroid/view/WindowManager;", false);
+        if (gw) {
+            jobject wm = env->CallObjectMethod(activity, gw);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (wm) {
+                jclass wmCls = env->GetObjectClass(wm);
+                jmethodID gd = lookupMethod(env, wmCls, "getDefaultDisplay",
+                                            "()Landroid/view/Display;", false);
+                if (gd) {
+                    disp = env->CallObjectMethod(wm, gd);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                }
+                env->DeleteLocalRef(wmCls);
+                env->DeleteLocalRef(wm);
+            }
+        }
+    }
+    int rot = -1;
+    if (disp) {
+        jclass dCls = env->GetObjectClass(disp);
+        if (jmethodID gr = lookupMethod(env, dCls, "getRotation", "()I", false)) {
+            rot = env->CallIntMethod(disp, gr);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); rot = -1; }
+        }
+        env->DeleteLocalRef(dCls);
+        env->DeleteLocalRef(disp);
+    }
+    env->DeleteLocalRef(actCls);
+    LOGI("display rotation = %d", rot);
+    return rot;
 }
- 
-// ★ 主线程回调（覆盖 glue 的 onWindowFocusChanged）：窗口聚焦时创建按钮
-void onWindowFocusChanged(ANativeActivity* activity, int hasFocus) {
-    if (g_origCallbacks.onWindowFocusChanged)
-        g_origCallbacks.onWindowFocusChanged(activity, hasFocus);   // 链回 glue
-    if (g_vm && hasFocus && !g_shutterBtn) createShutterButton(activity);
+
+// 框架在 UI 线程回调 onWindowFocusChanged —— 在这里做系统栏隐藏最安全。
+// 先挂系统栏钩子再转调 glue 原实现，保持 glue 的 GAINED/LOST_FOCUS 命令投递。
+using FocusChangedFn = void (*)(ANativeActivity*, int);
+FocusChangedFn g_glueFocusChanged = nullptr;
+
+void hookWindowFocusChanged(ANativeActivity* activity, int focused) {
+    if (focused) {
+        android_app* app = static_cast<android_app*>(activity->instance);
+        if (app) {
+            LOGI("focus gained -> hide system bars");
+            hideSystemBars(app);
+        }
+    }
+    if (g_glueFocusChanged) g_glueFocusChanged(activity, focused);
 }
- 
+
+struct AppState {
+    optic::capture::CameraEngine engine;
+    optic::ui::Ui ui;
+};
+
+int onInputEvent(android_app* app, AInputEvent* e) {
+    auto* st = static_cast<AppState*>(app->userData);
+    if (st) {
+        st->ui.onInputEvent(e);
+        return 1;
+    }
+    return 0;
+}
+
 void handleCommand(android_app* app, int32_t cmd) {
-    auto* engine = static_cast<optic::capture::CameraEngine*>(app->userData);
+    auto* st = static_cast<AppState*>(app->userData);
+    auto* engine = &st->engine;
+    auto* ui = &st->ui;
     switch (cmd) {
         case APP_CMD_START: LOGI("APP_CMD_START"); break;
         case APP_CMD_RESUME: LOGI("APP_CMD_RESUME"); break;
+        // 横屏两个方向（ROTATION_90/270）之间切换只发 CONFIG_CHANGED 时也要重取旋转角
+        case APP_CMD_CONFIG_CHANGED:
+            LOGI("APP_CMD_CONFIG_CHANGED");
+            if (ui) ui->setDisplayRot(displayRotation(app));
+            break;
         case APP_CMD_INIT_WINDOW:
             LOGI("APP_CMD_INIT_WINDOW surface=%p", (void*)app->window);
             ensurePermission(app);
-            engine->start(app->window, app->activity->externalDataPath);
+            ui->setDataDir(app->activity->externalDataPath);   // attach 时要读 controls.txt
+            ui->setDisplayRot(displayRotation(app));           // 预览定向（横屏两个方向都要对）
+            if (ui && ui->attach(app->window)) {
+                engine->setUi(ui);
+                engine->start(app->activity->externalDataPath);
+            }
             break;
         case APP_CMD_TERM_WINDOW:
             LOGI("APP_CMD_TERM_WINDOW");
             engine->stop();
+            if (ui) ui->detach();
             break;
         case APP_CMD_PAUSE:
             LOGI("APP_CMD_PAUSE");
             engine->stop();
+            if (ui) ui->detach();
             break;
         case APP_CMD_DESTROY:
             LOGI("APP_CMD_DESTROY");
             engine->stop();
-            destroyShutterButton(app);
+            if (ui) ui->detach();
             break;
         default: break;
     }
 }
- 
+
 } // namespace
- 
+
 extern "C" void android_main(android_app* app) {
     LOGI("Vicold.Optic starting (native main)");
-    g_vm = app->activity->vm;                     // JNI 句柄必须最先设
-    optic::capture::CameraEngine engine;
-    engine.setTriggerPoll(shutterPressed);
-    app->userData = &engine;
+    static AppState state;
+    app->userData = &state;
     app->onAppCmd = handleCommand;
- 
-    // 覆盖主线程回调（glue 已在 onCreate 设置过自己的，先存后覆盖以链回）
-    g_origCallbacks = *app->activity->callbacks;
-    app->activity->callbacks->onWindowFocusChanged = onWindowFocusChanged;
- 
-    android_poll_source* source = nullptr;
-    int events = 0;
+    app->onInputEvent = onInputEvent;
+    state.engine.setUi(&state.ui);
+
+    // 挂焦点钩子：框架在 UI 线程回调，正好用来隐藏系统栏（ glue 原实现转调保留）
+    g_glueFocusChanged = app->activity->callbacks->onWindowFocusChanged;
+    app->activity->callbacks->onWindowFocusChanged = hookWindowFocusChanged;
+
+    // glue 主循环：UI 渲染 + 事件处理（vsync 由 eglSwapInterval 节奏控制）
+    // 必须调用 source->process()：glue 以 NULL 回调注册 fd，pollOnce 只「报告」事件，
+    // 真正的读管道 + 派发命令/输入在 process() 里。漏掉它 → 命令永不消费、fd 一直可读，
+    // 表现为主线程永久卡在 NativeActivity.onStart*（glue 写完命令要等本线程消费）+ 100% CPU 自旋。
     while (app->destroyRequested == 0) {
-        int ident = ALooper_pollOnce(engine.running() ? 100 : -1, nullptr, &events,
+        int events = 0;
+        android_poll_source* source = nullptr;
+        // 有窗口时非阻塞轮询（由 eglSwapBuffers 跟 vsync 限速）；无窗口时阻塞等事件
+        int timeout = state.ui.attached() ? 0 : -1;
+        int ident = ALooper_pollOnce(timeout, nullptr, &events,
                                      reinterpret_cast<void**>(&source));
         if (ident >= 0 && source != nullptr) source->process(app, source);
+        if (state.ui.attached()) state.ui.frame();
     }
     LOGI("native main exit");
 }

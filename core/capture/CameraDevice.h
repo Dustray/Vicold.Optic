@@ -16,6 +16,10 @@ struct CameraTraits {
     std::string id;
     bool logical = false;
     std::vector<std::string> physicalIds;   // 逻辑摄的物理成员（V5）
+    std::string uwPhysicalId;               // 超广角物理摄像头 ID（physicalIds 中焦距最短者）
+    std::string telePhysicalId;             // 长焦物理摄像头 ID（焦距最长者；成员<3 时为空）
+    float teleNativeZoom = 0.f;             // 长焦原生倍率 = f(tele)/f(main)（0=未知）
+    float mainFocal = 0.f;                  // 主摄物理焦距（mm）
     int hardwareLevel = -1;
     bool raw = false;
     int32_t sensorOrientation = 0;
@@ -28,6 +32,8 @@ struct CameraTraits {
     int32_t blackLevel[4] = {0, 0, 0, 0};   // DNG 写入用（V3，运行时从 characteristics 填充）
     uint8_t cfaPattern[4] = {0, 1, 1, 2};   // CFA 图案（默认 RGGB，运行时按枚举映射）
     bool lscOn = false;                     // per-frame LSC map 可用（V4）
+    int32_t evMin = 0, evMax = 0;           // AE 补偿范围（步数）
+    float evStep = 1.f / 3;                 // AE 补偿步长（EV）
 };
 
 class CameraDevice {
@@ -38,7 +44,8 @@ public:
     CameraDevice& operator=(const CameraDevice&) = delete;
 
     // 枚举后置摄像头（M1.4：只取第一个后置逻辑摄；物理摄经 characteristics 读取）
-    bool openFirstBack();
+    // forcedId 非空时直接打开该 ID（诊断用：物理摄像头直开实验，绕过逻辑多摄切换管线）
+    bool openFirstBack(const std::string& forcedId = {});
     void close();
 
     bool opened() const { return device_ != nullptr; }
