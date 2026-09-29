@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -18,7 +19,7 @@ bool RawCapture::create(int32_t w, int32_t h, const std::string& saveDir, int ma
     h_ = h;
     dir_ = saveDir;
     std::error_code ec;
-    std::filesystem::create_directories(dir_ + "/raw", ec);
+    std::filesystem::create_directories(dir_ + "/dng", ec);
 
     // 0x20 = RAW_SENSOR（NDK 未导出该枚举名，值同 ImageFormat.RAW_SENSOR）
     if (AImageReader_new(w, h, 0x20, maxImages, &reader_) != AMEDIA_OK || !reader_) {
@@ -66,7 +67,7 @@ ANativeWindow* RawCapture::window() {
 void RawCapture::onFrameResult(const FrameResult& r) {
     std::lock_guard<std::mutex> l(m_);
     meta_.emplace_back(r.timestampNs, r);
-    while (meta_.size() > 32) meta_.pop_front();
+    while (meta_.size() > 64) meta_.pop_front();
 }
 
 void RawCapture::setRingMode(bool on) {
@@ -133,30 +134,10 @@ void RawCapture::onImage(AImage* img) {
         }
     }
 
-    // 时间戳配对最近的结果元数据（±20ms）；未命中回退最新一条并打点偏差（时基诊断）
-    FrameResult meta;
-    bool paired = false;
-    for (auto it = meta_.rbegin(); it != meta_.rend(); ++it) {
-        if (std::llabs(it->first - ts) < 20000000LL) {
-            meta = it->second;
-            paired = true;
-            break;
-        }
-    }
-    if (!paired && !meta_.empty()) {
-        meta = meta_.back().second;
-        if (ts - lastPairWarn_ > 3000000000LL) {
-            lastPairWarn_ = ts;
-            LOGW("meta pairing miss: imgTs=%lld nearestMetaTs=%lld delta=%lldms",
-                 static_cast<long long>(ts), static_cast<long long>(meta_.back().first),
-                 static_cast<long long>(std::llabs(meta_.back().first - ts)) / 1000000);
-        }
-    }
-
     if (!ringMode_) {
         if (singlePending_ > 0) {
             singlePending_ = 0;
-            saveQ_.push_back({img, meta});
+            saveQ_.push_back({img, ts});
             cv_.notify_one();
             return;
         }
@@ -164,7 +145,7 @@ void RawCapture::onImage(AImage* img) {
         return;
     }
 
-    ring_.push_back({img, meta});
+    ring_.push_back({img, ts});
     while (ring_.size() > kRingFrames) {
         if (ring_.front().img) AImage_delete(ring_.front().img);
         ring_.pop_front();
@@ -180,6 +161,30 @@ void RawCapture::saverLoop() {
             if (stop_ && saveQ_.empty()) return;
             f = std::move(saveQ_.front());
             saveQ_.pop_front();
+        }
+
+        // ★ 元数据配对在落盘时进行：此刻该帧的结果元数据早已到达（晚约 2 帧）
+        FrameResult meta;
+        {
+            std::lock_guard<std::mutex> l(m_);
+            bool paired = false;
+            for (auto it = meta_.rbegin(); it != meta_.rend(); ++it) {
+                if (std::llabs(it->first - f.imgTs) < 20000000LL) {
+                    meta = it->second;
+                    paired = true;
+                    break;
+                }
+            }
+            if (!paired && !meta_.empty()) {
+                meta = meta_.back().second;
+                if (f.imgTs - lastPairWarn_ > 3000000000LL) {
+                    lastPairWarn_ = f.imgTs;
+                    LOGW("meta pairing miss: imgTs=%lld nearestMetaTs=%lld delta=%lldms",
+                         static_cast<long long>(f.imgTs),
+                         static_cast<long long>(meta_.back().first),
+                         static_cast<long long>(std::llabs(meta_.back().first - f.imgTs)) / 1000000);
+                }
+            }
         }
 
         uint8_t* data = nullptr;
@@ -207,23 +212,18 @@ void RawCapture::saverLoop() {
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
         char name[64];
-        snprintf(name, sizeof(name), "raw_%lld_%03d", static_cast<long long>(ms), seq_++);
-        std::string base = dir_ + "/raw/" + name;
+        snprintf(name, sizeof(name), "dng_%lld_%03d", static_cast<long long>(ms), seq_++);
+        std::string base = dir_ + "/dng/" + name;
 
-        {
-            std::ofstream out(base + ".raw", std::ios::binary);
-            if (!buf.empty()) out.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+        dng::FrameMeta fm;
+        fm.timestampNs = f.imgTs;
+        fm.iso = meta.iso;
+        fm.exposureNs = meta.exposureNs;
+        std::memcpy(fm.wbGains, meta.wbGains, sizeof(fm.wbGains));
+
+        if (!dng::write(base + ".dng", buf.data(), buf.size(), sm_, fm)) {
+            LOGE("dng write failed: %s", base.c_str());
         }
-        {
-            std::ofstream out(base + ".txt");
-            out << "w=" << w_ << "\nh=" << h_ << "\nrowStride=" << rowStride
-                << "\npixelStride=" << pixStride << "\nbytes=" << buf.size()
-                << "\ntimestampNs=" << f.meta.timestampNs << "\niso=" << f.meta.iso
-                << "\nexposureNs=" << f.meta.exposureNs << "\nzoom=" << f.meta.zoomRatio
-                << "\nformat=RAW_SENSOR(16bit bayer, tight)\n";
-        }
-        LOGI("RAW saved: %s.raw (%zu bytes) iso=%d exp=%lldns", name, buf.size(), f.meta.iso,
-             static_cast<long long>(f.meta.exposureNs));
         if (f.img) AImage_delete(f.img);
     }
 }

@@ -140,7 +140,17 @@ struct IOpticDevice {
 
 **退出标准**：预览流畅无丢帧 ✅；手动参数实时生效 ✅；RAW 帧能取出且元数据完整 ✅（iso=89 真实值）；快门回溯可用 ✅。
 
-### M2 — RAW/DNG 输出链路 【P0，2 周】
+### M2 — RAW/DNG 输出链路 【P0，2 周】◐ 首光完成（2026-09-29）
+
+> **状态（2026-09-29）：DNG 端到端打通 ✅**
+> - 2.1 ✅ 元数据模型（StaticMeta/FrameMeta）+ WB gains 捕获（COLOR_CORRECTION_GAINS 进 FrameResult）
+> - 2.2 ✅ `dng/DngWriter`：自研 TIFF 构建器（无外部依赖），IFD0(缩略图+SubIFDs)→IFD1(raw CFA)，全必需 tag：
+>   DNGVersion/BackwardVersion/UniqueCameraModel/ColorMatrix1/AsShotNeutral/BlackLevel×4/WhiteLevel/
+>   DefaultCropOrigin+Size/ActiveArea/CFARepeatPatternDim/CFAPattern/CFALayout/CalibrationIlluminant1/ISO/ExposureTime
+> - 2.1 补充 ✅ 元数据配对移至落盘时（根治 66ms 乱序 miss；到达时配对已废弃）
+> - 2.3 ⏳ 机身方向/EXIF IFD/GPS（Orientation 已按 sensor 90→6 映射；EXIF 子 IFD 待做）
+> - 2.4 ⏳ 校验闭环：Python 结构校验 ✅ + demosaic 预览渲染 ✅（场景可辨、文字清晰）；Lightroom 导入 + 连拍 100 张压力、ColorMatrix1 校准（当前为占位单位阵）、hot pixel（max=65535 离群点待查）待做
+> - 实测：`dng saved: dng_xxx.dng (25756630 bytes, thumb 512x384)` ×4 = 24MiB bayer + 590KiB 缩略图 + tags
 
 | # | 任务 | 优先级 |
 |---|---|---|

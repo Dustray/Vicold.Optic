@@ -18,6 +18,12 @@ FrameResult parseResult(const ACameraMetadata* result) {
         out.exposureNs = e.data.i64[0];
     if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_ZOOM_RATIO, &e) == ACAMERA_OK && e.count > 0)
         out.zoomRatio = e.data.f[0];
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_COLOR_CORRECTION_GAINS, &e) == ACAMERA_OK && e.count >= 4) {
+        out.wbGains[0] = e.data.f[0];
+        out.wbGains[1] = e.data.f[1];
+        out.wbGains[2] = e.data.f[2];
+        out.wbGains[3] = e.data.f[3];
+    }
     return out;
 }
 

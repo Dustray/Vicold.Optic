@@ -1,6 +1,7 @@
 #include "core/capture/CameraDevice.h"
 #include "core/util/Log.h"
 
+#include <cstring>
 #include <sys/system_properties.h>
 
 namespace optic::capture {
@@ -62,6 +63,19 @@ bool CameraDevice::readTraits(const char* id) {
     if (ACameraMetadata_getConstEntry(chars, ACAMERA_STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES, &e) == ACAMERA_OK)
         for (uint32_t i = 0; i < e.count; ++i)
             if (e.data.u8[i] == 1) traits_.lscOn = true;
+
+    if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT, &e) == ACAMERA_OK && e.count > 0) {
+        // CFA 枚举 → 2×2 图案（DNG CFAPattern 值：R=0, G=1, B=2）
+        static const uint8_t kCfa[4][4] = {
+            {0, 1, 1, 2},   // RGGB
+            {1, 0, 2, 1},   // GRBG
+            {1, 2, 1, 0},   // GBRG
+            {2, 1, 1, 0},   // BGGR
+        };
+        int idx = e.data.u8[0];
+        if (idx >= 0 && idx <= 3)
+            std::memcpy(traits_.cfaPattern, kCfa[idx], 4);
+    }
 
     // 逻辑摄的物理成员 id（byte[n]，'\0' 分隔的字符串）
     if (traits_.logical &&

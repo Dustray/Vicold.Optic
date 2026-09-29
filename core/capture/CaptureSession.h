@@ -26,6 +26,7 @@ struct FrameResult {
     int32_t iso = 0;
     int64_t exposureNs = 0;
     float zoomRatio = 1.f;
+    float wbGains[4] = {1, 1, 1, 1};   // [r, gEven, gOdd, b]（COLOR_CORRECTION_GAINS）
 };
 
 class CaptureSession {

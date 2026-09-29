@@ -1,6 +1,7 @@
 #include "core/capture/CameraEngine.h"
 
 #include "core/device/DeviceRegistry.h"
+#include "core/dng/DngWriter.h"
 #include "core/util/Log.h"
 
 #include <camera/NdkCameraMetadata.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <thread>
 
@@ -114,7 +116,18 @@ bool CameraEngine::openSession(ANativeWindow* window) {
     // RAW 通路（能力具备时创建；会话输出恒含 RAW，repeating 是否带 RAW 由模式决定）
     if (t.raw && !raw_) {
         raw_ = std::make_unique<RawCapture>();
-        if (!raw_->create(t.pixelW, t.pixelH, dataDir_)) {
+        if (raw_->create(t.pixelW, t.pixelH, dataDir_)) {
+            // M2.1：静态元数据（DNG 写入用）来自真机 characteristics
+            dng::StaticMeta sm;
+            sm.width = t.pixelW;
+            sm.height = t.pixelH;
+            std::memcpy(sm.cfaPattern, t.cfaPattern, sizeof(sm.cfaPattern));
+            std::memcpy(sm.blackLevel, t.blackLevel, sizeof(sm.blackLevel));
+            sm.whiteLevel = 1023;
+            sm.sensorOrientation = t.sensorOrientation;
+            sm.model = "Xiaomi 17 Pro (" + propName("ro.product.device") + ")";
+            raw_->setStaticMeta(sm);
+        } else {
             LOGE("raw reader create failed, RAW disabled");
             raw_.reset();
         }

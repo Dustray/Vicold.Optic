@@ -25,7 +25,8 @@ struct CameraTraits {
     float zoomMin = 1.f, zoomMax = 1.f;
     bool hasZoomRatio = false;
     int32_t focusMinD = 0;                  // 最小对焦距离（屈光度，0=定焦）
-    int32_t blackLevel[4] = {0, 0, 0, 0};   // DNG 写入用（V3）
+    int32_t blackLevel[4] = {0, 0, 0, 0};   // DNG 写入用（V3，运行时从 characteristics 填充）
+    uint8_t cfaPattern[4] = {0, 1, 1, 2};   // CFA 图案（默认 RGGB，运行时按枚举映射）
     bool lscOn = false;                     // per-frame LSC map 可用（V4）
 };
 

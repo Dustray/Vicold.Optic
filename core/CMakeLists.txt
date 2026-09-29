@@ -7,6 +7,7 @@ add_library(optic_core STATIC
     capture/CaptureSession.cpp
     capture/RawCapture.cpp
     capture/CameraEngine.cpp
+    dng/DngWriter.cpp
 )
 
 target_include_directories(optic_core PUBLIC "${CMAKE_SOURCE_DIR}")
