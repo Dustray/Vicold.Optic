@@ -22,9 +22,14 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
 - `Ui`：cover 缩放。三件套必须分清 —— `dim(len)` 纯缩放（尺寸/半径/线宽）、`screenX/screenY` 位置加居中偏移；
   输入用 `toDesignX/toDesignY` 反变换。**EGL 窗口原点在左下、触摸原点在左上**，着色器里已做 Y 翻转，勿再改回
 - 变焦导轨 0.7–10（kZoomStops 含 0.7）：sub-1.0 经引擎自动切超广角物理直连（P:3）
-- **FOV 换算的两个基准量别混**：导轨下限 0.7 是 UI 量程；光学倍率
-  `uwNativeZoom = f(uw)/f(main)`（0.388）才是 FOV/crop 换算基准。混用会让超广带显示
-  FOV 系统性偏宽、与主摄带在 1.0 处接不上（2026-09-30 症状「焦距重叠」）。
+- **物理摄倍率必须用等效焦距比，不是焦距比**（2026-09-30 重大纠错）：
+  `zoom_i = (f_i/sensorW_i) / (f_main/sensorW_main)`。长焦传感器常只有主摄一半宽，
+  焦距比能把 5.02x 算成 2.63x。本机真值：**uw 0.774x、main 1.0x、tele 5.016x**
+  （等效 18.5/23.8/119.6mm，与 MIUI 相机 17/23/115mm 口径一致）。导轨下限取
+  max(HAL zoomMin, uwNative) —— 低于光学极限画不出更广。
+- **长焦接管点必须落在逻辑流安全区内**：本机逻辑流 4.8 干净、**5.0 起持续断流**
+  （HAL 还把逻辑流 zoom 硬钳在 5.00）→ `teleSwitch_ = min(teleNative, 4.85)`。
+  按原生倍率接管会让用户拖到 5x 时画面先冻结再跳变。
 - **平滑变焦 = 全带统一 crop 补偿**：`crop = zoom_（手指目标）/ az（相机实际出图倍率）`。
   逻辑带相机下发有 120ms 节流，不补差就是 8 次/s 阶梯跳（卡顿感）。
   **az 变化时 crop 必须落位到新 target，绝不能归一到 1** —— 归一会让 FOV 退回 az 再
@@ -56,7 +61,13 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
   UAF（C2N-dev-looper 线程 SIGABRT，destroyed mutex）。
 - `activePhysId()`：zoomRatio==0 表示"未设置"，不能当 <1.0（否则冷启动误入直连）。
 - 看门狗 12 次重试耗尽 → 全链路重连（不再永久黑屏）。
-- controls.txt 键：`uw=1`（默认开）、`uw_phys=N`、`tele_phys=N`、`phys_min=N`（诊断强制）。
+- controls.txt 键：`uw=1`（默认开）、`uw_phys=N`、`tele_phys=N`、`phys_min=N`、`disp=0/1/2`
+  （手动锁显示源）、`tele_native=N`（强制长焦带基，肉眼校准用）。
+- 真机诊断脚本（tools/）：`zoom_scan.sh`（逐点核对 eff FOV=az×crop 是否 == z）、
+  `stall_probe.sh`（逐点数断流，定位逻辑流安全上限）、`logical_limit.sh`、
+  `calib_fov.py`（像素标定；**近景视差下不可靠**，需 >3m 远景）。
+- 真机截图必须指定主屏：pandora 有副屏，`adb shell screencap -p -d <主屏id>`，
+  否则抓到副屏桌面。
 
 ## 已知状态（2026-09-28 更新）
 - M0 已完成并已跑通真机预览（30fps，LEVEL_3，RAW 4096x3072，黑电平 64，RGGB，后置 RAW 仅 1 条流）
