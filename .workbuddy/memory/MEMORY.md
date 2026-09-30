@@ -57,7 +57,11 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
   **pandora quirk（Xiaomi17ProDevice::physPerKeyZoom=false）**：CamX 声明支持 per-physical
   ZOOM_RATIO/CROP_REGION 但**实际忽略**（长焦带 3.0↔8.0 画面零差异确诊）→ 不写键、物理流恒
   原生 FOV，带内变焦走 GL crop。逻辑流钳制上界=kLogicalSafeMax(4.85)<teleSwitch(5.0)。
-  代价：三传感器常开功耗↑；三路 reader 每帧必须全部 drain（不消费会撑满队列拖累 repeating）。
+  **quirk 之二（2026-09-30）**：物理流**继承逻辑 ZOOM_RATIO 的裁切**——长焦带若逻辑写 4.85，
+  长焦流实际 = 5.016×4.85≈24x。故 tele 带 effSettings 必须把逻辑 zoom 写 1.0。
+  近距规则：对焦距离 <near_m(0.9m) → 长焦接管点推迟 tele_near(20x)（对齐系统相机）；
+  依据 result 的 LENS_FOCUS_DISTANCE。代价：三传感器常开功耗↑；三路 reader 每帧必须全部
+  drain（不消费会撑满队列拖累 repeating）。
 - 逐摄键 API：`ACaptureRequest_setEntry_physicalCamera_float(req, physicalId, tag, count, data)`
   —— **physicalId 在 tag 之前**（API 29）。
 - 单流降级路径仍走签名换请求（L+R / P:3 / P:4，物理直连无 RAW、拍摄被拒）。
