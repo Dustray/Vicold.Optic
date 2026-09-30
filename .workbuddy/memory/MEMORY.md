@@ -21,7 +21,7 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
   sdf 圆角矩形；字体图集（ASCII+按需 CJK）；`triangles()` 纯色批
 - `Ui`：cover 缩放。三件套必须分清 —— `dim(len)` 纯缩放（尺寸/半径/线宽）、`screenX/screenY` 位置加居中偏移；
   输入用 `toDesignX/toDesignY` 反变换。**EGL 窗口原点在左下、触摸原点在左上**，着色器里已做 Y 翻转，勿再改回
-- 变焦导轨 0.7–10（kZoomStops 含 0.7）：sub-1.0 经引擎自动切超广角物理直连（P:3）
+- 变焦导轨 0.7–120（kZoomStops={0.7,1,2,5,10,50,100}）：sub-1.0 经引擎自动切超广角物理直连（P:3）
 - **物理摄倍率必须用等效焦距比，不是焦距比**（2026-09-30 重大纠错）：
   `zoom_i = (f_i/sensorW_i) / (f_main/sensorW_main)`。长焦传感器常只有主摄一半宽，
   焦距比能把 5.02x 算成 2.63x。本机真值：**uw 0.774x、main 1.0x、tele 5.016x**
@@ -39,20 +39,24 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
 - 每启动快门配额 `saveQuota_ = 8`（曾为 1，无法真机评估）；`controls.txt: save_quota=N` 可调
 
 ## 多摄架构（2026-09-29 真机确诊，勿再走弯路）
-- 逻辑摄 0 物理成员 [3 2 4]：**3=超广角 2.57mm、2=主摄 6.62mm、4=长焦 17.42mm（2.63x）**；
+- 逻辑摄 0 物理成员 [3 2 4]：**3=超广角 2.57mm（等效 18.5mm）、2=主摄 6.62mm（23.8mm）、
+  4=长焦 17.42mm（119.6mm，等效比 5.016x）**；
   物理摄不在 getCameraIdList 里，无法独立打开（cam=2 直开必败）。
 - **逻辑融合管线有两个坏区，都必须物理直连绕开**：① sub-1.0（超广角融合）② 高倍数字区
   ≥~4（SAT/长焦融合；实测 2.0/3.0 干净、5.0/8.85/10 持续断流）。
-- 分带（显示源判定）：z∈[0.7,1.0)→显示 uw 流；z≥teleNativeZoom(2.63)→显示 tele 流；其余→逻辑流
-  （滞回保留：uw 退出 z≥1.03、tele 退出 z≥teleMin−0.08）。
+- 分带（2026-09-30 定稿，与 MIUI 口径一致）：z∈[0.7,1.0)→uw 流；[1.0,5.0)→逻辑主摄；
+  ≥5.0→tele 流（teleSwitch_=min(原生5.016, 5.0)，effSettings 逻辑流仍钳 4.85 安全上限，
+  4.85–5.0 由 GL crop 补足）。导轨量程 0.7–120，关键焦 0.7/1/2/5/10/50/100；高倍段全靠
+  GL 数字裁切（120x ≈ 23.9 倍裁切），引擎对 UI zoom 的钳制上界必须用导轨量程而非 HAL zoomMax。
+  滞回保留：uw 退出 z≥1.03、tele 退出 z≥teleSwitch−0.08。
 - **ALL 全目标常驻会话（2026-09-29 深夜定稿，真机验证）**：一个 repeating 请求挂 4 输出永不再换
-  （`setRepeatingAll`，withPhysicalIds([3,4]) 创建，逐摄写 ZOOM_RATIO：uw=z/uwNativeZoom(0.388)、
-  tele=z/teleMin、逻辑钳在 [1.0, teleMin]——三路流恒渲染同一用户 FOV）。跨带 = 纯 GL 切显示
+  （`setRepeatingAll`，withPhysicalIds([3,4]) 创建，逐摄写 ZOOM_RATIO：uw=z/0.774、
+  tele=z/5.016、逻辑钳在 [1.0, 4.85]——三路流恒渲染同一用户 FOV）。跨带 = 纯 GL 切显示
   slot + 150ms 交叉淡化，请求零动作。**10 次跨带往返 0 请求重建 0 gap**（换请求方案曾
   118ms/次、重建方案曾 ~285ms+黑帧）。RAW 恒出帧 → 全带可拍。HAL 拒绝则降级单流重建。
   **pandora quirk（Xiaomi17ProDevice::physPerKeyZoom=false）**：CamX 声明支持 per-physical
   ZOOM_RATIO/CROP_REGION 但**实际忽略**（长焦带 3.0↔8.0 画面零差异确诊）→ 不写键、物理流恒
-  原生 FOV，带内变焦走 GL crop。逻辑流钳制上界=teleMin（若钳 2.50 会留 2.50~2.63 死区）。
+  原生 FOV，带内变焦走 GL crop。逻辑流钳制上界=kLogicalSafeMax(4.85)<teleSwitch(5.0)。
   代价：三传感器常开功耗↑；三路 reader 每帧必须全部 drain（不消费会撑满队列拖累 repeating）。
 - 逐摄键 API：`ACaptureRequest_setEntry_physicalCamera_float(req, physicalId, tag, count, data)`
   —— **physicalId 在 tag 之前**（API 29）。
