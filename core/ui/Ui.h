@@ -134,10 +134,12 @@ private:
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
     float lastCamPush_ = 0.f;   // 上次下发给相机的目标值
     std::atomic<float> appliedZoom_{1.0f};  // 引擎回传：当前显示源出图的用户倍率
-    // ALL 常流：逻辑带相机实时跟随（crop=1）；物理带（quirk physPerKeyZoom=false）
-    // 带内变焦由 GL 裁切补足 —— crop = zoom_/az，az = 带基常量（引擎回传），
-    // 带内 az 稳定 → crop 单调连续无泵动；slot 切换瞬间 crop 直接落位（lastCropSlot_）。
+    // 全带 crop 补偿：crop = zoom_（手指目标）/ az（相机实际出图倍率），相机阶梯下发
+    // 的缺口由 GL 每帧补齐 → FOV 连续（逻辑带 120ms 节流不再表现为 8 次/s 跳变）。
+    // az 变化或 slot 切换时 crop **落位到新 target**（绝不归一到 1 —— 那会让 FOV
+    // 退回后再爬升，与纹理过渡叠加成泵动闪烁）。
     float cropSmooth_ = 1.f;    // GL 裁切平滑值（指数趋近，帧率无关）
+    float lastAz_ = 0.f;        // 上次见到的 appliedZoom（变化 → crop 瞬时落位）
     int lastCropSlot_ = 0;      // 上次计算 crop 时的显示 slot（切换 → 直接落位）
     double lastCropT_ = 0;      // 上一帧时刻（淡化计时 dt）
     float teleMin_ = 2.63f;                 // 长焦直连阈值（setTeleMin 下发）

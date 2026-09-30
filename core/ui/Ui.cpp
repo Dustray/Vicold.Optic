@@ -563,23 +563,27 @@ void Ui::frame() {
     gl_.beginFrame(kBg);
 
     // ---- 预览（相机 → GL 纹理）----
-    // 逻辑显示带（slot 0）：相机实时跟随（带内改 entry 重发 0 间隔），crop 恒 1。
-    // 物理显示带（slot 1/2，quirk physPerKeyZoom=false —— pandora 的 CamX 忽略
-    // per-physical 变焦键，物理流恒原生 FOV）：带内变焦由 GL 裁切补足，crop =
-    // zoom_/az，az = 带基常量（引擎回传）—— 拖动中 az 不变，crop 单调连续，
-    // 无旧双模式「az 每帧刷新 → crop 重置爬升」的泵动闪烁。跨带时 az 跳变 =
-    // 带基切换，边界处 crop ≈ 1（uw 出带 1.03/0.7≈1.47→落位即目标，tele 出带
-    // 2.55/2.63≈0.97→钳 1），slot 切换瞬间直接落位到目标 crop，无过渡闪烁。
+    // 全带统一的 crop 补偿：crop = zoom_（手指目标）/ az（相机实际出图倍率）。
+    //  - 为什么逻辑带也要补：相机侧下发有 120ms 节流，画面若全靠相机跟随就是
+    //    8 次/s 的阶梯跳 —— 2026-09-30 真机症状「广角变焦不丝滑会卡顿」的根因。
+    //    补差后相机阶梯跳一步、crop 同步收一点，FOV 每帧连续。
+    //  - 物理带（quirk physPerKeyZoom=false，pandora 的 CamX 忽略 per-physical
+    //    变焦键，物理流恒原生 FOV）：az = 带基常量，crop 平滑跟随手指。
+    //  - az 变化（相机真实变焦生效，纹理同步更新）时必须**落位到新 target**，
+    //    绝不能归一到 1：归一会让 FOV 先退回 az 再爬升，与纹理过渡叠加 =
+    //    泵动闪烁（旧双模式的 bug，2026-09-29 全程闪烁的元凶）。
     {
         const float az = appliedZoom_.load(std::memory_order_acquire);
         float target = 1.f;
-        if (previewActive_ != 0 && az > 0.01f)
-            target = std::clamp(zoom_ / az, 1.f, 16.f);
+        if (az > 0.01f) target = std::clamp(zoom_ / az, 1.f, 16.f);
         const double t = nowSec();
         const float dt = lastCropT_ > 0 ? float(t - lastCropT_) : 0.016f;
         lastCropT_ = t;
-        if (previewActive_ != lastCropSlot_) {
-            cropSmooth_ = target;       // 显示源切换：直接落位（边界处目标 ≈1 或换带基）
+        const bool azChanged = std::fabs(az - lastAz_) > 1e-3f;
+        const bool slotChanged = previewActive_ != lastCropSlot_;
+        if (azChanged || slotChanged) {
+            cropSmooth_ = target;       // 元数据与像素同帧：瞬时落位，无爬升过程
+            lastAz_ = az;
             lastCropSlot_ = previewActive_;
         } else {
             cropSmooth_ += (target - cropSmooth_) * (1.f - std::exp(-dt * 20.f));

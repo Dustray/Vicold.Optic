@@ -228,6 +228,8 @@ void CameraEngine::refreshPhysIds() {
     teleMinZoom_ = forcedPhysMin_ > 0.f
                        ? forcedPhysMin_
                        : (cam_.traits().teleNativeZoom > 0.f ? cam_.traits().teleNativeZoom : 1e9f);
+    // 超广角光学倍率（本机 0.388）；探测失败回退 1.0（不裁切，FOV 可能接不上但不崩）
+    uwNativeZoom_ = cam_.traits().uwNativeZoom > 0.f ? cam_.traits().uwNativeZoom : 1.0f;
 }
 
 std::string CameraEngine::activePhysId() const {
@@ -250,13 +252,13 @@ std::string CameraEngine::activePhysId() const {
 
 float CameraEngine::physZoom() const {
     // 直连请求写相对数字变焦 = 用户倍率 / 带基（rel 1.0 = 该镜头原生 FOV）：
-    //   超广角带基 = 0.7（用户 0.7 = 超广角原生，0.7–1.0 → rel 1.0–1.43，段内连续变焦）
+    //   超广角带基 = uwNativeZoom_（光学倍率 f(uw)/f(main)，本机 0.388 而非导轨下限 0.7）
     //   长焦带基   = teleNativeZoom（用户 z ≥ 2.63 → rel z/2.63，段内连续变焦）
     // 写相对值只作用于物理直连请求自身，不进逻辑融合管线（坏区）。
     const float z = settings_.zoomRatio;
     if (z <= 0.f) return 0.f;
     const std::string phys = activePhysId();
-    if (phys == uwPhysId_ && !uwPhysId_.empty()) return std::max(1.0f, z / 0.7f);
+    if (phys == uwPhysId_ && !uwPhysId_.empty()) return std::max(1.0f, z / uwNativeZoom_);
     if (phys == telePhysId_ && !telePhysId_.empty() && teleMinZoom_ < 1e8f)
         return std::max(1.0f, z / teleMinZoom_);
     return 0.f;
@@ -308,7 +310,7 @@ std::vector<CaptureSession::PhysZoom> CameraEngine::allPhysZooms() {
     // az 回传换算基准：perKey=true（HAL 执行 per-physical 变焦）→ rel = z/带基，
     // az = rel×带基 = 用户倍率；perKey=false（pandora：键被忽略，物理流恒原生 FOV）
     // → rel 恒 1，az = 带基常量（UI 用 crop = z/az 补带内变焦，带内 az 稳定无泵动）。
-    relUw_ = !uwPhysId_.empty() ? (perKey ? std::max(1.0f, z / 0.7f) : 1.0f) : 0.f;
+    relUw_ = !uwPhysId_.empty() ? (perKey ? std::max(1.0f, z / uwNativeZoom_) : 1.0f) : 0.f;
     relTele_ = (!telePhysId_.empty() && teleMinZoom_ < 1e8f)
                    ? (perKey ? std::max(1.0f, z / teleMinZoom_) : 1.0f)
                    : 0.f;
@@ -432,7 +434,10 @@ bool CameraEngine::rebuildSession() {
 CaptureSettings CameraEngine::effSettings() const {
     if (!multiStream_) return settings_;
     CaptureSettings s = settings_;
-    const float zmax = teleMinZoom_ < 1e8f ? std::min(2.5f, teleMinZoom_ - 0.05f) : 2.5f;
+    // 钳制只为"逻辑流不进 SAT 融合坏区"（本机实测 ≥~4 断流）。上界必须 = 长焦切换点
+    // teleMinZoom_，否则逻辑流提前停变而长焦带还没接管 → 中间出现一段 FOV 死区
+    //（2026-09-30 真机症状「广角到长焦之间缺失一段」，钳 2.50 而切换点 2.63）。
+    const float zmax = teleMinZoom_ < 1e8f ? teleMinZoom_ : 2.5f;
     s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
     return s;
 }
@@ -771,14 +776,14 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
         // ALL 模式：result 元数据是逻辑流的（被钳在干净带内），显示源的应用倍率
         // 按当前显示带换算 —— 物理流 applied = 写入的相对值 × 带基。
         if (physBand_ == uwPhysId_ && relUw_ > 0.f) {
-            userZoom = relUw_ * 0.7f;
+            userZoom = relUw_ * uwNativeZoom_;
         } else if (physBand_ == telePhysId_ && relTele_ > 0.f && teleMinZoom_ < 1e8f) {
             userZoom = relTele_ * teleMinZoom_;
         }
         // 逻辑带：r.zoomRatio 即真实应用值
     } else if (sessionIsPhysical_) {
         if (sessionSig_ == "P:" + uwPhysId_)
-            userZoom = r.zoomRatio * 0.7f;
+            userZoom = r.zoomRatio * uwNativeZoom_;
         else if (teleMinZoom_ < 1e8f)
             userZoom = r.zoomRatio * teleMinZoom_;
     }

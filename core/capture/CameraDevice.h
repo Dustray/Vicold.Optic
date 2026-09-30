@@ -19,6 +19,11 @@ struct CameraTraits {
     std::string uwPhysicalId;               // 超广角物理摄像头 ID（physicalIds 中焦距最短者）
     std::string telePhysicalId;             // 长焦物理摄像头 ID（焦距最长者；成员<3 时为空）
     float teleNativeZoom = 0.f;             // 长焦原生倍率 = f(tele)/f(main)（0=未知）
+    // 超广角原生倍率 = f(uw)/f(main)（本机 2.57/6.62 ≈ 0.388）。
+    // 注意与导轨下限 0.7 区分：0.7 是 UI 量程，光学倍率才是 FOV 换算基准 —— 用 0.7
+    // 当基准会让超广带显示 FOV 系统性偏宽，与主摄带在 1.0 处接不上（2026-09-30 真机
+    // 症状「超广↔主摄有一段焦距重叠」）。0 = 未知（回退 1.0，不裁切）。
+    float uwNativeZoom = 0.f;
     float mainFocal = 0.f;                  // 主摄物理焦距（mm）
     int hardwareLevel = -1;
     bool raw = false;
@@ -34,6 +39,8 @@ struct CameraTraits {
     bool lscOn = false;                     // per-frame LSC map 可用（V4）
     int32_t evMin = 0, evMax = 0;           // AE 补偿范围（步数）
     float evStep = 1.f / 3;                 // AE 补偿步长（EV）
+    bool physPerKeyZoom = true;             // per-physical 变焦键被 HAL 真实执行（机型 quirk，
+                                            // device 层下发；false = 物理带变焦走 GL 裁切兜底）
 };
 
 class CameraDevice {

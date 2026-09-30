@@ -1,4 +1,5 @@
 #include "core/capture/CameraDevice.h"
+#include "core/device/DeviceRegistry.h"
 #include "core/util/Log.h"
 
 #include <cstring>
@@ -138,11 +139,17 @@ bool CameraDevice::readTraits(const char* id) {
         } else if (fmap.size() == 2) {
             fMain = fMax;
         }
-        if (fMain > 0.f) traits_.mainFocal = fMain;
+        if (fMain > 0.f) {
+            traits_.mainFocal = fMain;
+            if (fMin > 0.f && !minId.empty()) traits_.uwNativeZoom = fMin / fMain;
+        }
         if (minId.empty()) {
             LOGW("physical lens detection failed (no focal length for members)");
         } else {
             traits_.uwPhysicalId = minId;
+            if (traits_.uwNativeZoom > 0.f)
+                LOGI("phys layout: uw native zoom = %.3fx (f=%.2fmm / main %.2fmm)",
+                     traits_.uwNativeZoom, fMin, fMain);
             if (traits_.telePhysicalId.empty())
                 LOGI("phys layout: uw=%s(%.2fmm) main=%.2fmm (no tele)", minId.c_str(), fMin, fMain);
             else
@@ -153,6 +160,10 @@ bool CameraDevice::readTraits(const char* id) {
     }
 
     ACameraMetadata_free(chars);
+
+    // 机型 quirk：per-physical 变焦键是否真实生效（pandora = false，2026-09-29 确诊）
+    traits_.physPerKeyZoom = device::currentDevice().physPerKeyZoom();
+    LOGI("quirk physPerKeyZoom=%d", (int)traits_.physPerKeyZoom);
     return true;
 }
 

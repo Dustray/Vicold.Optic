@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -62,8 +63,9 @@ private:
     // ALL 请求逐摄相对变焦表：uw = z/0.7、tele = z/teleMin（≤1 钳 1 = 原生 FOV，
     // 超范围由 HAL 按各摄 zoomRatioRange 钳制）。三路流恒渲染同一用户 FOV，
     // 跨带切显示源时画面内容连续；三路常流还使 AE/AWB 持续收敛（切换色彩已稳定）。
-    // 副作用：更新 relUw_/relTele_ 缓存。
-    std::vector<std::pair<std::string, float>> allPhysZooms();
+    // 同时附上与 rel 恒一致的 SCALER_CROP_REGION（per-physical ZOOM_RATIO 被 HAL
+    // 忽略时的兜底，见 PhysZoom 注释）。副作用：更新 relUw_/relTele_ 缓存。
+    std::vector<CaptureSession::PhysZoom> allPhysZooms();
     void refreshPhysIds();   // 按覆盖键（uw_phys/tele_phys/phys_min）+ 探测值刷新物理布局缓存
     // band 签名："L"（逻辑主摄）/ "P:"+uwPhysId_（超广角直连）/ "P:"+telePhysId_（长焦直连）
     std::vector<ANativeWindow*> bandTargets(const std::string& sig) const;  // 该带 repeating 目标
@@ -108,6 +110,8 @@ private:
     std::string uwPhysId_;      // 当前生效的超广角物理 ID（forcedUwPhys_ > 自动探测 > 回退 "2"）
     std::string telePhysId_;    // 当前生效的长焦物理 ID（forcedTelePhys_ > 自动探测）
     float teleMinZoom_ = 1e9f;  // 长焦直连起始倍率（默认 = teleNativeZoom，即恰在 SAT 切换点前绕开融合）
+    float uwNativeZoom_ = 0.7f; // 超广角光学倍率 f(uw)/f(main)（真机 0.388；探测失败回退 0.7）
+                                // —— FOV 换算基准，与导轨下限 0.7 无关，混用会让超广/主摄衔接错位
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连
     std::string sessionSig_;          // 当前 active band（"L"/"P:cameraId"，见 bandTargets）
     // 多流常驻会话（M-MC）：逻辑 + uw + tele 三路预览输出一次 configure，跨带只切换
@@ -118,6 +122,18 @@ private:
     bool lastRawRing_ = false;        // 检测 RAW 进出 repeating（ALL 请求目标集变化 → 重建）
     // ALL 请求逐摄写入的相对变焦缓存（onFrameResult 的 appliedZoom 回传换算用）
     float relUw_ = 0.f, relTele_ = 0.f;
+    int lastDispSlot_ = -1;     // 上次下发的 GL 显示 slot（变化才打日志）
+
+    // 物理摄逐键变焦能力快照（probePhysCaps，rebuildSession 时刷新）：ALL 带内连续变焦
+    // 依赖 per-physical ZOOM_RATIO 生效；部分 HAL 不支持/忽略该键（表现为镜头固定在
+    // 原生焦段，2026-09-29 真机症状），届时按 cropKey 决定回退方案。
+    struct PhysCaps {
+        bool zoomKey = false, cropKey = false;
+        float zmin = 1.f, zmax = 1.f;   // CONTROL_ZOOM_RATIO_RANGE
+        int32_t aa[4] = {};             // SENSOR_INFO_ACTIVE_ARRAY_SIZE (x, y, w, h)
+    };
+    std::map<std::string, PhysCaps> physCaps_;
+    void probePhysCaps();
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问
