@@ -33,35 +33,60 @@ bool parseOn(const std::string& v) {
 
 } // namespace
 
-bool CameraEngine::start(const std::string& dataDir) {
+CameraEngine::~CameraEngine() {
+    stop();
+    // 进程退出场景：引擎线程可能还卡在 HAL close（打盹挂起），detach 交给 OS 收尾，
+    // 绝不 join（卡住会让析构冻结）
+    if (thread_.joinable()) thread_.detach();
+}
+
+void CameraEngine::requestStart(const std::string& dataDir) {
+    pendingDataDir_ = dataDir;
+    wantRun_.store(true, std::memory_order_release);
+    tryStart();
+}
+
+bool CameraEngine::tryStart() {
+    if (!wantRun_.load(std::memory_order_acquire)) return false;
     if (running_.load(std::memory_order_acquire)) return true;
+    if (!stopped_.load(std::memory_order_acquire)) return false;   // 旧线程收摊中，下轮再试
     stopFlag_.store(false, std::memory_order_release);
+    stopped_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
-    thread_ = std::thread([this, dataDir] { run(dataDir); });
+    if (thread_.joinable()) thread_.join();   // stopped_=true 保证线程已结束，立即返回
+    thread_ = std::thread([this, dir = pendingDataDir_] { run(dir); });
+    LOGI("engine started (dataDir=%s)", pendingDataDir_.c_str());
     return true;
 }
 
 void CameraEngine::stop() {
-    if (!running_.load(std::memory_order_acquire)) return;
+    wantRun_.store(false, std::memory_order_release);
     stopFlag_.store(true, std::memory_order_release);
-    if (thread_.joinable()) thread_.join();
-    running_.store(false, std::memory_order_release);
+    // 收摊（closeSession + camera close）由引擎线程在 run 尾部完成 —— 本函数不等待。
+    // running_/stopped_ 由引擎线程翻转，主线程经 tryStart 观察后才能再启动。
 }
 
 void CameraEngine::run(std::string dataDir) {
     dataDir_ = std::move(dataDir);
+    // 每轮运行复位看门狗/重连状态（成员跨引擎生命周期保留，残留会让新运行
+    // 误报 preview stall 或开局就撞重连上限 —— 2026-09-30 真机复现）
+    lastResultMs_ = 0;
+    stallRetries_ = 0;
+    reconnects_ = 0;
     ctl_ = std::make_unique<util::ControlFile>(dataDir_ + "/controls.txt",
                                                std::chrono::milliseconds(400));
 
-    // 开机前先扫一遍 controls.txt：取出 cam= 强制摄像头 ID（诊断用，必须在 openFirstBack 之前）
+    // 开机前先扫一遍 controls.txt：cam= 强制摄像头 ID（诊断用，必须在 openFirstBack 之前）、
+    // fmt=raw 强制 RAW/DNG（默认拍摄格式是 JPEG → 系统相册）
     {
         std::ifstream f(dataDir_ + "/controls.txt");
         std::string line;
         while (std::getline(f, line)) {
             auto eq = line.find('=');
             if (eq == std::string::npos) continue;
-            std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-            if (k == "cam") { forcedCamId_ = v; break; }
+            const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+            if (k == "cam" && forcedCamId_.empty()) forcedCamId_ = v;
+            if (k == "fmt") jpgMode_ = (v != "raw");
         }
     }
 
@@ -87,6 +112,10 @@ void CameraEngine::run(std::string dataDir) {
         pollControls();
         drainUiCmds();
         reapRetired();
+
+        // 拍照保存进度 → UI（StillCapture 原子量直读，引擎轮速足够刷新 pill）
+        if (ui_ && still_)
+            ui_->notifySaveProgress(still_->savePending(), still_->lastSavedMs());
 
         // 预览存活看门狗：repeating 被 HAL 静默丢弃（逻辑多摄切超广角时偶发，
         // setRepeatingRequest 返回成功却不再交付 result）时自动重发 setRepeating 恢复。
@@ -136,6 +165,9 @@ void CameraEngine::run(std::string dataDir) {
         std::this_thread::sleep_for(50ms);
     }
     closeSession();
+    ctl_.reset();
+    running_.store(false, std::memory_order_release);
+    stopped_.store(true, std::memory_order_release);   // 收摊完成，主线程可再启动
     LOGI("engine exit");
 }
 
@@ -190,6 +222,17 @@ bool CameraEngine::openSession() {
             raw_.reset();
         }
     }
+    // JPEG 通路（reader 创建无流位成本，输出随 jpgMode_ 挂会话；重建 reader 开销极低）
+    if (!still_) {
+        still_ = std::make_unique<StillCapture>();
+        still_->setGallery(&gallery_);   // 存系统相册（DCIM/Camera）
+        if (!still_->create(t.pixelW, t.pixelH, dataDir_)) {
+            LOGE("jpeg reader create failed, JPEG disabled");
+            still_.reset();
+        }
+        if (ui_) ui_->resetSaveProgress();   // 上会话的保存计数不跨会话卡「正在保存」
+    }
+    if (ui_) ui_->setFmtJpg(jpgMode_);   // 引擎是格式真值源（冷启动读 controls.txt 后校正 UI）
     // 会话按当前模式（逻辑广角 / 超广角物理直连）创建
     if (!rebuildSession()) return false;
 
@@ -220,7 +263,27 @@ void CameraEngine::closeSession() {
         raw_->close();
         raw_.reset();
     }
+    if (still_) {
+        still_->close();
+        still_.reset();
+    }
     cam_.close();
+}
+
+ANativeWindow* CameraEngine::stillWindow() const {
+    if (jpgMode_) return still_ ? still_->window() : nullptr;
+    return (raw_ && raw_->ringMode()) ? raw_->window() : nullptr;
+}
+
+StillParams CameraEngine::makeStillParams() const {
+    StillParams p;
+    p.zoom = settings_.zoomRatio;
+    p.iso = settings_.iso > 0 ? settings_.iso : lastAeIso_;
+    p.exposureNs = settings_.exposureNs > 0 ? settings_.exposureNs : lastAeExpNs_;
+    p.evSteps = settings_.evSteps;
+    p.aeOn = settings_.aeOn;
+    p.awbOn = settings_.awbOn;
+    return p;
 }
 
 void CameraEngine::refreshPhysIds() {
@@ -388,16 +451,21 @@ std::vector<CaptureSession::PhysZoom> CameraEngine::allPhysZooms() {
 
 std::vector<ANativeWindow*> CameraEngine::bandTargets(const std::string& sig) const {
     std::vector<ANativeWindow*> t;
+    // repeating 的拍摄流：RAW 环常驻（DMA 直出便宜，ZSL 回溯需要连续出帧）；
+    // JPEG 流**绝不进 repeating**（每帧 12MP ISP 编码把预览拖到 18.5fps，
+    // 2026-09-30 真机确诊）——流只配置进会话，快门走 captureOnce 单拍。
     if (sig == "ALL") {
-        // 探针：全部输出一次挂上（三路预览 + RAW 环）——请求不再随带切换
+        // 全部输出一次挂上（三路预览 + RAW 环）——请求不再随带切换
         for (int s = 0; s < 3; ++s)
             if (ANativeWindow* w = ui_->previewWindow(s)) t.push_back(w);
-        if (raw_ && raw_->ringMode()) t.push_back(raw_->window());
+        if (!jpgMode_)
+            if (ANativeWindow* w = stillWindow()) t.push_back(w);
         return t;
     }
     if (sig == "L") {
         t.push_back(ui_->previewWindow(0));
-        if (raw_ && raw_->ringMode()) t.push_back(raw_->window());
+        if (!jpgMode_)
+            if (ANativeWindow* w = stillWindow()) t.push_back(w);
     } else if (!uwPhysId_.empty() && sig == "P:" + uwPhysId_) {
         t.push_back(ui_->previewWindow(1));
     } else {
@@ -439,7 +507,12 @@ bool CameraEngine::rebuildSession() {
         std::vector<CaptureSession::OutDesc> outs = {{ui_->previewWindow(0), nullptr}};
         if (!uwPhysId_.empty()) outs.push_back({ui_->previewWindow(1), uwPhysId_.c_str()});
         if (!telePhysId_.empty()) outs.push_back({ui_->previewWindow(2), telePhysId_.c_str()});
-        if (raw_) outs.push_back({raw_->window(), nullptr});
+        // 拍摄输出互斥：JPEG 模式挂 JPEG，否则挂 RAW（4 流组合不变，防 HAL 拒 5 流）
+        if (jpgMode_) {
+            if (still_) outs.push_back({still_->window(), nullptr});
+        } else if (raw_) {
+            outs.push_back({raw_->window(), nullptr});
+        }
         if (sess->create(cam_.handle(), outs)) {
             session_ = std::move(sess);
             multiStream_ = true;
@@ -462,7 +535,8 @@ bool CameraEngine::rebuildSession() {
     const std::string phys = activePhysId();
     std::vector<ANativeWindow*> outs;
     outs.push_back(ui_->previewWindow(0));
-    if (phys.empty() && raw_ && raw_->ringMode()) outs.push_back(raw_->window());
+    if (phys.empty())
+        if (ANativeWindow* sw = stillWindow()) outs.push_back(sw);
 
     CaptureSession::OutDesc od{outs[0], phys.empty() ? nullptr : phys.c_str()};
     if (!sess->create(cam_.handle(), {od})) {
@@ -559,7 +633,8 @@ void CameraEngine::commitSession(bool settingsChanged) {
     } else if (settingsChanged) {
         std::vector<ANativeWindow*> outs;
         outs.push_back(ui_->previewWindow(0));
-        if (phys.empty() && rawRing) outs.push_back(raw_->window());
+        if (phys.empty())
+            if (ANativeWindow* sw = stillWindow()) outs.push_back(sw);
         session_->setRepeating(sig, outs, settings_, phys, physZoom());
     }
     if (session_) physBand_ = phys;
@@ -822,6 +897,13 @@ void CameraEngine::drainUiCmds() {
             case ui::Ui::Cmd::SHOT:
                 triggerBurst();
                 break;
+            case ui::Ui::Cmd::SET_FMT:
+                // 拍摄格式切换：会话输出目标变化（RAW↔JPEG），必须重建会话（~300ms）
+                jpgMode_ = !jpgMode_;
+                LOGI("still format -> %s (rebuilding session)", jpgMode_ ? "JPEG" : "RAW");
+                if (!rebuildSession())
+                    LOGE("rebuild after fmt switch failed");
+                break;
         }
     }
     // 整轮命令处理完后统一提交（模式变化→重建会话，仅设置变化→重发 repeating）。
@@ -862,7 +944,37 @@ void CameraEngine::recomputeMixed() {
     }
 }
 
-void CameraEngine::triggerBurst() {    if (!raw_ || !raw_->ringMode()) {
+void CameraEngine::triggerBurst() {
+    // ---- JPEG 模式：单拍请求（repeating 不带 JPEG 流，快门时才让 ISP 编码一帧）----
+    // 曝光/AE/对焦沿用当前会话设置；zoom 钳在逻辑流安全带内（物理带时 JPEG 来自
+    // 逻辑主摄，FOV 上限 ~kLogicalSafeMax，超出部分预览是物理流/数字裁切）。
+    if (jpgMode_) {
+        if (!still_ || !session_ || !session_->valid()) {
+            LOGW("jpeg unavailable");
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+            return;
+        }
+        if (savesUsed_ >= saveQuota_) {
+            LOGW("save quota exhausted (%d/%d) - restart app to reset", savesUsed_, saveQuota_);
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+            return;
+        }
+        CaptureSettings s = settings_;
+        s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f,
+                                 kLogicalSafeMax);
+        still_->expectShot(makeStillParams());
+        if (!session_->captureOnce({still_->window()}, s)) {
+            still_->cancelShot();
+            LOGE("jpeg captureOnce failed");
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+            return;
+        }
+        ++savesUsed_;
+        if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_);
+        LOGI("shutter triggered [jpg single] (%d/%d)", savesUsed_, saveQuota_);
+        return;
+    }
+    if (!raw_ || !raw_->ringMode()) {
         LOGW("trigger requires raw_mode=ring");
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;

@@ -226,6 +226,12 @@ void hookWindowFocusChanged(ANativeActivity* activity, int focused) {
 struct AppState {
     optic::capture::CameraEngine engine;
     optic::ui::Ui ui;
+    // attach/detach 延迟执行：引擎异步收摊期间不能销毁 GL 预览 reader（旧会话可能
+    // 还在向它出帧），也不能在 reader 重建后让旧引擎碰新窗口 —— 等引擎 stopped()
+    // 后在主循环里执行（引擎卡 HAL close 时由 100ms 轮询兜底，不丢事件）。
+    ANativeWindow* pendingWin = nullptr;   // 已 acquire，等待 attach 的 surface
+    bool wantAttach = false;
+    bool wantDetach = false;
 };
 
 int onInputEvent(android_app* app, AInputEvent* e) {
@@ -237,13 +243,40 @@ int onInputEvent(android_app* app, AInputEvent* e) {
     return 0;
 }
 
+// 统一 attach：引擎已收摊后执行（主循环调用）。成功后登记启动意图。
+void doAttach(android_app* app, AppState* st) {
+    if (st->wantAttach && st->pendingWin) {
+        LOGI("attach deferred -> now (surface=%p)", (void*)st->pendingWin);
+        ensurePermission(app);
+        st->ui.setDataDir(app->activity->externalDataPath);   // attach 时要读 controls.txt
+        st->ui.setDisplayRot(displayRotation(app));           // 预览定向（横屏两个方向都要对）
+        if (st->ui.attach(st->pendingWin)) {
+            st->engine.setUi(&st->ui);
+            st->engine.requestStart(app->activity->externalDataPath);
+        }
+        ANativeWindow_release(st->pendingWin);
+        st->pendingWin = nullptr;
+        st->wantAttach = false;
+    }
+}
+
 void handleCommand(android_app* app, int32_t cmd) {
     auto* st = static_cast<AppState*>(app->userData);
     auto* engine = &st->engine;
     auto* ui = &st->ui;
     switch (cmd) {
-        case APP_CMD_START: LOGI("APP_CMD_START"); break;
-        case APP_CMD_RESUME: LOGI("APP_CMD_RESUME"); break;
+        case APP_CMD_START:
+        case APP_CMD_RESUME:
+            LOGI("%s", cmd == APP_CMD_START ? "APP_CMD_START" : "APP_CMD_RESUME");
+            // 关键：pause/resume 若不经历 TERM_WINDOW/INIT_WINDOW（息屏打盹被子屏接管、
+            // 旋转配置变化保表面等），引擎不会收到任何重启机会 —— 预览定格、触摸全死，
+            // 表现为"卡死"（2026-09-30 真机确诊）。恢复时 UI 还挂着就重启引擎
+            // （requestStart 幂等：引擎在跑则 no-op；撞上收摊中由主循环重试）。
+            if (cmd == APP_CMD_RESUME && ui->attached()) {
+                st->wantDetach = false;   // 已回前台，撤销后台化 detach
+                engine->requestStart(app->activity->externalDataPath);
+            }
+            break;
         // 横屏两个方向（ROTATION_90/270）之间切换只发 CONFIG_CHANGED 时也要重取旋转角
         case APP_CMD_CONFIG_CHANGED:
             LOGI("APP_CMD_CONFIG_CHANGED");
@@ -251,13 +284,13 @@ void handleCommand(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_INIT_WINDOW:
             LOGI("APP_CMD_INIT_WINDOW surface=%p", (void*)app->window);
-            ensurePermission(app);
-            ui->setDataDir(app->activity->externalDataPath);   // attach 时要读 controls.txt
-            ui->setDisplayRot(displayRotation(app));           // 预览定向（横屏两个方向都要对）
-            if (ui && ui->attach(app->window)) {
-                engine->setUi(ui);
-                engine->start(app->activity->externalDataPath);
-            }
+            // attach 延迟到引擎收摊（异步 stop 期间 reader 还被旧会话引用）
+            engine->stop();   // 防御：surface 重建 = 旧会话必失效（幂等，异步）
+            st->wantDetach = false;   // INIT 抵消挂起的 detach（attach 内部会重建 GL）
+            st->pendingWin = app->window;
+            ANativeWindow_acquire(st->pendingWin);
+            st->wantAttach = true;
+            doAttach(app, st);   // 引擎已停止则立即执行，否则等主循环
             break;
         case APP_CMD_WINDOW_RESIZED: {
             // 全出血生效（displayCutout inset 隐藏后 MIUI 放开 150px 保留条）等场景：
@@ -268,25 +301,25 @@ void handleCommand(android_app* app, int32_t cmd) {
                  ui ? ui->winW() : -1, ui ? ui->winH() : -1);
             if (ui && ui->attached() && (w != ui->winW() || h != ui->winH())) {
                 engine->stop();
-                if (ui->attach(app->window))
-                    engine->start(app->activity->externalDataPath);
+                st->pendingWin = app->window;
+                ANativeWindow_acquire(st->pendingWin);
+                st->wantAttach = true;   // 延迟到引擎收摊后重 attach（doAttach 完成重启）
             }
             break;
         }
         case APP_CMD_TERM_WINDOW:
             LOGI("APP_CMD_TERM_WINDOW");
-            engine->stop();
-            if (ui) ui->detach();
+            engine->stop();          // 异步：引擎线程自行收摊（HAL 挂起也不冻结主线程）
+            st->wantDetach = true;   // detach（销毁 reader）延到引擎收摊后
             break;
         case APP_CMD_PAUSE:
             LOGI("APP_CMD_PAUSE");
             engine->stop();
-            if (ui) ui->detach();
+            st->wantDetach = true;
             break;
         case APP_CMD_DESTROY:
             LOGI("APP_CMD_DESTROY");
-            engine->stop();
-            if (ui) ui->detach();
+            engine->stop();          // 主循环随即退出，进程收尾交给 OS
             break;
         default: break;
     }
@@ -301,6 +334,7 @@ extern "C" void android_main(android_app* app) {
     app->onAppCmd = handleCommand;
     app->onInputEvent = onInputEvent;
     state.engine.setUi(&state.ui);
+    state.engine.setJni(app->activity->vm, app->activity->clazz);   // 相册写入（MediaStore）
     state.ui.setJni(app->activity->vm, app->activity->clazz);   // 触感反馈（Vibrator）
 
     // 挂焦点钩子：框架在 UI 线程回调，正好用来隐藏系统栏（ glue 原实现转调保留）
@@ -314,11 +348,27 @@ extern "C" void android_main(android_app* app) {
     while (app->destroyRequested == 0) {
         int events = 0;
         android_poll_source* source = nullptr;
-        // 有窗口时非阻塞轮询（由 eglSwapBuffers 跟 vsync 限速）；无窗口时阻塞等事件
-        int timeout = state.ui.attached() ? 0 : -1;
+        // 有窗口时非阻塞轮询（由 eglSwapBuffers 跟 vsync 限速）；无窗口时：
+        // 有等待引擎收摊的挂起操作 → 100ms 轮询（引擎卡 HAL close 时不能永久睡死）；
+        // 否则阻塞等事件。
+        const bool waiting = state.wantAttach || state.wantDetach;
+        int timeout = state.ui.attached() ? 0 : (waiting ? 100 : -1);
         int ident = ALooper_pollOnce(timeout, nullptr, &events,
                                      reinterpret_cast<void**>(&source));
         if (ident >= 0 && source != nullptr) source->process(app, source);
+
+        // 引擎收摊完成 → 执行挂起的 attach / detach（见 AppState 注释）
+        if (state.engine.stopped()) {
+            if (state.wantAttach) doAttach(app, &state);
+            if (state.wantDetach && !state.wantAttach) {
+                state.ui.detach();
+                state.wantDetach = false;
+                LOGI("ui detached (engine reaped)");
+            }
+        }
+        // 启动意图重试：撞上收摊中的引擎时，这里在收摊完成后补启动（无阻塞）
+        state.engine.tryStart();
+
         if (state.ui.attached()) state.ui.frame();
     }
     LOGI("native main exit");

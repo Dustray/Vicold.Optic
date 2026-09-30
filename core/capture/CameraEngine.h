@@ -20,6 +20,8 @@
 #include "core/capture/CaptureSession.h"
 #include "core/capture/CaptureSettings.h"
 #include "core/capture/RawCapture.h"
+#include "core/capture/StillCapture.h"
+#include "core/capture/StillPipeline.h"
 #include "core/util/ControlFile.h"
 
 namespace optic::ui {
@@ -31,15 +33,23 @@ namespace optic::capture {
 class CameraEngine {
 public:
     CameraEngine() = default;
-    ~CameraEngine() { stop(); }
+    ~CameraEngine();
 
-    bool start(const std::string& dataDir);   // 预览窗由 core/ui 提供
-    void stop();
-
+    // ---- 生命周期（全异步：主线程永不阻塞）----
+    // HAL 在打盹瞬间可能把 device close 挂起（2026-09-30 两次实锤：closeSession >5s
+    // 不返回）——若主线程同步 join 引擎线程，surfaceDestroyed/onPause 冻结 → ANR。
+    // 因此：stop 只置标志立即返回，收摊（closeSession + camera close）由引擎线程
+    // 自己完成；启动若撞上收摊未完成，登记意图后由主循环 tryStart 重试。
+    void requestStart(const std::string& dataDir);   // 登记 + 尝试启动
+    bool tryStart();                                 // 主循环每轮调用；无阻塞
+    void stop();                                     // 异步停：置标志即返回
     bool running() const { return running_.load(std::memory_order_acquire); }
+    bool stopped() const { return stopped_.load(std::memory_order_acquire); }
 
     // GL UI（optic.cpp 注入；引擎线程消费其命令队列，预览窗挂会话输出）
     void setUi(ui::Ui* u) { ui_ = u; }
+    // JNI 注入（android_main）：相册写入用（MediaStore → DCIM/Camera）
+    void setJni(JavaVM* vm, jobject activity) { gallery_.init(vm, activity); }
 
 private:
     void run(std::string dataDir);
@@ -88,12 +98,27 @@ private:
     CameraDevice cam_;
     std::unique_ptr<CaptureSession> session_;
     std::unique_ptr<RawCapture> raw_;
+    std::unique_ptr<StillCapture> still_;   // JPEG 通路（与 raw_ 互斥挂会话输出）
+    // 拍摄格式：true=JPEG（默认，存系统相册） false=RAW/DNG（fmt=raw 切换）。
+    // UI 角标点按切换（Cmd::SET_FMT），会话输出目标随之替换（stillWindow），
+    // 需重建会话（~300ms）。
+    bool jpgMode_ = true;
+    // 拍摄输出的窗口：JPEG 模式返回 still_，否则按 raw 环模式返回 raw_
+    ANativeWindow* stillWindow() const;
+    // 快门时刻参数快照（滤镜/自定义算法管线的用户设置来源）
+    StillParams makeStillParams() const;
     CaptureSettings settings_;
     // 曝光参数自动状态（UI A 键 / 拖滚轮切换）与 AE 冻结值（AE on 时从结果跟踪）
     bool isoAuto_ = true, ssAuto_ = true;
     int lastAeIso_ = 0;
     int64_t lastAeExpNs_ = 0;
     std::string dataDir_;
+    util::GalleryWriter gallery_;   // JPEG → 系统相册（DCIM/Camera）
+
+    // 异步生命周期状态（stop() 只置标志；running_/stopped_ 由引擎线程在收摊尾部翻转）
+    std::atomic<bool> stopped_{true};
+    std::atomic<bool> wantRun_{false};
+    std::string pendingDataDir_;    // 主线程写、tryStart 读（同线程），无竞争
 
     // 每启动拍摄配额（硬盘保护；save_quota=N 可放宽，0=禁用）
     // 8 次 ≈ 8×4 张 DNG ≈ 0.8GiB 上限；真机调参走 controls.txt: save_quota=N

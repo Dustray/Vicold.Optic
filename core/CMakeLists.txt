@@ -6,10 +6,13 @@ add_library(optic_core STATIC
     capture/CaptureSettings.cpp
     capture/CaptureSession.cpp
     capture/RawCapture.cpp
+    capture/StillCapture.cpp
     capture/CameraEngine.cpp
     dng/DngWriter.cpp
+    util/Gallery.cpp
     ui/Gl.cpp
     ui/Haptics.cpp
+    ui/Battery.cpp
     ui/Ui.cpp
 )
 

@@ -98,6 +98,8 @@ private:
                                    const ACameraMetadata* result);
     static void onCaptureFailed(void* ctx, ACameraCaptureSession*, ACaptureRequest*,
                                 ACameraCaptureFailure* failure);
+    static void onSequenceCompleted(void* ctx, ACameraCaptureSession*, int sequenceId,
+                                    int64_t frameNumber);
 
     // skipZoom=true 时物理直连不写用户 zoomRatio（物理镜头以自身原生 FOV 出图）；
     // physZoom>0 时改写该相对数字变焦（长焦直连的 z/teleNative，HAL 侧自行钳制）。
@@ -121,8 +123,9 @@ private:
     std::vector<ACaptureSessionOutput*> outputs_;
     std::map<std::string, BandReq> bands_;
 
-    // 单拍：串行复用一个请求
+    // 单拍：串行复用一个请求（释放以 sequenceId 匹配的 onSequenceCompleted 为准）
     ACaptureRequest* onceReq_ = nullptr;
+    int onceSeq_ = -1;
     std::vector<ANativeWindow*> onceWins_;
     std::vector<ACameraOutputTarget*> onceTgts_;
 

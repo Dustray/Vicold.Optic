@@ -104,7 +104,8 @@ bool CaptureSession::create(ACameraDevice* dev, const std::vector<OutDesc>& outp
     }
 
     capCbs_ = {this, nullptr, nullptr, &CaptureSession::onCaptureCompleted,
-               &CaptureSession::onCaptureFailed, nullptr, nullptr, nullptr};
+               &CaptureSession::onCaptureFailed, &CaptureSession::onSequenceCompleted,
+               nullptr, nullptr};
     LOGI("capture session created (%zu outputs)", outputs_.size());
     return true;
 }
@@ -344,11 +345,34 @@ bool CaptureSession::captureOnce(const std::vector<ANativeWindow*>& targets,
 
     int seqId = 0;
     ACaptureRequest* reqArr[1] = {onceReq_};
-    if (ACameraCaptureSession_capture(session_, &capCbs_, 1, reqArr, &seqId) != ACAMERA_OK) {
+    if (ACameraCaptureSession_capture(session_, &capCbs_, 1, reqArr, &seqId)
+        != ACAMERA_OK) {
         LOGE("capture(once) failed");
+        ACaptureRequest_free(onceReq_);
+        onceReq_ = nullptr;
+        for (auto* t : onceTgts_) ACameraOutputTarget_free(t);
+        onceTgts_.clear();
         return false;
     }
+    // 单拍完成以 sequenceId 事件为准（onCaptureCompleted 回调的 request 指针
+    // 与提交指针不保证相等 —— NDK 文档明确，靠指针相等释放会泄漏 onceReq_，
+    // 第二次 captureOnce 被"在途"跳过。2026-09-30 真机复现，M0 审查 P0 处方落地）
+    onceSeq_ = seqId;
     return true;
+}
+
+// 序列结束：sequenceId 匹配的单拍请求在此释放（成功/失败都保证回调）
+void CaptureSession::onSequenceCompleted(void* ctx, ACameraCaptureSession*, int sequenceId,
+                                         int64_t) {
+    auto* self = static_cast<CaptureSession*>(ctx);
+    std::lock_guard<std::mutex> lock(self->mutex_);
+    if (self->onceSeq_ == sequenceId && self->onceReq_) {
+        ACaptureRequest_free(self->onceReq_);
+        self->onceReq_ = nullptr;
+        self->onceSeq_ = -1;
+        for (auto* t : self->onceTgts_) ACameraOutputTarget_free(t);
+        self->onceTgts_.clear();
+    }
 }
 
 void CaptureSession::applySettings(ACaptureRequest* req, const CaptureSettings& s, bool skipZoom,
@@ -364,21 +388,11 @@ void CaptureSession::onSessionClosed(void*, ACameraCaptureSession*) {}
 void CaptureSession::onSessionReady(void*, ACameraCaptureSession*) {}
 void CaptureSession::onSessionActive(void*, ACameraCaptureSession*) {}
 
-void CaptureSession::onCaptureCompleted(void* ctx, ACameraCaptureSession*, ACaptureRequest* req,
+void CaptureSession::onCaptureCompleted(void* ctx, ACameraCaptureSession*, ACaptureRequest*,
                                         const ACameraMetadata* result) {
     auto* self = static_cast<CaptureSession*>(ctx);
-    FrameResult fr = parseResult(result);
-    {
-        std::lock_guard<std::mutex> lock(self->mutex_);
-        if (self->onceReq_ && req == self->onceReq_) {
-            // 单拍请求完成，释放给下一次 captureOnce
-            ACaptureRequest_free(self->onceReq_);
-            self->onceReq_ = nullptr;
-            for (auto* t : self->onceTgts_) ACameraOutputTarget_free(t);
-            self->onceTgts_.clear();
-        }
-    }
-    if (self->onFrameResult) self->onFrameResult(fr);
+    // 单拍请求的释放走 onSequenceCompleted（sequenceId 匹配，指针相等不可靠）
+    if (self->onFrameResult) self->onFrameResult(parseResult(result));
 }
 
 void CaptureSession::onCaptureFailed(void* ctx, ACameraCaptureSession*, ACaptureRequest*,

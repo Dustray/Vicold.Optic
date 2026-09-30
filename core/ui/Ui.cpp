@@ -72,8 +72,8 @@ constexpr float kHistW = 132, kHistH = 66, kHistY = 52;
 // AF（跟随预览区，保持居中：预览中心 x=678）
 constexpr float kAfX = 626, kAfY = 312, kAfSize = 104, kAfTagY = 264;
 // EV 面板（跟随预览区左移：面板 = 预览左缘 + 24）
-constexpr float kEvPanelX = 222, kEvPanelY = 622, kEvPanelW = 360, kEvPanelH = 84;
-constexpr float kEvTrackX = 234, kEvTrackW = 316, kEvTrackY = 664, kEvTrackH = 24;
+constexpr float kEvPanelX = 222, kEvPanelY = 622, kEvPanelW = 520, kEvPanelH = 84;
+constexpr float kEvTrackX = 234, kEvTrackW = 476, kEvTrackY = 664, kEvTrackH = 24;
 // 右导轨（滑轨宽 100；整组左移拉开与快门的距离：SS 滑轨右缘 1380 ↔ 快门左缘 1410）
 constexpr float kRailRX = 1156, kRailRW = 380;
 constexpr float kIsoTrackX = 1166, kSsTrackX = 1280, kTrackY = 138, kTrackW = 100, kTrackH = 440;
@@ -199,7 +199,8 @@ void Ui::onInputEvent(AInputEvent* e) {
     float x = toDesignX(AMotionEvent_getX(e, 0));
     float y = toDesignY(AMotionEvent_getY(e, 0));
     switch (action) {
-        case AMOTION_EVENT_ACTION_DOWN: onDown(x, y); break;
+        case AMOTION_EVENT_ACTION_DOWN:
+            onDown(x, y, double(AMotionEvent_getEventTime(e)) / 1e6); break;
         case AMOTION_EVENT_ACTION_MOVE: onMove(x, y); break;
         case AMOTION_EVENT_ACTION_UP:
         case AMOTION_EVENT_ACTION_CANCEL: onUp(x, y); break;
@@ -207,8 +208,17 @@ void Ui::onInputEvent(AInputEvent* e) {
     }
 }
 
-void Ui::onDown(float x, float y) {
+void Ui::onDown(float x, float y, double tMs) {
     hapStop_ = -1;   // 新触摸重置落档触感跟踪
+    // RAW/JPG 格式角标（预览左上第一枚）：点按切换拍摄格式（引擎重建会话 ~300ms）。
+    // 热区存设计坐标（onDown 的 x/y 已是 toDesign 反变换后的设计值），上下各放宽 6px 好按
+    if (chipFmtL_ > 0 && x >= chipFmtL_ && x <= chipFmtR_ &&
+        y >= kHudY - 6 && y <= kHudY + kChipH + 6) {
+        fmtJpg_ = !fmtJpg_;
+        pushCmd(Cmd::SET_FMT, 1.f);
+        hap_.click();
+        return;
+    }
     // 快门（圆内判定，略放大热区）
     float scx = kShutterX + kShutterD / 2, scy = kShutterY + kShutterD / 2;
     if (std::hypot(x - scx, y - scy) <= kShutterD / 2 + 8) {
@@ -260,6 +270,21 @@ void Ui::onDown(float x, float y) {
     const bool anyAuto = isoAuto_ || ssAuto_;   // EV 只作用于处于自动态的参数
     if (anyAuto &&  // 全手动时 EV 无意义（面板灰显），不可拖
         inR(x, y, kEvTrackX - 6, kEvTrackY - 8, kEvTrackW + 12, kEvTrackH + 16)) {
+        // 双击归零：350ms 内、同位置（±40 设计 px）的第二击 → EV 复位 0
+        if (tMs - lastEvTapMs_ < 350.0 &&
+            std::hypot(x - lastEvTapX_, y - lastEvTapY_) < 40.f) {
+            lastEvTapMs_ = -1e3;                  // 复位，防三击连触
+            if (std::fabs(ev_) > 1e-4f) {         // 已是 0 则不重发命令
+                ev_ = 0;
+                pushCmd(Cmd::SET_EV, 0.f);
+                LOGI("ev double-tap -> 0");
+            }
+            hap_.click();
+            return;
+        }
+        lastEvTapMs_ = tMs;
+        lastEvTapX_ = x;
+        lastEvTapY_ = y;
         LOGI("ev drag: down design=(%.0f,%.0f) ev=%.2f", x, y, ev_);
         drag_ = Drag::EV; dragRefPos_ = x; dragRefF_ = (ev_ - evMinEv_) / (evMaxEv_ - evMinEv_);
         return;
@@ -368,8 +393,9 @@ void Ui::onMove(float x, float y) {
         }
         case Drag::EV: {
             const float span = evMaxEv_ - evMinEv_;
-            // 符号与渲染一致：f=0(evMin) 在左、f=1(evMax) 在右 → 手指向右 = EV 增大
-            float f = dragRefF_ + (x - dragRefPos_) / (0.92f * kEvTrackW);
+            // 刻度盘手感，与 ISO/SS 竖滚轮一致：「刻度跟着手指走」——手指向右 = 刻度右移
+            // = 中心对准更小的 EV（渲染 f=0 在左、f=1 在右，故取负号）。
+            float f = dragRefF_ - (x - dragRefPos_) / (0.92f * kEvTrackW);
             float v = std::clamp(f, 0.f, 1.f) * span + evMinEv_;
             if (std::fabs(v) < evStepEv_ * 0.5f) v = 0;      // 中心吸附（拖动中）
             ev_ = v;
@@ -416,7 +442,8 @@ void Ui::onUp(float x, float y) {
         }
         case Drag::EV: {
             const float span = evMaxEv_ - evMinEv_;
-            float f = dragRefF_ + (x - dragRefPos_) / (0.92f * kEvTrackW);
+            // 与 onMove 同号：刻度盘手感（手指向右 = EV 减小），松手吸附步长网格
+            float f = dragRefF_ - (x - dragRefPos_) / (0.92f * kEvTrackW);
             ev_ = std::clamp(f, 0.f, 1.f) * span + evMinEv_;
             // 松手吸附到步长网格（traits evStep，默认 0.5）：显示值 = 相机实际生效值
             const float st = evStepEv_;
@@ -757,25 +784,52 @@ void Ui::drawPreviewOverlay() {
     }
     gl_.text("AF-S \xc2\xb7 f/1.65", screenX(kAfX), screenY(kAfTagY), 10 * kUiZoom * scale_, kT2);
 
-    // HUD chips（RAW / DNG / 分辨率 / ZSL）
+    // HUD chips（RAW|JPG / DNG / 分辨率 / ZSL）。首枚角标是格式切换按钮：点按 RAW↔JPG
     {
         float x = screenX(kPreviewX + 16), y = screenY(kHudY);
+        float dx = kPreviewX + 16;   // 同步推进的设计坐标（热区记录用，勿与屏幕 x 混用）
         std::string res = std::to_string(rawW_) + " \xc3\x97 " + std::to_string(rawH_);
         struct Chip { const char* t; Rgba c; };
-        const Chip chips[4] = {{"RAW", kAccent},
-                               {"DNG", kWhite},
+        const Chip chips[4] = {{fmtJpg_ ? "JPG" : "RAW", fmtJpg_ ? kWhite : kAccent},
+                               {"DNG", fmtJpg_ ? kT3 : kWhite},
                                {res.c_str(), kT2},
                                {"ZSL \xe5\xb0\xb1\xe7\xbb\xaa", kT2}};
-        for (const auto& c : chips) {
+        for (int i = 0; i < 4; ++i) {
+            const auto& c = chips[i];
             float w = gl_.textWidth(c.t, 12 * kUiZoom * scale_) + 2 * dim(kChipPadX);
             gl_.roundedRect(x, y, w, dim(kChipH), dim(6), kChipBg, kNone, 0);
             gl_.text(c.t, x + dim(kChipPadX), y + dim(5), 12 * kUiZoom * scale_, c.c);
+            if (i == 0) {
+                // 记录格式角标热区（设计坐标；onDown 同在 glue 线程，无竞争）
+                chipFmtL_ = dx;
+                chipFmtR_ = dx + w / scale_;
+            }
             x += w + dim(8);
+            dx += w / scale_ + 8;
         }
     }
 
-    // 时钟 + 电池
+    // 预览帧率（芯片行下方，跟芯片文字同字号）
+    if (fpsValue_ > 0.f) {
+        char ftxt[16];
+        snprintf(ftxt, sizeof(ftxt), "%.0f FPS", fpsValue_);
+        gl_.text(ftxt, screenX(kPreviewX + 16), screenY(kHudY + kChipH + 8),
+                 12 * kUiZoom * scale_, kT2);
+    }
+
+    // 时钟 + 电池（真实电量：Battery JNI 轮询，30s 刷新；失败保持上次值）
     {
+        const double nowS = nowSec();
+        if (nowS >= battNextT_) {
+            bool chg = false;
+            int p = batt_.query(&chg);
+            if (p >= 0) {
+                battPct_ = p;
+                battCharging_ = chg;
+            }
+            battNextT_ = nowS + 30.0;
+        }
+
         std::time_t t = std::time(nullptr);
         std::tm tm{};
         localtime_r(&t, &tm);
@@ -785,9 +839,15 @@ void Ui::drawPreviewOverlay() {
         float right = screenX(kPreviewX + kPreviewW - 16);
         gl_.text(clk, right - cw - dim(34), screenY(kHudY + 4), 13 * kUiZoom * scale_, kT1);
 
+        // 填充按真实电量比例；充电 = 绿、低电(≤20%) = 重点色、正常 = 白
         float bx = right - dim(24), by = screenY(kHudY + 2);
         gl_.roundedRect(bx, by, dim(24), dim(14), dim(3), kNone, {1, 1, 1, 0.8f}, dim(1.5f));
-        gl_.roundedRect(bx + dim(2), by + dim(2), dim(12), dim(10), dim(1.5f), kAccent, kNone, 0);
+        Rgba fill = battCharging_ ? Rgba{74 / 255.f, 222 / 255.f, 128 / 255.f, 1}
+                    : (battPct_ >= 0 && battPct_ <= 20)
+                        ? kAccent
+                        : Rgba{1, 1, 1, 1};
+        float fw = dim(20) * (battPct_ < 0 ? 0.f : std::clamp(battPct_ / 100.f, 0.04f, 1.f));
+        gl_.roundedRect(bx + dim(2), by + dim(2), fw, dim(10), dim(1.5f), fill, kNone, 0);
         // 电池正极帽
         gl_.roundedRect(bx + dim(24) + dim(1), by + dim(3), dim(2), dim(8), 0,
                         {1, 1, 1, 0.8f}, kNone, 0);
@@ -885,6 +945,22 @@ void Ui::frame() {
                 LOGI("preview slot %d -> %d (az=%.2f base=%.2f)", previewActive_, tgt, azT,
                      base);
                 previewActive_ = tgt;
+            }
+        }
+    }
+
+    // 预览帧率：活动 slot 的相机出帧速率，500ms 窗口（预览左上角显示）
+    {
+        const double t = nowSec();
+        if (previewActive_ >= 0) {
+            const int64_t cnt = slotFrames_[previewActive_].load(std::memory_order_relaxed);
+            if (fpsLastT_ == 0) {
+                fpsLastT_ = t;
+                fpsLastCnt_ = cnt;
+            } else if (t - fpsLastT_ >= 0.5) {
+                fpsValue_ = float(double(cnt - fpsLastCnt_) / (t - fpsLastT_));
+                fpsLastT_ = t;
+                fpsLastCnt_ = cnt;
             }
         }
     }
@@ -1039,6 +1115,10 @@ void Ui::frame() {
                      "\xe9\x85\x8d\xe9\xa2\x9d\xe5\xb7\xb2\xe7\x94\xa8\xe5\xb0\xbd %d/%d",
                      shotUsed_.load(std::memory_order_acquire),
                      shotTotal_.load(std::memory_order_acquire));
+        } else if (fmtJpg_) {
+            snprintf(t, sizeof(t),
+                     "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 JPG \xe2\x86\x92 "
+                     "\xe7\x9b\xb8\xe5\x86\x8c");   // 已保存 · JPG → 相册
         } else {
             snprintf(t, sizeof(t),
                      "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 DNG "
@@ -1050,6 +1130,24 @@ void Ui::frame() {
         float ty = screenY(kStageH - 56);
         gl_.roundedRect(tx, ty, w, dim(30), dim(15), {0, 0, 0, 0.6f}, {1, 1, 1, 0.12f}, 1);
         gl_.text(t, tx + dim(14), ty + dim(9), 11 * kUiZoom * scale_, kWhite);
+    }
+    // 保存进度 pill（优先于拍照 toast；正在保存/已保存短暂展示）
+    {
+        const int inFlight = saveInFlight_.load(std::memory_order_acquire);
+        const char* msg = nullptr;
+        if (inFlight > 0) {
+            msg = "\xe6\xad\xa3\xe5\x9c\xa8\xe4\xbf\x9d\xe5\xad\x98\xe2\x80\xa6";   // 正在保存…
+        } else if (now < saveDoneUntil_) {
+            msg = "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 DCIM/Camera";   // 已保存 · DCIM/Camera
+        }
+        if (msg) {
+            float w = gl_.textWidth(msg, 11 * kUiZoom * scale_) + dim(28);
+            float tx = screenX(kPreviewX + kPreviewW / 2) - w / 2;
+            float ty = screenY(kStageH - 96);   // 拍照 toast 上方一行
+            gl_.roundedRect(tx, ty, w, dim(30), dim(15), {0, 0, 0, 0.6f},
+                            inFlight > 0 ? kAccent : Rgba{1, 1, 1, 0.12f}, 1);
+            gl_.text(msg, tx + dim(14), ty + dim(9), 11 * kUiZoom * scale_, kWhite);
+        }
     }
 
     gl_.swap();

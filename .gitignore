@@ -8,3 +8,4 @@ out/
 *.apk.idsig
 doc/debug/
 .workbuddy/*.png
+.workbuddy/*.jpg

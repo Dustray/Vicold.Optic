@@ -9,12 +9,15 @@
 #include <jni.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "core/ui/Battery.h"
 #include "core/ui/Gl.h"
 #include "core/ui/Haptics.h"
 
@@ -24,7 +27,7 @@ class Ui {
 public:
     struct Cmd {
         enum Type { SET_ISO, SET_EXP_US, SET_ZOOM, SET_EV, SET_AE, SET_ISO_AUTO,
-                    SET_SS_AUTO, SET_AE_LOCK, SHOT } type = SET_ISO;
+                    SET_SS_AUTO, SET_AE_LOCK, SET_FMT, SHOT } type = SET_ISO;
         float v = 0;
     };
 
@@ -47,6 +50,8 @@ public:
     int32_t previewH(int slot = 0) { return gl_.previewH(slot); }
 
     void setStaticText(int32_t rawW, int32_t rawH) { rawW_ = rawW; rawH_ = rawH; }
+    // 拍摄格式真值同步（引擎冷启动读 controls.txt 后校正；UI 点按角标时乐观翻转）
+    void setFmtJpg(bool j) { fmtJpg_ = j; }
     void setUvRot(int rot) { uvRotOverride_ = rot; }
     // 定向的两个真值输入（比"猜方向"可靠）：
     //   sensorDeg  = ACAMERA_SENSOR_ORIENTATION（缓冲需顺时针转多少度才在"本机自然方向"下正立）
@@ -56,8 +61,12 @@ public:
     void setDisplayRot(int r) { displayRot_ = r; }
     // 注入应用数据目录：attach 时读 controls.txt 的 preview_w/preview_h（机型调参用）
     void setDataDir(const std::string& dir) { dataDir_ = dir; }
-    // 注入 JNI（android_main 一次性调用）：触感反馈经系统 Vibrator
-    void setJni(JavaVM* vm, jobject activity) { hap_.init(vm, activity); }
+    // 注入 JNI（android_main 一次性调用）：触感反馈经系统 Vibrator、真实电量经
+    // ACTION_BATTERY_CHANGED 粘性广播
+    void setJni(JavaVM* vm, jobject activity) {
+        hap_.init(vm, activity);
+        batt_.init(vm, activity);
+    }
 
     // 引擎线程回传本次快门是否被配额放行（toast 据此给真实反馈）
     void notifyShot(bool accepted, int used, int total) {
@@ -65,6 +74,22 @@ public:
         shotUsed_.store(used, std::memory_order_release);
         shotTotal_.store(total, std::memory_order_release);
     }
+
+    // 拍照保存进度（引擎每轮转发 StillCapture 的原子量）：inFlight>0 = 正在保存；
+    // 归零且 lastDoneMs 有新值 → 「已保存」短暂展示
+    void notifySaveProgress(int inFlight, int64_t lastDoneMs) {
+        int prev = saveInFlight_.exchange(inFlight, std::memory_order_acq_rel);
+        if (prev > 0 && inFlight == 0 && lastDoneMs != lastDoneSeenMs_) {
+            lastDoneSeenMs_ = lastDoneMs;
+            saveDoneUntil_ =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count() +
+                1.6;
+        }
+    }
+    // 引擎重建会话/重建 StillCapture 时调用：上会话计数不跨会话卡「正在保存」
+    void resetSaveProgress() { saveInFlight_.store(0, std::memory_order_release); }
 
     // ---- 平滑拖拽变焦（引擎线程回传）----
     // 每路预览源（0=逻辑主摄 / 1=超广角 / 2=长焦）各自维护一个 az（当前出图帧对应的
@@ -129,7 +154,7 @@ private:
     float zoomMin_ = kZoomMin;   // 运行时实际下限（setZoomRange 覆盖，默认按 HAL 量程）
     static constexpr int kRingFrames = 4;
 
-    void onDown(float dx, float dy);
+    void onDown(float dx, float dy, double tMs);   // tMs = AMotionEvent 事件时间（双击判定）
     void onMove(float dx, float dy);
     void onUp(float dx, float dy);
     float zoomFromF(float f) const;   // 轨道连续位置 → 变焦值（等距分段 + 刻度吸附）
@@ -229,6 +254,17 @@ private:
     std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
     std::atomic<int> shotUsed_{0}, shotTotal_{0};
 
+    // 拍照保存进度（引擎 notifySaveProgress 转发；绘制在 toast 位）
+    std::atomic<int> saveInFlight_{0};   // 正在保存/待到帧的帧数
+    int64_t lastDoneSeenMs_ = 0;         // 上次「已保存」用过的完成戳（去重）
+    double saveDoneUntil_ = 0;           // 「已保存」展示截止（steady 秒）
+
+    // 真实电量（Battery JNI 轮询，~30s 一次；失败保持上次值）
+    Battery batt_;
+    int battPct_ = -1;
+    bool battCharging_ = false;
+    double battNextT_ = 0;
+
     // 预览源切换（ALL 常流）：target = 引擎按带要求的显示源；active = 实际显示源。
     std::atomic<int> previewTarget_{0};
     int previewActive_ = 0;
@@ -238,10 +274,20 @@ private:
 
     // 三路常流帧计数（frame() 每帧 drain 全部源时累加）
     std::atomic<int64_t> slotFrames_[3] = {};
+    // 预览帧率显示（预览左上角）：活动 slot 帧计数 500ms 窗口
+    double fpsLastT_ = 0;
+    int64_t fpsLastCnt_ = 0;
+    float fpsValue_ = 0.f;
 
     // 直方图
     int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};
     int32_t rawW_ = 4096, rawH_ = 3072;
+    bool fmtJpg_ = false;        // 拍摄格式：false=RAW/DNG true=JPEG（HUD 角标点按切换）
+    float chipFmtL_ = -1, chipFmtR_ = -1;   // RAW/JPG 角标热区（绘制时记录，设计坐标）
+
+    // EV 双击归零判定（onDown 传事件时间，350ms 内同位置二击 = 双击）
+    double lastEvTapMs_ = -1e3;
+    float lastEvTapX_ = 0, lastEvTapY_ = 0;
 
     std::mutex cmdM_;
     std::deque<Cmd> cmds_;
