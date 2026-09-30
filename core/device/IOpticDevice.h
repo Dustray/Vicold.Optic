@@ -50,6 +50,12 @@ public:
     // per-sensor tuning 配置路径（M4 起使用）
     virtual std::string tuningFileFor(const std::string& physicalId) const { (void)physicalId; return {}; }
 
+    // per-physical 请求键（ZOOM_RATIO / SCALER_CROP_REGION）是否被 HAL 真实执行。
+    // 部分机型（pandora/CamX）在 availableRequestKeys 里声明支持但实际忽略
+    //（2026-09-29 真机确诊：长焦带 3.0↔8.0 预览逐像素零差异），此时物理带内
+    // 变焦回退 GL 数字裁切（见 CameraEngine/Ui）。
+    virtual bool physPerKeyZoom() const { return true; }
+
     virtual const char* name() const = 0;
 };
 

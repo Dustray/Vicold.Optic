@@ -107,9 +107,15 @@ private:
     std::string forcedUwPhys_;  // controls.txt uw_phys=N：强制指定超广角物理摄像头 ID（诊断用）
     std::string forcedTelePhys_;// controls.txt tele_phys=N：强制指定长焦物理摄像头 ID（诊断用）
     float forcedPhysMin_ = 0.f; // controls.txt phys_min=N：强制长焦直连起始倍率（0=用自动值，诊断用）
+    float forcedTeleNative_ = 0.f; // controls.txt tele_native=N：强制长焦带基 az（肉眼校准用）
     std::string uwPhysId_;      // 当前生效的超广角物理 ID（forcedUwPhys_ > 自动探测 > 回退 "2"）
     std::string telePhysId_;    // 当前生效的长焦物理 ID（forcedTelePhys_ > 自动探测）
-    float teleMinZoom_ = 1e9f;  // 长焦直连起始倍率（默认 = teleNativeZoom，即恰在 SAT 切换点前绕开融合）
+    float teleMinZoom_ = 1e9f;  // 长焦原生倍率（= teleNativeZoom，长焦带 crop 的换算带基）
+    // 长焦接管点：逻辑流能健康出帧的最大倍率（本机实测 4.8 干净、5.0 起持续断流 ——
+    // 2026-09-30）。接管点必须在安全区内，否则用户拖到 5x 时逻辑流已在断流：
+    // 画面先冻结、再随长焦接管瞬间跳变（用户所见「5x 瞬间放大好多」）。
+    static constexpr float kLogicalSafeMax = 4.85f;
+    float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, kLogicalSafeMax)：实际接管点
     float uwNativeZoom_ = 0.7f; // 超广角光学倍率 f(uw)/f(main)（真机 0.388；探测失败回退 0.7）
                                 // —— FOV 换算基准，与导轨下限 0.7 无关，混用会让超广/主摄衔接错位
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连
@@ -123,6 +129,7 @@ private:
     // ALL 请求逐摄写入的相对变焦缓存（onFrameResult 的 appliedZoom 回传换算用）
     float relUw_ = 0.f, relTele_ = 0.f;
     int lastDispSlot_ = -1;     // 上次下发的 GL 显示 slot（变化才打日志）
+    bool manualDisp_ = false;   // disp 诊断键手动锁定显示源（分带变化时才交还自动）
 
     // 物理摄逐键变焦能力快照（probePhysCaps，rebuildSession 时刷新）：ALL 带内连续变焦
     // 依赖 per-physical ZOOM_RATIO 生效；部分 HAL 不支持/忽略该键（表现为镜头固定在

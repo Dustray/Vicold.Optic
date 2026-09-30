@@ -21,7 +21,15 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
   sdf 圆角矩形；字体图集（ASCII+按需 CJK）；`triangles()` 纯色批
 - `Ui`：cover 缩放。三件套必须分清 —— `dim(len)` 纯缩放（尺寸/半径/线宽）、`screenX/screenY` 位置加居中偏移；
   输入用 `toDesignX/toDesignY` 反变换。**EGL 窗口原点在左下、触摸原点在左上**，着色器里已做 Y 翻转，勿再改回
-- 变焦导轨 0.7–10（kZoomStops 含 0.7）：sub-1.0 经引擎自动切超广角物理直连（P:3）；0.7–1.0 段=超广角原生 FOV 无数字变焦
+- 变焦导轨 0.7–10（kZoomStops 含 0.7）：sub-1.0 经引擎自动切超广角物理直连（P:3）
+- **FOV 换算的两个基准量别混**：导轨下限 0.7 是 UI 量程；光学倍率
+  `uwNativeZoom = f(uw)/f(main)`（0.388）才是 FOV/crop 换算基准。混用会让超广带显示
+  FOV 系统性偏宽、与主摄带在 1.0 处接不上（2026-09-30 症状「焦距重叠」）。
+- **平滑变焦 = 全带统一 crop 补偿**：`crop = zoom_（手指目标）/ az（相机实际出图倍率）`。
+  逻辑带相机下发有 120ms 节流，不补差就是 8 次/s 阶梯跳（卡顿感）。
+  **az 变化时 crop 必须落位到新 target，绝不能归一到 1** —— 归一会让 FOV 退回 az 再
+  爬升，与纹理过渡叠加 = 泵动闪烁（2026-09-29 全程闪烁元凶）。静止时 az=zoom_ → crop=1。
+- 变焦补偿上限：uw 带 crop ≤2.65、tele 带 ≤3.8（数字裁切，预览偏软，DNG 不受影响）
 - 线程：glue 线程 = 渲染 + 输入；UI 命令经 `Ui::popCmd()` 交引擎线程，与 controls.txt 共用 `triggerBurst()` 配额闸门
 - 每启动快门配额 `saveQuota_ = 8`（曾为 1，无法真机评估）；`controls.txt: save_quota=N` 可调
 
@@ -30,8 +38,20 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
   物理摄不在 getCameraIdList 里，无法独立打开（cam=2 直开必败）。
 - **逻辑融合管线有两个坏区，都必须物理直连绕开**：① sub-1.0（超广角融合）② 高倍数字区
   ≥~4（SAT/长焦融合；实测 2.0/3.0 干净、5.0/8.85/10 持续断流）。
-- 分带：z∈[0.7,1.0)→P:3 直连；z≥teleNativeZoom(2.63)→P:4 直连（写相对变焦 z/2.63）；其余→逻辑 L。
-- 会话签名 L+R / P:3 / P:4；物理直连不写用户 zoomRatio（写 physZoom 相对值）、不含 RAW、RAW 拍摄被拒。
+- 分带（显示源判定）：z∈[0.7,1.0)→显示 uw 流；z≥teleNativeZoom(2.63)→显示 tele 流；其余→逻辑流
+  （滞回保留：uw 退出 z≥1.03、tele 退出 z≥teleMin−0.08）。
+- **ALL 全目标常驻会话（2026-09-29 深夜定稿，真机验证）**：一个 repeating 请求挂 4 输出永不再换
+  （`setRepeatingAll`，withPhysicalIds([3,4]) 创建，逐摄写 ZOOM_RATIO：uw=z/uwNativeZoom(0.388)、
+  tele=z/teleMin、逻辑钳在 [1.0, teleMin]——三路流恒渲染同一用户 FOV）。跨带 = 纯 GL 切显示
+  slot + 150ms 交叉淡化，请求零动作。**10 次跨带往返 0 请求重建 0 gap**（换请求方案曾
+  118ms/次、重建方案曾 ~285ms+黑帧）。RAW 恒出帧 → 全带可拍。HAL 拒绝则降级单流重建。
+  **pandora quirk（Xiaomi17ProDevice::physPerKeyZoom=false）**：CamX 声明支持 per-physical
+  ZOOM_RATIO/CROP_REGION 但**实际忽略**（长焦带 3.0↔8.0 画面零差异确诊）→ 不写键、物理流恒
+  原生 FOV，带内变焦走 GL crop。逻辑流钳制上界=teleMin（若钳 2.50 会留 2.50~2.63 死区）。
+  代价：三传感器常开功耗↑；三路 reader 每帧必须全部 drain（不消费会撑满队列拖累 repeating）。
+- 逐摄键 API：`ACaptureRequest_setEntry_physicalCamera_float(req, physicalId, tag, count, data)`
+  —— **physicalId 在 tag 之前**（API 29）。
+- 单流降级路径仍走签名换请求（L+R / P:3 / P:4，物理直连无 RAW、拍摄被拒）。
 - **会话重建必须走退役墓地**（retired_，延迟 1.5s 析构）：旧 CaptureSession 立即析构会
   UAF（C2N-dev-looper 线程 SIGABRT，destroyed mutex）。
 - `activePhysId()`：zoomRatio==0 表示"未设置"，不能当 <1.0（否则冷启动误入直连）。

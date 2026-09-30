@@ -3,6 +3,7 @@
 #include "core/util/Log.h"
 
 #include <cstring>
+#include <map>
 #include <sys/system_properties.h>
 #include <utility>
 #include <vector>
@@ -105,13 +106,18 @@ bool CameraDevice::readTraits(const char* id) {
     }
 
     // 探测物理镜头布局：逻辑摄的物理成员按焦距排序 —— 最短=超广角、最长=长焦、
-    // 居中者=主摄。本机 [3 2 4] = 2.57mm(超广) / 6.62mm(主) / 17.42mm(长焦≈2.63x)。
+    // 居中者=主摄。本机 [3 2 4] = 2.57mm(超广) / 6.62mm(主) / 17.42mm(长焦)。
+    // 倍率必须用等效焦距比（含传感器宽度）：zoom_i = (f_i/w_i) / (f_main/w_main)。
+    // 仅焦距比会错得离谱 —— tele 传感器(5.24mm)远小于主摄(9.99mm)，焦距比 2.63x
+    // 而真值 5.02x（2026-09-30 真机+MIUI 相机口径双重确认：1x=23mm、5x=115mm、
+    // 0.7x=17mm，切换点就是 1x 与 5x）。此前按 2.63x 分带导致切点错乱。
     // 逻辑多摄的 ZOOM_RATIO 融合管线在本机有两个坏区：sub-1.0（超广角融合）与
-    // 高倍数字区（≥~4，SAT/长焦融合），两者都要物理直连绕开（见 CameraEngine）。
+    // 高倍数字区（SAT/长焦融合），两者都要物理直连绕开（见 CameraEngine）。
     if (traits_.logical && !traits_.physicalIds.empty()) {
         float fMin = 1e9f, fMax = 0.f, fMain = 0.f;
+        float swMin = 0.f, swMax = 0.f, swMain = 0.f;   // 传感器宽 mm
         std::string minId, maxId;
-        std::vector<std::pair<std::string, float>> fmap;   // (id, focal)
+        std::map<std::string, float> swOf;              // id -> sensorW
         for (auto& pid : traits_.physicalIds) {
             ACameraMetadata* pc = nullptr;
             if (ACameraManager_getCameraCharacteristics(manager_, pid.c_str(), &pc) != ACAMERA_OK || !pc)
@@ -121,41 +127,67 @@ bool CameraDevice::readTraits(const char* id) {
                     ACAMERA_OK &&
                 fe.count > 0) {
                 float fl = fe.data.f[0];
-                fmap.emplace_back(pid, fl);
-                if (fl < fMin) { fMin = fl; minId = pid; }
-                if (fl > fMax) { fMax = fl; maxId = pid; }
+                float sw = 0.f;
+                ACameraMetadata_const_entry se{};
+                if (ACameraMetadata_getConstEntry(pc, ACAMERA_SENSOR_INFO_PHYSICAL_SIZE, &se) ==
+                        ACAMERA_OK &&
+                    se.count >= 1)
+                    sw = se.data.f[0];
+                swOf[pid] = sw;
+                if (fl < fMin) { fMin = fl; minId = pid; swMin = sw; }
+                if (fl > fMax) { fMax = fl; maxId = pid; swMax = sw; }
             }
             ACameraMetadata_free(pc);
         }
         // 主摄 = 非（最短/最长）的那一个；成员只有 2 个时主摄 = 较长焦者（无长焦）
-        if (fmap.size() >= 3) {
-            for (auto& [pid, fl] : fmap) {
-                if (pid != minId && pid != maxId) { fMain = fl; break; }
+        if (swOf.size() >= 3) {
+            for (auto& pid : traits_.physicalIds) {
+                if (pid != minId && pid != maxId && swOf.count(pid)) {
+                    // 主摄焦距：从 characteristics 里拿不到就复用（此处重新读太重，
+                    // 用 fMain 直接由 swOf 成员对应 —— 再读一次 focal）
+                    ACameraMetadata* pc = nullptr;
+                    if (ACameraManager_getCameraCharacteristics(manager_, pid.c_str(), &pc) ==
+                            ACAMERA_OK &&
+                        pc) {
+                        ACameraMetadata_const_entry fe{};
+                        if (ACameraMetadata_getConstEntry(
+                                pc, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &fe) == ACAMERA_OK &&
+                            fe.count > 0)
+                            fMain = fe.data.f[0];
+                        ACameraMetadata_free(pc);
+                    }
+                    swMain = swOf[pid];
+                    if (fMain > 0.f && maxId != minId) traits_.telePhysicalId = maxId;
+                    break;
+                }
             }
-            if (fMain > 0.f && maxId != minId) {
-                traits_.telePhysicalId = maxId;
-                traits_.teleNativeZoom = fMax / fMain;
-            }
-        } else if (fmap.size() == 2) {
+        } else if (swOf.size() == 2) {
             fMain = fMax;
+            swMain = swMax;
         }
         if (fMain > 0.f) {
             traits_.mainFocal = fMain;
-            if (fMin > 0.f && !minId.empty()) traits_.uwNativeZoom = fMin / fMain;
+            // 等效焦距比（传感器尺寸缺失时回退纯焦距比）
+            auto zoomOf = [](float f, float w, float f0, float w0) {
+                if (f <= 0.f || f0 <= 0.f) return 0.f;
+                if (w <= 0.f || w0 <= 0.f) return f / f0;
+                return (f / w) / (f0 / w0);
+            };
+            if (fMin > 0.f && !minId.empty())
+                traits_.uwNativeZoom = zoomOf(fMin, swMin, fMain, swMain);
+            if (!traits_.telePhysicalId.empty())
+                traits_.teleNativeZoom = zoomOf(fMax, swMax, fMain, swMain);
         }
         if (minId.empty()) {
             LOGW("physical lens detection failed (no focal length for members)");
         } else {
             traits_.uwPhysicalId = minId;
-            if (traits_.uwNativeZoom > 0.f)
-                LOGI("phys layout: uw native zoom = %.3fx (f=%.2fmm / main %.2fmm)",
-                     traits_.uwNativeZoom, fMin, fMain);
-            if (traits_.telePhysicalId.empty())
-                LOGI("phys layout: uw=%s(%.2fmm) main=%.2fmm (no tele)", minId.c_str(), fMin, fMain);
-            else
-                LOGI("phys layout: uw=%s(%.2fmm) main=%.2fmm tele=%s(%.2fmm, %.2fx)",
-                     minId.c_str(), fMin, fMain, traits_.telePhysicalId.c_str(), fMax,
-                     traits_.teleNativeZoom);
+            auto f35 = [](float f, float w) { return w > 0.f ? f * 36.f / w : 0.f; };
+            LOGI("phys layout: uw=%s f=%.2fmm(eq %.1fmm) main f=%.2fmm(eq %.1fmm)"
+                 " tele=%s f=%.2fmm(eq %.1fmm) -> uw=%.3fx tele=%.3fx",
+                 minId.c_str(), fMin, f35(fMin, swMin), fMain, f35(fMain, swMain),
+                 traits_.telePhysicalId.c_str(), fMax, f35(fMax, swMax),
+                 traits_.uwNativeZoom, traits_.teleNativeZoom);
         }
     }
 

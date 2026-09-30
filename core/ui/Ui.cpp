@@ -203,13 +203,15 @@ float Ui::zoomFromY(float y) const {
     float f = 1 - (y - kZoomTrackY - kPadF * kZoomTrackH) /
                       (kUsableF * kZoomTrackH);
     f = std::clamp(f, 0.f, 1.f);
-    float v = kZoomMin * std::pow(kZoomMax / kZoomMin, f);
-    // 设计档位 / 整数档吸附
-    for (float s : kZoomStops)
+    float v = zoomMin_ * std::pow(kZoomMax / zoomMin_, f);
+    // 设计档位 / 整数档吸附（低于光学下限的档位不再吸附，否则拖到底落进死区）
+    for (float s : kZoomStops) {
+        if (s < zoomMin_ - 1e-3f) continue;
         if (std::fabs(v - s) < 0.13f) { v = s; break; }
+    }
     for (int s = 1; s <= 10; ++s)
         if (std::fabs(v - float(s)) < 0.13f) { v = float(s); break; }
-    return std::clamp(v, kZoomMin, kZoomMax);
+    return std::clamp(v, zoomMin_, kZoomMax);
 }
 
 void Ui::onMove(float x, float y) {
@@ -624,11 +626,15 @@ void Ui::frame() {
     gl_.roundedRect(screenX(kZoomTrackX + 23), screenY(kZoomTrackY + 20), dim(2),
                     dim(kZoomTrackH - 40), 0, kTrackLine, kNone, 0);
     {
-        float logMax = std::log(kZoomMax / kZoomMin);
+        float logMax = std::log(kZoomMax / zoomMin_);
         std::vector<float> fs;
         std::vector<char> mj;
+        // 光学下限本身作为一个主刻度（比 HAL 声称的下限更靠上时才替换掉 0.7 档）
+        fs.push_back(0.f);
+        mj.push_back(1);
         for (float s : kZoomStops) {
-            fs.push_back(std::log(s / kZoomMin) / logMax);
+            if (s < zoomMin_ - 1e-3f) continue;
+            fs.push_back(std::log(s / zoomMin_) / logMax);
             mj.push_back(1);
         }
         for (int k = 1; k < 14; ++k) {
@@ -639,7 +645,7 @@ void Ui::frame() {
                    dim(kZoomTrackH), fs, mj);
     }
     {
-        float logf = std::log(zoom_ / kZoomMin) / std::log(kZoomMax / kZoomMin);
+        float logf = std::log(zoom_ / zoomMin_) / std::log(kZoomMax / zoomMin_);
         float zt = thumbTop(logf);
         gl_.roundedRect(screenX(kZoomTrackX + 2), screenY(kZoomTrackY + zt), dim(44),
                         dim(30), dim(15), kAccent, kNone, 0);

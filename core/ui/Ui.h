@@ -70,6 +70,10 @@ public:
     // 导轨把手位置不搬动（视觉跳变），仅同步数值状态。
     void setZoomExternal(float z) { zoom_ = z; }
 
+    // 导轨下限 = 超广角光学倍率（运行时探测）：低于它画不了更广，拖到底会有一段
+    // 画面不动的死区（本机 uw 原生 0.774x > HAL 声称的 0.70x，2026-09-30）。
+    void setZoomRange(float zmin) { zoomMin_ = std::max(zmin, 0.5f); }
+
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
 
@@ -86,6 +90,7 @@ private:
     // 变焦范围 0.7–10：sub-1.0 走超广角物理直连（引擎侧 uwActive 判定，见 CameraEngine）。
     // 0.7–1.0 区间预览为超广角原生 FOV（物理直连不写 ZOOM_RATIO，段内无数字变焦）。
     static constexpr float kZoomMin = 0.7f, kZoomMax = 10.f, kZoomBaseMm = 23.f;
+    float zoomMin_ = kZoomMin;   // 运行时实际下限（setZoomRange 覆盖，默认按 HAL 量程）
     static constexpr int kRingFrames = 4;
 
     void onDown(float dx, float dy);

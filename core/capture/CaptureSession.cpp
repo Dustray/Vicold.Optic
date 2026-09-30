@@ -162,7 +162,7 @@ bool CaptureSession::setRepeating(const std::string& band, const std::vector<ANa
 
 bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
                                      const CaptureSettings& s,
-                                     const std::vector<std::pair<std::string, float>>& physZooms) {
+                                     const std::vector<PhysZoom>& phys) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!session_ || targets.empty()) return false;
 
@@ -174,10 +174,10 @@ bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
         for (auto* t : b.tgts) ACameraOutputTarget_free(t);
         b.tgts.clear();
         b.physId.clear();
-        if (!physZooms.empty()) {
+        if (!phys.empty()) {
             std::vector<const char*> ids;
-            ids.reserve(physZooms.size());
-            for (const auto& [id, z] : physZooms) ids.push_back(id.c_str());
+            ids.reserve(phys.size());
+            for (const auto& pz : phys) ids.push_back(pz.id.c_str());
             ACameraIdList plist{};
             plist.numCameras = static_cast<int>(ids.size());
             plist.cameraIds = ids.data();
@@ -205,12 +205,31 @@ bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
     }
 
     // 逻辑 zoom 由调用方（CameraEngine::effSettings）钳在干净带内；
-    // 物理流逐摄覆盖相对变焦（per-physical 键优先于逻辑值）。
+    // 物理流逐摄覆盖相对变焦：ZOOM_RATIO + 同值的 SCALER_CROP_REGION（双保险）。
     applySettings(b.req, s, false, 0.f);
-    for (const auto& [id, z] : physZooms) {
-        if (z > 0.f)
-            ACaptureRequest_setEntry_physicalCamera_float(b.req, id.c_str(),
-                                                          ACAMERA_CONTROL_ZOOM_RATIO, 1, &z);
+    for (const auto& pz : phys) {
+        if (pz.rel > 0.f) {
+            // 返回码必查：部分 HAL 对 per-physical 控制键静默失败。
+            const camera_status_t rc = ACaptureRequest_setEntry_physicalCamera_float(
+                b.req, pz.id.c_str(), ACAMERA_CONTROL_ZOOM_RATIO, 1, &pz.rel);
+            if (rc != ACAMERA_OK)
+                LOGW("per-phys ZOOM_RATIO set failed (phys=%s rel=%.2f rc=%d)", pz.id.c_str(),
+                     pz.rel, (int)rc);
+        }
+        if (pz.crop[2] > 0) {
+            const camera_status_t rc = ACaptureRequest_setEntry_physicalCamera_i32(
+                b.req, pz.id.c_str(), ACAMERA_SCALER_CROP_REGION, 4, pz.crop);
+            if (rc != ACAMERA_OK)
+                LOGW("per-phys CROP_REGION set failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        }
+    }
+    // 拖拽中 ~8 次/s 重发，值变化才打日志（防淹没 logcat）
+    if (s.zoomRatio != lastAllZoom_) {
+        lastAllZoom_ = s.zoomRatio;
+        LOGI("ALL re-issue: zoom=%.2f phys:", s.zoomRatio);
+        for (const auto& pz : phys)
+            LOGI("  %s rel=%.2f crop=[%d %d %d %d]", pz.id.c_str(), pz.rel, pz.crop[0],
+                 pz.crop[1], pz.crop[2], pz.crop[3]);
     }
     int seqId = 0;
     ACaptureRequest* reqArr[1] = {b.req};

@@ -56,11 +56,17 @@ public:
     bool setRepeating(const std::string& band, const std::vector<ANativeWindow*>& targets,
                       const CaptureSettings& s, const std::string& physId, float physZoom = 0.f);
     // 方案 A（全目标常驻）：一个 repeating 请求同时驱动全部 targets（三路预览 + RAW）。
-    // physZooms = 各物理摄的相对变焦（withPhysicalIds 建请求 + 逐摄写 ZOOM_RATIO，0 = 不写；
-    // 逻辑流 zoom 由 s.zoomRatio 给出，调用方钳在干净带内）。请求按 "ALL" 缓存，
+    // 逻辑流 zoom 由 s.zoomRatio 给出（调用方钳在干净带内）。请求按 "ALL" 缓存，
     // 设置/变焦变化只改 entry 重发 —— 跨带、带内全部 0 间隔。
+    struct PhysZoom {
+        std::string id;
+        float rel = 1.f;        // 相对变焦（该摄 zoomRatio 域，1.0 = 原生 FOV）
+        int32_t crop[4] = {};   // 与 rel 一致的 SCALER_CROP_REGION（activeArray 域；
+                                // crop[2]==0 = 不写）。ZOOM_RATIO 被声明但被 HAL 忽略时
+                                //（2026-09-29 真机症状）由 crop region 同义兜底，二者恒一致。
+    };
     bool setRepeatingAll(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s,
-                         const std::vector<std::pair<std::string, float>>& physZooms);
+                         const std::vector<PhysZoom>& phys);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
     std::function<void(const FrameResult&)> onFrameResult;
@@ -94,6 +100,7 @@ private:
 
     ACameraDevice* device_ = nullptr;
     ACameraCaptureSession* session_ = nullptr;
+    float lastAllZoom_ = 0.f;           // 上次 ALL 重发的逻辑 zoom（日志去抖）
     ACaptureSessionOutputContainer* container_ = nullptr;
     std::vector<ACaptureSessionOutput*> outputs_;
     std::map<std::string, BandReq> bands_;

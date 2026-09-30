@@ -18,7 +18,7 @@ struct CameraTraits {
     std::vector<std::string> physicalIds;   // 逻辑摄的物理成员（V5）
     std::string uwPhysicalId;               // 超广角物理摄像头 ID（physicalIds 中焦距最短者）
     std::string telePhysicalId;             // 长焦物理摄像头 ID（焦距最长者；成员<3 时为空）
-    float teleNativeZoom = 0.f;             // 长焦原生倍率 = f(tele)/f(main)（0=未知）
+    float teleNativeZoom = 0.f;             // 长焦原生倍率 = 等效焦距比 (f/w)_tele / (f/w)_main（0=未知；≠焦距比！）
     // 超广角原生倍率 = f(uw)/f(main)（本机 2.57/6.62 ≈ 0.388）。
     // 注意与导轨下限 0.7 区分：0.7 是 UI 量程，光学倍率才是 FOV 换算基准 —— 用 0.7
     // 当基准会让超广带显示 FOV 系统性偏宽，与主摄带在 1.0 处接不上（2026-09-30 真机

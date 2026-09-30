@@ -227,9 +227,18 @@ void CameraEngine::refreshPhysIds() {
     telePhysId_ = forcedTelePhys_.empty() ? cam_.traits().telePhysicalId : forcedTelePhys_;
     teleMinZoom_ = forcedPhysMin_ > 0.f
                        ? forcedPhysMin_
-                       : (cam_.traits().teleNativeZoom > 0.f ? cam_.traits().teleNativeZoom : 1e9f);
-    // 超广角光学倍率（本机 0.388）；探测失败回退 1.0（不裁切，FOV 可能接不上但不崩）
+                       : (forcedTeleNative_ > 0.f
+                              ? forcedTeleNative_
+                              : (cam_.traits().teleNativeZoom > 0.f ? cam_.traits().teleNativeZoom
+                                                                    : 1e9f));
+    // 超广角光学倍率（本机 0.774，= 等效焦距比而非焦距比）；探测失败回退 1.0
     uwNativeZoom_ = cam_.traits().uwNativeZoom > 0.f ? cam_.traits().uwNativeZoom : 1.0f;
+    // 长焦接管点：不能等到 HAL 自己的切换点（5.0）—— 逻辑流在 5.0 起就断流。
+    // 取"安全上限"与原生倍率的较小者：原生倍率低于安全上限时按原生接管（无死区）。
+    teleSwitch_ = std::min(teleMinZoom_, kLogicalSafeMax);
+    // 导轨下限收到光学极限：HAL 声称 0.70 但 uw 原生 0.774 时，最底下 0.074 段
+    // 画不出更广的画面（crop 不能 <1），继续拖会"没反应"。
+    if (ui_) ui_->setZoomRange(std::max(uwNativeZoom_, cam_.traits().zoomMin));
 }
 
 std::string CameraEngine::activePhysId() const {
@@ -240,13 +249,13 @@ std::string CameraEngine::activePhysId() const {
     // 带间滞回：当前在物理带内时，退出阈值低于进入阈值，防止导轨在边界微动
     // 触发会话重建风暴（真机实测：uw 边界 0.86↔1.00 摆动 3 次重建）。
     if (physBand_ == uwPhysId_ && uwAllowed_ && z < 1.03f) return uwPhysId_;
-    if (physBand_ == telePhysId_ && !telePhysId_.empty() && z >= teleMinZoom_ - 0.08f)
+    if (physBand_ == telePhysId_ && !telePhysId_.empty() && z >= teleSwitch_ - 0.08f)
         return telePhysId_;
     // 常规判定（进入新带）
     if (z < 1.0f - 1e-3f)
         return (uwAllowed_ && !uwPhysId_.empty()) ? uwPhysId_ : std::string();
-    // 高倍区走长焦直连（teleMinZoom_ 默认 = 长焦原生倍率，恰在 SAT 融合坏区之前切换）
-    if (z >= teleMinZoom_ && !telePhysId_.empty()) return telePhysId_;
+    // 高倍区走长焦直连（接管点 teleSwitch_ 落在逻辑流安全区内，先于断流点 5.0）
+    if (z >= teleSwitch_ && !telePhysId_.empty()) return telePhysId_;
     return "";
 }
 
@@ -434,10 +443,10 @@ bool CameraEngine::rebuildSession() {
 CaptureSettings CameraEngine::effSettings() const {
     if (!multiStream_) return settings_;
     CaptureSettings s = settings_;
-    // 钳制只为"逻辑流不进 SAT 融合坏区"（本机实测 ≥~4 断流）。上界必须 = 长焦切换点
-    // teleMinZoom_，否则逻辑流提前停变而长焦带还没接管 → 中间出现一段 FOV 死区
-    //（2026-09-30 真机症状「广角到长焦之间缺失一段」，钳 2.50 而切换点 2.63）。
-    const float zmax = teleMinZoom_ < 1e8f ? teleMinZoom_ : 2.5f;
+    // 钳制只为"逻辑流不进断流区"（本机实测 4.8 干净、5.0 起持续断流 —— 2026-09-30）。
+    // 上界必须 = 长焦接管点 teleSwitch_，否则逻辑流提前停变而长焦带还没接管 →
+    // 中间出现一段 FOV 死区（真机症状「广角到长焦之间缺失一段」）。
+    const float zmax = teleSwitch_ < 1e8f ? teleSwitch_ : 2.5f;
     s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
     return s;
 }
@@ -472,15 +481,16 @@ void CameraEngine::commitSession(bool settingsChanged) {
             session_->setRepeatingAll(bandTargets("ALL"), effSettings(), allPhysZooms());
         }
         // 显示源切换：纯 GL 层（不动请求），按滞回带判定（activePhysId 内含滞回状态机）。
-        // slot 变化才打日志（拖拽期间 commitSession 每 120ms 一次，防淹没 logcat）。
+        // slot 变化才写（拖拽期间 commitSession 每 120ms 一次；此前每轮无条件写会
+        // 把 controls.txt 的 disp 诊断键立即盖回，2026-09-30 标定时确诊）。
         physBand_ = phys;
         const int dispSlot = slotFromSig(phys.empty() ? std::string("L") : "P:" + phys);
-        if (ui_) {
-            if (dispSlot != lastDispSlot_)
-                LOGI("display slot -> %d (z=%.2f phys=%s)", dispSlot, settings_.zoomRatio,
-                     phys.c_str());
+        if (ui_ && dispSlot != lastDispSlot_) {
+            LOGI("display slot -> %d (z=%.2f phys=%s)", dispSlot, settings_.zoomRatio,
+                 phys.c_str());
             lastDispSlot_ = dispSlot;
             ui_->setPreviewSlot(dispSlot);
+            manualDisp_ = false;
         }
         return;
     }
@@ -571,14 +581,20 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             changed = true;
         }
     } else if (k == "disp") {
-        // 诊断：手动切显示源（0=逻辑 1=超广 2=长焦；纯 GL 层，不动请求）
-        if (ui_) ui_->setPreviewSlot(std::clamp(std::atoi(v.c_str()), 0, 2));
+        // 诊断：手动切显示源（0=逻辑 1=超广 2=长焦；纯 GL 层，不动请求）。
+        // manualDisp_ 期间自动判定不覆盖手动值，直到分带真的变化才交还自动。
+        if (ui_) {
+            ui_->setPreviewSlot(std::clamp(std::atoi(v.c_str()), 0, 2));
+            manualDisp_ = true;
+        }
     } else if (k == "zoom") {
         if (!t.hasZoomRatio) {
             LOGW("zoom not supported on %s", t.id.c_str());
             return;
         }
-        float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
+        // 下限 = 超广角光学倍率（HAL 声称的 zoomMin 可能比它能给的更广）
+        float zmin = uwAllowed_ ? std::max(t.zoomMin, uwNativeZoom_)
+                                : std::max(1.0f, t.zoomMin);
         float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin, t.zoomMax);
         if (z != settings_.zoomRatio) {
             settings_.zoomRatio = z;
@@ -603,6 +619,15 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         if (v != forcedTelePhys_) {
             forcedTelePhys_ = v;
             LOGI("tele physical override: '%s'", v.c_str());
+        }
+    } else if (k == "tele_native") {
+        // 诊断：强制长焦带基（az，即 crop 换算的分母）。本机等效焦距算得 5.02x，
+        // 但物理直连流可能被 HAL 额外裁切；像素标定在本场景不可靠（视差 + 近景），
+        // 用肉眼校准：切到长焦的瞬间画面不跳变，该值即真值（试 5.0 / 7.0 / 9.6）。
+        float f = std::atof(v.c_str());
+        if (f > 0.f && std::fabs(f - forcedTeleNative_) > 1e-3f) {
+            forcedTeleNative_ = f;
+            LOGI("tele native override: %.2fx", f);
         }
     } else if (k == "phys_min") {
         // 强制长焦直连起始倍率（诊断用；0 = 恢复自动值 teleNativeZoom）
@@ -691,7 +716,9 @@ void CameraEngine::drainUiCmds() {
                 break;
             case ui::Ui::Cmd::SET_ZOOM:
                 if (t.hasZoomRatio) {
-                    float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
+                    // 下限 = 超广角光学倍率（HAL 声称的 zoomMin 可能比它能给的更广）
+        float zmin = uwAllowed_ ? std::max(t.zoomMin, uwNativeZoom_)
+                                : std::max(1.0f, t.zoomMin);
                     settings_.zoomRatio = std::clamp(cmd.v, zmin, t.zoomMax);
                     changed = true;
                 }
