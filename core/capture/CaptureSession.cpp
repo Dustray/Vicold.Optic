@@ -18,6 +18,10 @@ FrameResult parseResult(const ACameraMetadata* result) {
         out.exposureNs = e.data.i64[0];
     if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_ZOOM_RATIO, &e) == ACAMERA_OK && e.count > 0)
         out.zoomRatio = e.data.f[0];
+    // 对焦距离（屈光度，0=无穷远）→ 近距判定（长焦最小对焦距离之内时推迟接管点）
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_LENS_FOCUS_DISTANCE, &e) == ACAMERA_OK &&
+        e.count > 0)
+        out.focusDistanceDiopters = e.data.f[0];
     if (ACameraMetadata_getConstEntry(result, ACAMERA_COLOR_CORRECTION_GAINS, &e) == ACAMERA_OK && e.count >= 4) {
         out.wbGains[0] = e.data.f[0];
         out.wbGains[1] = e.data.f[1];

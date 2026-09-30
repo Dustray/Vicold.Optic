@@ -119,6 +119,13 @@ private:
     // 否则逻辑流会被请求到断流区。
     static constexpr float kTeleSwitchUser = 5.0f;
     float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, kTeleSwitchUser)：实际接管点
+    // 近距推迟接管（对齐系统相机行为：对焦距离过近时长焦对不上焦，1–20x 恒主摄）：
+    // 依据逻辑流 result 的 LENS_FOCUS_DISTANCE 判定被摄距离，滞回 + 帧数去抖。
+    static constexpr float kNearEnterM = 0.9f;   // <0.9m 进入近距（接管点 → teleNearSwitch_）
+    static constexpr float kNearExitM = 1.4f;    // >1.4m 退出近距（恢复 5x 接管）
+    static constexpr int kNearDebounce = 12;     // ~0.4s @30fps
+    float teleNearSwitch_ = 20.f;                // controls.txt tele_near=N 可调（0=关）
+    float nearEnterM_ = kNearEnterM;             // controls.txt near_m=N 可调（0=关距离判定）
     float uwNativeZoom_ = 0.7f; // 超广角光学倍率 f(uw)/f(main)（真机 0.388；探测失败回退 0.7）
                                 // —— FOV 换算基准，与导轨下限 0.7 无关，混用会让超广/主摄衔接错位
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连
@@ -133,6 +140,15 @@ private:
     float relUw_ = 0.f, relTele_ = 0.f;
     int lastDispSlot_ = -1;     // 上次下发的 GL 显示 slot（变化才打日志）
     bool manualDisp_ = false;   // disp 诊断键手动锁定显示源（分带变化时才交还自动）
+    // 近距状态机（onFrameResult 回调线程更新；翻转时置 bandDirty_ 让引擎线程重发请求）
+    bool nearSubject_ = false;
+    int nearCnt_ = 0, farCnt_ = 0;
+    std::atomic<bool> bandDirty_{false};
+
+    // 当前生效的长焦接管点：近距时推迟（长焦模组最小对焦距离之外，与系统相机一致）
+    float teleSwitchEff() const {
+        return (nearSubject_ && teleNearSwitch_ > 1.f) ? teleNearSwitch_ : teleSwitch_;
+    }
 
     // 物理摄逐键变焦能力快照（probePhysCaps，rebuildSession 时刷新）：ALL 带内连续变焦
     // 依赖 per-physical ZOOM_RATIO 生效；部分 HAL 不支持/忽略该键（表现为镜头固定在

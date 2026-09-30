@@ -32,6 +32,7 @@ struct FrameResult {
     int32_t iso = 0;
     int64_t exposureNs = 0;
     float zoomRatio = 1.f;
+    float focusDistanceDiopters = 0.f;  // 屈光度（0=无穷远）；AF 连续时有效
     float wbGains[4] = {1, 1, 1, 1};   // [r, gEven, gOdd, b]（COLOR_CORRECTION_GAINS）
 };
 

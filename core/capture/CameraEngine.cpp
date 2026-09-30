@@ -128,6 +128,9 @@ void CameraEngine::run(std::string dataDir) {
             continue;
         }
 
+        // 近距状态翻转 → 分带可能变化（接管点 5x ↔ 20x），重发 repeating
+        if (bandDirty_.exchange(false, std::memory_order_acq_rel)) commitSession(true);
+
         // 50ms 拾取节拍：UI 命令（拖拽实时变焦）最坏延迟 = UI 节流 120ms + 本轮 50ms，
         // 平均 ~95ms；其余轮内工作（看门狗/墓地回收）都很轻，不影响功耗。
         std::this_thread::sleep_for(50ms);
@@ -252,13 +255,14 @@ std::string CameraEngine::activePhysId() const {
     // 带间滞回：当前在物理带内时，退出阈值低于进入阈值，防止导轨在边界微动
     // 触发会话重建风暴（真机实测：uw 边界 0.86↔1.00 摆动 3 次重建）。
     if (physBand_ == uwPhysId_ && uwAllowed_ && z < 1.03f) return uwPhysId_;
-    if (physBand_ == telePhysId_ && !telePhysId_.empty() && z >= teleSwitch_ - 0.08f)
+    if (physBand_ == telePhysId_ && !telePhysId_.empty() && z >= teleSwitchEff() - 0.08f)
         return telePhysId_;
     // 常规判定（进入新带）
     if (z < 1.0f - 1e-3f)
         return (uwAllowed_ && !uwPhysId_.empty()) ? uwPhysId_ : std::string();
-    // 高倍区走长焦直连（接管点 teleSwitch_ 落在逻辑流安全区内，先于断流点 5.0）
-    if (z >= teleSwitch_ && !telePhysId_.empty()) return telePhysId_;
+    // 高倍区走长焦直连（接管点落在逻辑流安全区内，先于断流点 5.0；
+    // 近距时推迟到 teleNearSwitch_ —— 长焦对不上焦，与系统相机行为一致）
+    if (z >= teleSwitchEff() && !telePhysId_.empty()) return telePhysId_;
     return "";
 }
 
@@ -451,6 +455,11 @@ CaptureSettings CameraEngine::effSettings() const {
     //（见 refreshPhysIds 注释），相机侧绝不越进断流区。
     const float zmax = teleSwitch_ < 1e8f ? std::min(teleSwitch_, kLogicalSafeMax) : 2.5f;
     s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
+    // pandora quirk（真机 2026-09-30 确诊）：逐摄变焦键被 CamX 忽略，且物理流会
+    // **继承逻辑 ZOOM_RATIO 的裁切**。长焦带若保持逻辑 4.85，长焦流实际 =
+    // 5.016 × 4.85 ≈ 24x（用户所见「我们的 5x = 系统 25x」）。长焦带逻辑流写 1.0，
+    // 让长焦物理流回到原生 FOV；主摄流此时不显示，跳到 1.0 无副作用。
+    if (activePhysId() == telePhysId_) s.zoomRatio = 1.0f;
     return s;
 }
 
@@ -639,6 +648,23 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             forcedPhysMin_ = f;
             LOGI("tele direct threshold override: %.2f", f);
         }
+    } else if (k == "tele_near") {
+        // 近距接管点（0 = 关闭近距推迟，恒按 5x 切长焦；诊断/校准用）
+        float f = std::atof(v.c_str());
+        if (f != teleNearSwitch_) {
+            teleNearSwitch_ = f;
+            bandDirty_.store(true, std::memory_order_release);
+            LOGI("tele near-distance switch: %.1fx", f);
+        }
+    } else if (k == "near_m") {
+        // 近距判定阈值（米，0 = 关闭距离判定；退出阈值 = 1.5 倍）
+        float f = std::atof(v.c_str());
+        if (f != nearEnterM_) {
+            nearEnterM_ = f;
+            nearCnt_ = farCnt_ = 0;
+            bandDirty_.store(true, std::memory_order_release);
+            LOGI("near-distance threshold: %.2fm", f);
+        }
     } else if (k == "raw_mode") {
         if (!raw_) {
             LOGW("raw unavailable on %s", t.id.c_str());
@@ -798,6 +824,31 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
     lastTs_ = r.timestampNs;
 
     if (raw_) raw_->onFrameResult(r);
+
+    // 近距判定（滞回 + 帧数去抖）：对焦距离过近时长焦模组对不上焦，
+    // 接管点推迟到 teleNearSwitch_（对齐系统相机：近距 1–20x 恒主摄）。
+    if (nearEnterM_ > 0.f && r.focusDistanceDiopters > 1e-3f) {
+        const float distM = 1.f / r.focusDistanceDiopters;
+        if (distM < nearEnterM_) {
+            farCnt_ = 0;
+            if (++nearCnt_ >= kNearDebounce && !nearSubject_) {
+                nearSubject_ = true;
+                bandDirty_.store(true, std::memory_order_release);
+                if (teleNearSwitch_ > 1.f)
+                    LOGI("subject near (%.2fm) -> tele switch deferred to %.0fx", distM,
+                         teleNearSwitch_);
+            }
+        } else if (distM > nearEnterM_ * 1.5f) {
+            nearCnt_ = 0;
+            if (++farCnt_ >= kNearDebounce && nearSubject_) {
+                nearSubject_ = false;
+                bandDirty_.store(true, std::memory_order_release);
+                LOGI("subject far (%.2fm) -> tele switch back at %.2fx", distM, teleSwitch_);
+            }
+        } else {
+            nearCnt_ = farCnt_ = 0;
+        }
+    }
 
     // 回传当前出图帧对应的"用户倍率"（UI 平滑变焦的锚点）：
     // result 里的 zoomRatio 在物理直连下是相对值，需按带基换算回用户域。
