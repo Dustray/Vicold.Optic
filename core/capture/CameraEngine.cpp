@@ -233,12 +233,15 @@ void CameraEngine::refreshPhysIds() {
                                                                     : 1e9f));
     // 超广角光学倍率（本机 0.774，= 等效焦距比而非焦距比）；探测失败回退 1.0
     uwNativeZoom_ = cam_.traits().uwNativeZoom > 0.f ? cam_.traits().uwNativeZoom : 1.0f;
-    // 长焦接管点：不能等到 HAL 自己的切换点（5.0）—— 逻辑流在 5.0 起就断流。
-    // 取"安全上限"与原生倍率的较小者：原生倍率低于安全上限时按原生接管（无死区）。
-    teleSwitch_ = std::min(teleMinZoom_, kLogicalSafeMax);
-    // 导轨下限收到光学极限：HAL 声称 0.70 但 uw 原生 0.774 时，最底下 0.074 段
-    // 画不出更广的画面（crop 不能 <1），继续拖会"没反应"。
-    if (ui_) ui_->setZoomRange(std::max(uwNativeZoom_, cam_.traits().zoomMin));
+    // 长焦接管点 = 用户口径 5.0x（与系统相机一致：≥5x 走长焦），但不晚于长焦
+    // 原生倍率（不可能有比原生更"广"的长焦画面）。
+    teleSwitch_ = std::min(teleMinZoom_, kTeleSwitchUser);
+    // 注意：接管点 5.0 与逻辑流安全上限 4.85 之间的 0.15 段不靠相机实现 ——
+    // effSettings 把下发的 ZOOM_RATIO 钳在 4.85，剩余倍率由 UI 的 GL crop 补足
+    //（crop = z/az ≤ 1.031），因此 FOV 仍连续到 5.0，没有死区。
+    // 导轨下限按 HAL 声称值（0.70）：与系统相机口径一致；代价是最底下
+    // 0.70–uwNative(0.774) 约 9% 的行程画不出更广（crop 不能 <1）。
+    if (ui_) ui_->setZoomRange(cam_.traits().zoomMin);
 }
 
 std::string CameraEngine::activePhysId() const {
@@ -444,9 +447,9 @@ CaptureSettings CameraEngine::effSettings() const {
     if (!multiStream_) return settings_;
     CaptureSettings s = settings_;
     // 钳制只为"逻辑流不进断流区"（本机实测 4.8 干净、5.0 起持续断流 —— 2026-09-30）。
-    // 上界必须 = 长焦接管点 teleSwitch_，否则逻辑流提前停变而长焦带还没接管 →
-    // 中间出现一段 FOV 死区（真机症状「广角到长焦之间缺失一段」）。
-    const float zmax = teleSwitch_ < 1e8f ? teleSwitch_ : 2.5f;
+    // 上界取安全上限而非接管点（5.0）：两者之间那 0.15 段由 UI 的 GL crop 补足
+    //（见 refreshPhysIds 注释），相机侧绝不越进断流区。
+    const float zmax = teleSwitch_ < 1e8f ? std::min(teleSwitch_, kLogicalSafeMax) : 2.5f;
     s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
     return s;
 }
@@ -592,10 +595,10 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGW("zoom not supported on %s", t.id.c_str());
             return;
         }
-        // 下限 = 超广角光学倍率（HAL 声称的 zoomMin 可能比它能给的更广）
-        float zmin = uwAllowed_ ? std::max(t.zoomMin, uwNativeZoom_)
-                                : std::max(1.0f, t.zoomMin);
-        float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin, t.zoomMax);
+        // 上界按 UI 导轨 120x（相机拿不到的高倍由 GL 裁切完成，下发时各自钳制）
+        float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
+        float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin,
+                             ui::Ui::zoomLimitMax());
         if (z != settings_.zoomRatio) {
             settings_.zoomRatio = z;
             if (ui_) ui_->setZoomExternal(z);   // UI crop 基准 / 导轨读数联动
@@ -716,10 +719,10 @@ void CameraEngine::drainUiCmds() {
                 break;
             case ui::Ui::Cmd::SET_ZOOM:
                 if (t.hasZoomRatio) {
-                    // 下限 = 超广角光学倍率（HAL 声称的 zoomMin 可能比它能给的更广）
-        float zmin = uwAllowed_ ? std::max(t.zoomMin, uwNativeZoom_)
-                                : std::max(1.0f, t.zoomMin);
-                    settings_.zoomRatio = std::clamp(cmd.v, zmin, t.zoomMax);
+                    // 下限按 HAL 声称值（用户口径 0.7x）；上限按 UI 导轨 120x —— 相机
+                    // 拿不到的高倍由 GL 数字裁切完成（下发时 effSettings/physZoom 各自钳制）。
+                    float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
+                    settings_.zoomRatio = std::clamp(cmd.v, zmin, ui::Ui::zoomLimitMax());
                     changed = true;
                 }
                 break;

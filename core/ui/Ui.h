@@ -73,6 +73,8 @@ public:
     // 导轨下限 = 超广角光学倍率（运行时探测）：低于它画不了更广，拖到底会有一段
     // 画面不动的死区（本机 uw 原生 0.774x > HAL 声称的 0.70x，2026-09-30）。
     void setZoomRange(float zmin) { zoomMin_ = std::max(zmin, 0.5f); }
+    // 导轨上限：引擎侧钳制 UI 下发的 zoom 时用（相机拿不到的高倍由 GL 裁切完成）
+    static constexpr float zoomLimitMax() { return kZoomMax; }
 
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
@@ -87,16 +89,23 @@ public:
 private:
     // 设计空间常量（camera-ui.html 移植）
     static constexpr float kStageW = 1560, kStageH = 720;
-    // 变焦范围 0.7–10：sub-1.0 走超广角物理直连（引擎侧 uwActive 判定，见 CameraEngine）。
-    // 0.7–1.0 区间预览为超广角原生 FOV（物理直连不写 ZOOM_RATIO，段内无数字变焦）。
-    static constexpr float kZoomMin = 0.7f, kZoomMax = 10.f, kZoomBaseMm = 23.f;
+    // 变焦范围 0.7–120（与系统相机口径对齐）：
+    //   [0.7, 1.0) 超广角 / [1.0, 5.0) 广角主摄 / [5.0, 120] 长焦。
+    // 高于相机能力的高倍段（本机长焦原生 ≈5x，HAL 逻辑流上限 5x）全部由 GL 数字裁切
+    // 完成 —— 相机只收到 ≤4.85 的请求，120x 对应约 24 倍裁切（画质软，但取景可用）。
+    static constexpr float kZoomMin = 0.7f, kZoomMax = 120.f, kZoomBaseMm = 23.f;
     float zoomMin_ = kZoomMin;   // 运行时实际下限（setZoomRange 覆盖，默认按 HAL 量程）
     static constexpr int kRingFrames = 4;
 
     void onDown(float dx, float dy);
     void onMove(float dx, float dy);
     void onUp(float dx, float dy);
-    float zoomFromY(float y) const;   // 导轨 y 位置 → 变焦值（含档位吸附）
+    float zoomFromF(float f) const;   // 轨道连续位置 → 变焦值（含关键焦段吸附）
+    float zoomFrac() const { return zoomToF(zoom_); }         // 当前变焦 → 轨道位置
+    float zoomToF(float z) const {                             // 对数刻度（按运行时量程）
+        return std::log(std::max(z, zoomMin_) / zoomMin_) /
+               std::log(kZoomMax / zoomMin_);
+    }
     void draw();
     void drawTracks();
     void drawPreviewOverlay();
@@ -104,6 +113,25 @@ private:
     void drawGrid(float x, float y, float w, float h);
     void drawVTicks(float tx, float ty, float tw, float th,
                     const std::vector<float>& fracs, const std::vector<char>& major);
+    // ---- 中心确认点刻度盘（替代滑块）----
+    // 轨道正中是固定的确认线，刻度整体随当前值滚动：中心对准的刻度即当前值。
+    // f ∈ [0,1] 是该轨道的连续位置（0=底/左，1=顶/右），curF 为当前值对应的位置。
+    struct RollItem {
+        float f;             // 该刻度的位置
+        bool major;          // 主刻度（长线 + 标签）
+        const char* label;   // 主刻度标签（nullptr = 不画）
+    };
+    void drawRollerV(float tx, float ty, float tw, float th, float curF,
+                     const RollItem* items, int n);
+    void drawRollerH(float tx, float ty, float tw, float th, float curF,
+                     const RollItem* items, int n);
+    // 拖拽基准：按下瞬间的指针位置与轨道位置。刻度盘用**相对位移**驱动（手指移动
+    // 多少像素，刻度滚多少像素），按下即取值会造成"手还没动值先跳"。
+    float dragRefPos_ = 0.f;
+    float dragRefF_ = 0.f;
+    // 离散档位轨（ISO/SS）的**连续**滚动位置：拖动中按像素连续滚（刻度有滚动感），
+    // 松手落位后渲染直接用 idx 派生值 —— 不加这两个成员，拖动时刻度只能整档跳变。
+    float isoRoll_ = 0.f, ssRoll_ = 0.f;
     // cover 缩放：长度只乘 scale_；位置再加居中偏移（cover 下 offX/offY 恒 ≤ 0）
     float dim(float designLen) const { return designLen * scale_; }
     float screenX(float designX) const { return designX * scale_ + offX_; }
@@ -123,7 +151,8 @@ private:
     static constexpr int kSsStopsN = 9;
     static const int kIsoStops[kIsoStopsN];
     static const int kSsStops[kSsStopsN];               // 分母（1/x s）
-    static constexpr float kZoomStops[6] = {0.7f, 1, 2, 3, 5, 10};
+    // 关键焦段（与系统相机一致）：0.7 超广 / 1 广角 / 2 / 5 长焦起点 / 10 / 50 / 100
+    static constexpr float kZoomStops[7] = {0.7f, 1, 2, 5, 10, 50, 100};
     int isoIdx_ = 2;
     int ssIdx_ = 3;
     float zoom_ = 1.0f;   // 与引擎初始状态一致（引擎 zoomRatio=0 未设置 ≈ 原生 1.0）

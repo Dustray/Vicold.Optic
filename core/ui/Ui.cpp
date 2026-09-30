@@ -64,11 +64,7 @@ using namespace layout;
 
 namespace {
 constexpr float kPadF = 20.f / 440.f;      // 滑轨上下内边距占比
-constexpr float kThumbF = 30.f / 440.f;    // 滑块高占比
 constexpr float kUsableF = 1 - kPadF * 2;
-
-// 轨道比例 → thumb 顶部（轨道内像素）
-float thumbTop(float f) { return (kPadF + (1 - f) * kUsableF - kThumbF / 2) * kTrackH; }
 } // namespace
 
 Ui::~Ui() = default;
@@ -178,17 +174,20 @@ void Ui::onDown(float x, float y) {
         shutterDown_ = true;
         return;
     }
+    // 刻度盘：只记基准，不在按下时改值（否则手还没动值先跳到指针位置）
     if (inR(x, y, kZoomTrackX, kZoomTrackY, kZoomTrackW, kZoomTrackH)) {
-        drag_ = Drag::ZOOM; onMove(x, y); return;
+        drag_ = Drag::ZOOM; dragRefPos_ = y; dragRefF_ = zoomFrac(); return;
     }
     if (inR(x, y, kIsoTrackX, kTrackY, kTrackW, kTrackH)) {
-        drag_ = Drag::ISO; onMove(x, y); return;
+        drag_ = Drag::ISO; dragRefPos_ = y;
+        dragRefF_ = float(isoIdx_) / (kIsoStopsN - 1); return;
     }
     if (inR(x, y, kSsTrackX, kTrackY, kTrackW, kTrackH)) {
-        drag_ = Drag::SS; onMove(x, y); return;
+        drag_ = Drag::SS; dragRefPos_ = y;
+        dragRefF_ = float(ssIdx_) / (kSsStopsN - 1); return;
     }
     if (inR(x, y, kEvTrackX - 6, kEvTrackY - 8, kEvTrackW + 12, kEvTrackH + 16)) {
-        drag_ = Drag::EV; onMove(x, y); return;
+        drag_ = Drag::EV; dragRefPos_ = x; dragRefF_ = (ev_ + 3.f) / 6.f; return;
     }
     if (inR(x, y, kZoomTrackX - 2, kToggleY, 52, kToggleH)) {
         zoomUnit_ ^= 1;   // mm / × 切换
@@ -196,63 +195,54 @@ void Ui::onDown(float x, float y) {
     }
 }
 
-// 导轨 y 位置 → 变焦值（对数刻度 + 档位吸附）。onMove/onUp 共用，
-// onUp 必须用松手位置重算：快速甩动时输入管线会丢弃末尾若干 MOVE，
-// 若只信最后一次 MOVE，终值会停在中途（实测 150ms 甩动停在 8.76 而非 10.0）。
-float Ui::zoomFromY(float y) const {
-    float f = 1 - (y - kZoomTrackY - kPadF * kZoomTrackH) /
-                      (kUsableF * kZoomTrackH);
+// 轨道连续位置 f ∈[0,1] → 变焦值（对数刻度 + 关键焦段吸附）。
+// 刻度盘用相对位移驱动，onMove/onUp 都从"按下基准"重算：快速甩动时输入管线
+// 会丢弃末尾若干 MOVE，只信最后一次 MOVE 会让终值停在中途。
+float Ui::zoomFromF(float f) const {
     f = std::clamp(f, 0.f, 1.f);
     float v = zoomMin_ * std::pow(kZoomMax / zoomMin_, f);
-    // 设计档位 / 整数档吸附（低于光学下限的档位不再吸附，否则拖到底落进死区）
+    // 关键焦段吸附。量程跨 0.7–120（对数跨度 5.15），绝对值阈值在低端太松、高端太紧，
+    // 故按对数距离吸附（±11% 相对量 ≈ 轨道高度 ±2%），各档手感一致。
+    // 低于光学下限的档位不吸附（否则拖到底落进画不出更广的死区）。
     for (float s : kZoomStops) {
         if (s < zoomMin_ - 1e-3f) continue;
-        if (std::fabs(v - s) < 0.13f) { v = s; break; }
+        if (std::fabs(std::log(v / s)) < 0.11f) { v = s; break; }
     }
-    for (int s = 1; s <= 10; ++s)
-        if (std::fabs(v - float(s)) < 0.13f) { v = float(s); break; }
     return std::clamp(v, zoomMin_, kZoomMax);
 }
 
 void Ui::onMove(float x, float y) {
     switch (drag_) {
         case Drag::ZOOM: {
-            zoom_ = zoomFromY(y);
+            // 搓刻度盘：刻度跟着手指走（手指向下 → 刻度向下滚 → 中心对准更大的值）
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kZoomTrackH);
+            zoom_ = zoomFromF(f);
             // ALL 常流：相机全向实时跟随（双向节流下发，带内重发 0 间隔）；
             // 跨带由引擎切显示 slot（纯 GL 层），无请求切换、无松手落位重建。
             pushZoomLive(zoom_);
             break;
         }
         case Drag::ISO: {
-            float f = std::clamp(1 - (y - kTrackY - kPadF * kTrackH) /
-                                         (kUsableF * kTrackH), 0.f, 1.f);
-            int idx = std::clamp(int(std::lround(f * (kIsoStopsN - 1))), 0, kIsoStopsN - 1);
-            if (idx != isoIdx_) {
-                isoIdx_ = idx;
-                // 命令延到 onUp 下发
-            }
-            break;
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kTrackH);
+            isoRoll_ = std::clamp(f, 0.f, 1.f);           // 连续滚动位置（渲染用）
+            isoIdx_ = std::clamp(int(std::lround(isoRoll_ * (kIsoStopsN - 1))), 0,
+                                 kIsoStopsN - 1);
+            break;   // 命令延到 onUp 下发
         }
         case Drag::SS: {
-            float f = std::clamp(1 - (y - kTrackY - kPadF * kTrackH) /
-                                         (kUsableF * kTrackH), 0.f, 1.f);
-            int idx = std::clamp(int(std::lround(f * (kSsStopsN - 1))), 0, kSsStopsN - 1);
-            if (idx != ssIdx_) {
-                ssIdx_ = idx;
-                // 命令延到 onUp 下发
-            }
-            break;
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kTrackH);
+            ssRoll_ = std::clamp(f, 0.f, 1.f);
+            ssIdx_ = std::clamp(int(std::lround(ssRoll_ * (kSsStopsN - 1))), 0,
+                                kSsStopsN - 1);
+            break;   // 命令延到 onUp 下发
         }
         case Drag::EV: {
-            float f = std::clamp((x - kEvTrackX) / kEvTrackW, 0.f, 1.f);
-            float v = f * 6 - 3;
+            float f = dragRefF_ - (x - dragRefPos_) / (0.92f * kEvTrackW);
+            float v = std::clamp(f, 0.f, 1.f) * 6 - 3;
             if (std::fabs(v) < 0.06f) v = 0;                 // 中心吸附
-            if (std::fabs(v - ev_) > 1e-4f) {
-                ev_ = v;
-                aeOn_ = true;
-                // 命令延到 onUp 下发
-            }
-            break;
+            ev_ = v;
+            aeOn_ = true;
+            break;   // 命令延到 onUp 下发
         }
         default: break;
     }
@@ -263,18 +253,37 @@ void Ui::onUp(float x, float y) {
     // （节流窗口内最后一次移动可能还没推给引擎）。
     switch (drag_) {
         case Drag::ZOOM: {
-            // 用松手位置重算终值（不依赖最后一次 MOVE，见 zoomFromY 注释），
-            // 推真实值精确落位（拖拽中已实时下发，此处只补节流窗口内的末段差值）
-            float v = zoomFromY(y);
-            if (std::fabs(v - zoom_) > 1e-4f) zoom_ = v;
+            // 用松手坐标从基准重算终值（末尾 MOVE 可能被输入管线丢弃），
+            // 补推真实值精确落位（拖拽中已实时下发，此处只补节流窗口内的末段差值）
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kZoomTrackH);
+            zoom_ = zoomFromF(f);
             pushCmd(Cmd::SET_ZOOM, zoom_);
             lastZoomPush_ = nowSec();
             lastCamPush_ = zoom_;
             break;
         }
-        case Drag::ISO:  pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_])); break;
-        case Drag::SS:   pushCmd(Cmd::SET_EXP_US, 1e6f / float(kSsStops[ssIdx_])); break;   // µs
-        case Drag::EV:   pushCmd(Cmd::SET_EV, ev_); pushCmd(Cmd::SET_AE, aeOn_ ? 1.f : 0.f); break;
+        case Drag::ISO: {
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kTrackH);
+            isoIdx_ = std::clamp(int(std::lround(std::clamp(f, 0.f, 1.f) *
+                                                 (kIsoStopsN - 1))), 0, kIsoStopsN - 1);
+            pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_]));
+            break;
+        }
+        case Drag::SS: {
+            float f = dragRefF_ + (y - dragRefPos_) / (kUsableF * kTrackH);
+            ssIdx_ = std::clamp(int(std::lround(std::clamp(f, 0.f, 1.f) *
+                                                (kSsStopsN - 1))), 0, kSsStopsN - 1);
+            pushCmd(Cmd::SET_EXP_US, 1e6f / float(kSsStops[ssIdx_]));   // µs
+            break;
+        }
+        case Drag::EV: {
+            float f = dragRefF_ - (x - dragRefPos_) / (0.92f * kEvTrackW);
+            ev_ = std::clamp(f, 0.f, 1.f) * 6 - 3;
+            if (std::fabs(ev_) < 0.06f) ev_ = 0;
+            pushCmd(Cmd::SET_EV, ev_);
+            pushCmd(Cmd::SET_AE, aeOn_ ? 1.f : 0.f);
+            break;
+        }
         default: break;
     }
     if (shutterDown_) {
@@ -314,6 +323,80 @@ void Ui::drawVTicks(float tx, float ty, float tw, float th,
     }
     if (!vMin.empty()) gl_.triangles(vMin.data(), int(vMin.size() / 2), kTickMinor);
     if (!vMaj.empty()) gl_.triangles(vMaj.data(), int(vMaj.size() / 2), kTickMajor);
+}
+
+// ---- 中心确认点刻度盘 ----
+// 轨道正中是固定的确认线，刻度整体随当前值滚动：中心对准的刻度即当前值。
+// 越靠近中心越亮（GL 批只有单色，故按 近/远 × 主/次 分四批），出轨道的刻度裁掉。
+void Ui::drawRollerV(float tx, float ty, float tw, float th, float curF,
+                     const RollItem* items, int n) {
+    const float travel = kUsableF * th;      // f 走满 1.0 对应的滚动行程
+    const float yMid = ty + th * 0.5f;
+    const float sx = tw / 48.f;              // 设计宽 48 → 屏幕比例
+    std::vector<float> b[4];
+    struct Lbl { const char* t; float x, y, fs; Rgba c; };
+    std::vector<Lbl> lbl;
+    for (int i = 0; i < n; ++i) {
+        const RollItem& it = items[i];
+        const float cy = yMid - (it.f - curF) * travel;
+        if (cy < ty + 5.f * scale_ || cy > ty + th - 5.f * scale_) continue;
+        const float d = std::fabs(cy - yMid) / (th * 0.5f);
+        const float x0 = tx + 4.f * sx;
+        const float w = (it.major ? 13.f : 7.f) * sx;
+        const float h = std::max(dim(it.major ? 2.f : 1.5f), 1.f);
+        const float x1 = x0 + w, y1 = cy + h;
+        const float q[12] = {x0, cy, x1, cy, x0, y1, x0, y1, x1, cy, x1, y1};
+        auto& v = b[(d < 0.38f ? 0 : 2) + (it.major ? 0 : 1)];
+        v.insert(v.end(), std::begin(q), std::end(q));
+        if (it.major && it.label && d < 0.72f)
+            lbl.push_back({it.label, tx + 19.f * sx, cy - 4.5f * scale_, 9.f * scale_,
+                           d < 0.38f ? kT1 : kT3});
+    }
+    static const Rgba cols[4] = {{1, 1, 1, 0.85f}, {1, 1, 1, 0.45f},
+                                 {1, 1, 1, 0.30f}, {1, 1, 1, 0.14f}};
+    for (int i = 0; i < 4; ++i)
+        if (!b[i].empty()) gl_.triangles(b[i].data(), int(b[i].size() / 2), cols[i]);
+    for (const auto& l : lbl) gl_.text(l.t, l.x, l.y, l.fs, l.c);
+    // 中心确认区（替代原滑块）：选择带 + 确认线
+    gl_.roundedRect(tx + dim(2), yMid - dim(15), tw - dim(4), dim(30), dim(8),
+                    {1, 1, 1, 0.07f}, kNone, 0);
+    gl_.roundedRect(tx + dim(4), yMid - dim(1), tw - dim(8), dim(2), 0, kAccent, kNone, 0);
+}
+
+void Ui::drawRollerH(float tx, float ty, float tw, float th, float curF,
+                     const RollItem* items, int n) {
+    const float travel = 0.92f * tw;
+    const float xMid = tx + tw * 0.5f;
+    std::vector<float> b[4];
+    struct Lbl { const char* t; float x, y, fs; Rgba c; };
+    std::vector<Lbl> lbl;
+    for (int i = 0; i < n; ++i) {
+        const RollItem& it = items[i];
+        const float cx = xMid + (it.f - curF) * travel;
+        if (cx < tx + 4.f * scale_ || cx > tx + tw - 4.f * scale_) continue;
+        const float d = std::fabs(cx - xMid) / (tw * 0.5f);
+        const float w = std::max(dim(it.major ? 1.6f : 1.f), 1.f);
+        const float y0 = ty + 1.f * scale_;
+        const float h = dim(it.major ? 12.f : 7.f);
+        const float x1 = cx + w, y1 = y0 + h;
+        const float q[12] = {cx, y0, x1, y0, cx, y1, cx, y1, x1, y0, x1, y1};
+        auto& v = b[(d < 0.38f ? 0 : 2) + (it.major ? 0 : 1)];
+        v.insert(v.end(), std::begin(q), std::end(q));
+        if (it.major && it.label && d < 0.8f) {
+            const float fs = 9.f * scale_;
+            const float lw = gl_.textWidth(it.label, fs);
+            lbl.push_back({it.label, cx - lw / 2, ty + dim(13), fs,
+                           d < 0.38f ? kT1 : kT3});
+        }
+    }
+    static const Rgba cols[4] = {{1, 1, 1, 0.85f}, {1, 1, 1, 0.45f},
+                                 {1, 1, 1, 0.30f}, {1, 1, 1, 0.14f}};
+    for (int i = 0; i < 4; ++i)
+        if (!b[i].empty()) gl_.triangles(b[i].data(), int(b[i].size() / 2), cols[i]);
+    for (const auto& l : lbl) gl_.text(l.t, l.x, l.y, l.fs, l.c);
+    gl_.roundedRect(xMid - dim(15), ty - dim(6), dim(30), th + dim(12), dim(8),
+                    {1, 1, 1, 0.07f}, kNone, 0);
+    gl_.roundedRect(xMid - dim(1), ty - dim(4), dim(2), th + dim(8), 0, kAccent, kNone, 0);
 }
 
 void Ui::drawGrid(float x, float y, float w, float h) {
@@ -363,17 +446,18 @@ void Ui::drawHistogram(float x, float y, float w, float h) {
 
 // 右侧 ISO / 曝光时间 双滑轨
 void Ui::drawTracks() {
-    struct VSlider { float tx; const char* label; const char* thumb; const char* value; int idx; int n; };
-    const float fracs[2] = {float(isoIdx_) / (kIsoStopsN - 1), float(ssIdx_) / (kSsStopsN - 1)};
-    char isoBuf[16], ssBuf[16], isoVal[16], ssVal[16];
-    snprintf(isoBuf, sizeof(isoBuf), "%d", kIsoStops[isoIdx_]);
-    snprintf(ssBuf, sizeof(ssBuf), "1/%d", kSsStops[ssIdx_]);
+    struct VSlider {
+        float tx; const char* label; const char* value;
+        int idx, n; bool slash; const int* stops;
+    };
+    char isoVal[16], ssVal[16];
     snprintf(isoVal, sizeof(isoVal), "ISO %d", kIsoStops[isoIdx_]);
     snprintf(ssVal, sizeof(ssVal), "1/%d s", kSsStops[ssIdx_]);
 
     const VSlider sliders[2] = {
-        {kIsoTrackX, "ISO", isoBuf, isoVal, isoIdx_, kIsoStopsN},
-        {kSsTrackX, "\xe6\x9b\x9d\xe5\x85\x89\xe6\x97\xb6\xe9\x97\xb4", ssBuf, ssVal, ssIdx_, kSsStopsN},
+        {kIsoTrackX, "ISO", isoVal, isoIdx_, kIsoStopsN, false, kIsoStops},
+        {kSsTrackX, "\xe6\x9b\x9d\xe5\x85\x89\xe6\x97\xb6\xe9\x97\xb4", ssVal, ssIdx_,
+         kSsStopsN, true, kSsStops},
     };
 
     for (int s = 0; s < 2; ++s) {
@@ -383,31 +467,32 @@ void Ui::drawTracks() {
         float lw = gl_.textWidth(v.label, 12 * scale_);
         gl_.text(v.label, screenX(cx) - lw / 2, screenY(kLabelY), 12 * scale_, kT2);
 
-        // 轨道 + 中线 + 刻度
+        // 轨道 + 中心确认刻度盘（档位刻度 + 档间 4 条短刻度，拖动连续滚动）
         gl_.roundedRect(screenX(v.tx), screenY(kTrackY), dim(kTrackW), dim(kTrackH),
                         dim(20), kTrack, kTrackLine, 1);
-        gl_.roundedRect(screenX(v.tx + 23), screenY(kTrackY + 20), dim(2),
-                        dim(kTrackH - 40), 0, kTrackLine, kNone, 0);
-        std::vector<float> fs;
-        std::vector<char> mj;
+        // 渲染位置：拖动中用连续 roll（刻度逐像素滚动），静止时落位到档位
+        const float curF =
+            (s == 0 ? (drag_ == Drag::ISO ? isoRoll_ : float(isoIdx_) / (kIsoStopsN - 1))
+                    : (drag_ == Drag::SS ? ssRoll_ : float(ssIdx_) / (kSsStopsN - 1)));
+        RollItem items[48];
+        char labels[16][16];
+        float fr[16];
         for (int i = 0; i < v.n; ++i) {
-            float f = float(i) / (v.n - 1);
-            fs.push_back(f);
-            mj.push_back(1);
-            if (i < v.n - 1) {                      // 档位之间加短刻度
-                fs.push_back(f + 0.5f / (v.n - 1));
-                mj.push_back(0);
-            }
+            fr[i] = float(i) / (v.n - 1);
+            if (v.slash) snprintf(labels[i], sizeof(labels[i]), "1/%d", v.stops[i]);
+            else snprintf(labels[i], sizeof(labels[i]), "%d", v.stops[i]);
         }
-        drawVTicks(screenX(v.tx), screenY(kTrackY), dim(kTrackW), dim(kTrackH), fs, mj);
-
-        // thumb
-        float ty = thumbTop(fracs[s]);
-        gl_.roundedRect(screenX(v.tx + 2), screenY(kTrackY + ty), dim(44), dim(30),
-                        dim(15), kAccent, kNone, 0);
-        float tw2 = gl_.textWidth(v.thumb, 11 * scale_);
-        gl_.text(v.thumb, screenX(v.tx + 24) - tw2 / 2, screenY(kTrackY + ty + 9),
-                 11 * scale_, kInk);
+        int n = 0;
+        for (int i = 0; i < v.n && n < 48; ++i) {
+            if (i > 0) {                                  // 档间短刻度
+                for (int k = 1; k <= 4 && n < 48; ++k)
+                    items[n++] = {fr[i - 1] + (fr[i] - fr[i - 1]) * float(k) / 5.f,
+                                  false, nullptr};
+            }
+            items[n++] = {fr[i], true, labels[i]};
+        }
+        drawRollerV(screenX(v.tx), screenY(kTrackY), dim(kTrackW), dim(kTrackH),
+                    curF, items, n);
 
         // 数值（轨道下方居中）
         float vw = gl_.textWidth(v.value, 12 * scale_);
@@ -498,30 +583,17 @@ void Ui::drawPreviewOverlay() {
         gl_.text(v, screenX(kEvPanelX + kEvPanelW - 12) - w, screenY(kEvPanelY + 12),
                  12 * scale_, kAccent);
     }
-    // EV 轨：中线 + 13 档刻度 + thumb
-    gl_.roundedRect(screenX(kEvTrackX), screenY(kEvTrackY + 9), dim(kEvTrackW), dim(2), 0,
-                    kTrackLine, kNone, 0);
+    // EV 轨：水平中心确认刻度盘（-3 … +3，步长 0.5）
     {
-        std::vector<float> maj, min;
-        float t = std::max(dim(1), 1.f);
+        RollItem items[13];
+        char labels[13][8];
         for (int i = 0; i <= 12; ++i) {
-            bool m = i % 2 == 0;
-            float tx = screenX(kEvTrackX + kEvTrackW * i / 12) - t / 2;
-            float ty = screenY(kEvTrackY + (m ? 3 : 6));
-            float th = dim(m ? 14 : 8);
-            float q[12] = {tx, ty, tx + t, ty, tx, ty + th,
-                           tx, ty + th, tx + t, ty, tx + t, ty + th};
-            auto& v = m ? maj : min;
-            v.insert(v.end(), std::begin(q), std::end(q));
+            const bool m = (i % 2 == 0);
+            snprintf(labels[i], sizeof(labels[i]), "%+d", i / 2 - 3);
+            items[i] = {float(i) / 12.f, m, m ? labels[i] : nullptr};
         }
-        if (!min.empty()) gl_.triangles(min.data(), int(min.size() / 2), {1, 1, 1, 0.35f});
-        if (!maj.empty()) gl_.triangles(maj.data(), int(maj.size() / 2), {1, 1, 1, 0.55f});
-    }
-    {
-        float f = (ev_ + 3) / 6;
-        float tx = screenX(kEvTrackX + kEvTrackW * f);
-        gl_.roundedRect(tx - dim(9), screenY(kEvTrackY), dim(18), dim(20), dim(9),
-                        kAccent, {0, 0, 0, 0.55f}, dim(1.5f));
+        drawRollerH(screenX(kEvTrackX), screenY(kEvTrackY), dim(kEvTrackW), dim(kEvTrackH),
+                    (ev_ + 3.f) / 6.f, items, 13);
     }
 }
 
@@ -577,7 +649,8 @@ void Ui::frame() {
     {
         const float az = appliedZoom_.load(std::memory_order_acquire);
         float target = 1.f;
-        if (az > 0.01f) target = std::clamp(zoom_ / az, 1.f, 16.f);
+        // 上界 32 覆盖导轨 120x：长焦原生 ≈5x，120/5.016 ≈ 24 倍数字裁切。
+        if (az > 0.01f) target = std::clamp(zoom_ / az, 1.f, 32.f);
         const double t = nowSec();
         const float dt = lastCropT_ > 0 ? float(t - lastCropT_) : 0.016f;
         lastCropT_ = t;
@@ -626,35 +699,27 @@ void Ui::frame() {
     gl_.roundedRect(screenX(kZoomTrackX + 23), screenY(kZoomTrackY + 20), dim(2),
                     dim(kZoomTrackH - 40), 0, kTrackLine, kNone, 0);
     {
-        float logMax = std::log(kZoomMax / zoomMin_);
-        std::vector<float> fs;
-        std::vector<char> mj;
-        // 光学下限本身作为一个主刻度（比 HAL 声称的下限更靠上时才替换掉 0.7 档）
-        fs.push_back(0.f);
-        mj.push_back(1);
-        for (float s : kZoomStops) {
-            if (s < zoomMin_ - 1e-3f) continue;
-            fs.push_back(std::log(s / zoomMin_) / logMax);
-            mj.push_back(1);
+        // 中心确认刻度盘：关键焦段为主刻度（带标签），段间按对数等分插短刻度
+        RollItem items[48];
+        char labels[16][8];
+        int n = 0;
+        float prev = -1.f;
+        for (size_t i = 0; i < sizeof(kZoomStops) / sizeof(kZoomStops[0]); ++i) {
+            const float s = kZoomStops[i];
+            if (s < zoomMin_ - 1e-3f) continue;          // 低于光学下限的档位不画
+            const float f = zoomToF(s);
+            if (prev >= 0.f) {                           // 段间短刻度（对数等分 3 份）
+                for (int k = 1; k <= 3 && n < 48; ++k)
+                    items[n++] = {prev + (f - prev) * float(k) / 4.f, false, nullptr};
+            }
+            if (n >= 48) break;
+            snprintf(labels[i], sizeof(labels[i]),
+                     s < 1.f ? "%.1f" : "%.0f", s);
+            items[n++] = {f, true, labels[i]};
+            prev = f;
         }
-        for (int k = 1; k < 14; ++k) {
-            fs.push_back(float(k) / 14);
-            mj.push_back(0);
-        }
-        drawVTicks(screenX(kZoomTrackX), screenY(kZoomTrackY), dim(kZoomTrackW),
-                   dim(kZoomTrackH), fs, mj);
-    }
-    {
-        float logf = std::log(zoom_ / zoomMin_) / std::log(kZoomMax / zoomMin_);
-        float zt = thumbTop(logf);
-        gl_.roundedRect(screenX(kZoomTrackX + 2), screenY(kZoomTrackY + zt), dim(44),
-                        dim(30), dim(15), kAccent, kNone, 0);
-        char buf[12];
-        if (zoomUnit_ == 0) snprintf(buf, sizeof(buf), "%d", int(std::lround(kZoomBaseMm * zoom_)));
-        else snprintf(buf, sizeof(buf), "%.1f", zoom_);
-        float w = gl_.textWidth(buf, 11 * scale_);
-        gl_.text(buf, screenX(kZoomTrackX + 24) - w / 2, screenY(kZoomTrackY + zt + 9),
-                 11 * scale_, kInk);
+        drawRollerV(screenX(kZoomTrackX), screenY(kZoomTrackY), dim(kZoomTrackW),
+                    dim(kZoomTrackH), zoomFrac(), items, n);
     }
 
     // 单位切换（mm / ×）

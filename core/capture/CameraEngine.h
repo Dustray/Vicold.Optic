@@ -115,7 +115,10 @@ private:
     // 2026-09-30）。接管点必须在安全区内，否则用户拖到 5x 时逻辑流已在断流：
     // 画面先冻结、再随长焦接管瞬间跳变（用户所见「5x 瞬间放大好多」）。
     static constexpr float kLogicalSafeMax = 4.85f;
-    float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, kLogicalSafeMax)：实际接管点
+    // 用户口径的长焦起点（与系统相机一致：≥5x 用长焦）；必须 ≥ 逻辑流安全上限，
+    // 否则逻辑流会被请求到断流区。
+    static constexpr float kTeleSwitchUser = 5.0f;
+    float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, kTeleSwitchUser)：实际接管点
     float uwNativeZoom_ = 0.7f; // 超广角光学倍率 f(uw)/f(main)（真机 0.388；探测失败回退 0.7）
                                 // —— FOV 换算基准，与导轨下限 0.7 无关，混用会让超广/主摄衔接错位
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连
