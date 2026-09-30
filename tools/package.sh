@@ -15,9 +15,13 @@ rm -f "$OUT/base.apk" "$OUT/aligned.apk"
 SO="$(ls "$ROOT"/build/android-arm64/liboptic.so 2>/dev/null || true)"
 [ -n "$SO" ] || { echo "liboptic.so not built yet"; exit 1; }
 
+echo ">> aapt2 compile"
+"$BUILD_TOOLS/aapt2" compile --dir "$ROOT/app/src/main/res" -o "$OUT/res.zip"
+
 echo ">> aapt2 link"
 "$BUILD_TOOLS/aapt2" link -o "$OUT/base.apk" \
     -I "$PLATFORM_JAR" \
+    "$OUT/res.zip" \
     --manifest "$ROOT/app/src/main/AndroidManifest.xml" \
     --min-sdk-version 31 --target-sdk-version 34 \
     --version-code 1 --version-name 0.1.0

@@ -20,6 +20,7 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -57,20 +58,29 @@ public:
     int32_t previewW(int slot) const;
     int32_t previewH(int slot) const;
     // 每帧调用：acquireLatestImage → 导入/绑定纹理；有新帧返回 true。
-    // 同时填充 64-bin RGB 直方图（PRIV 流暂空，见 M7.1）。
-    bool acquirePreview(int slot, int32_t histR[64], int32_t histG[64], int32_t histB[64]);
+    // wantHist = 对该 slot 统计直方图（GL 降采样 + readPixels，内部 ~120ms 节流）。
+    // 只对当前显示源开启：readPixels 会同步 stall 管线，三路全开必掉帧。
+    bool acquirePreview(int slot, bool wantHist);
+    // 取该 slot 最近一次直方图统计的快照（64-bin × R,G,B；从未统计过时全 0）
+    void copyHistogram(int slot, int32_t outR[64], int32_t outG[64], int32_t outB[64]) const;
 
     // 文字图集（attach 后调用一次；bakedPx 为烘焙像素高）
     bool bakeFont(float bakedPx);
     float textWidth(const std::string& utf8, float px) const;
     // y 为「行顶」（ascent 线），不是基线：字形落在 y 下方，与 CSS line box 对齐
     void text(const std::string& utf8, float x, float yTop, float px, const Rgba& c);
+    // 返回让字符串**实际墨迹**（字形位图 bbox）垂直居中于 cy 的行顶 yTop：
+    // 按钮圆心等场景里按字号比例估中心会偏（ascent 含上伸部空隙），此函数遍历
+    // 字形取 min(bearingY)/max(bearingY+h) 精确居中。
+    float textCenterTop(const std::string& utf8, float px, float cy) const;
 
     void beginFrame(const Rgba& c);   // viewport + 清屏
     void clear(const Rgba& c);
-    // alpha < 1 用于跨带显示切换的交叉淡化（新源为底、旧源叠画淡出）
+    // alpha < 1 用于跨带显示切换的交叉淡化（新源为底、旧源叠画淡出）。
+    // zoom < 0 = 沿用全局 previewZoom_；淡化旧层必须传自己的 crop（zoom_/az_旧带），
+    // 否则旧纹理会被新带的 crop 放大到错误倍率（跨带大闪烁元凶之二）。
     void drawPreview(int32_t x, int32_t y, int32_t w, int32_t h, int uvRot, int srcSlot = 0,
-                     float alpha = 1.f);
+                     float alpha = 1.f, float zoom = -1.f);
     // 圆角矩形：填充 + 描边（borderA.a<=0 跳过描边）
     void roundedRect(float cx, float cy, float w, float h, float radius,
                      const Rgba& fill, const Rgba& border, float borderW);
@@ -79,6 +89,10 @@ public:
     // 预览数字变焦（≥1）：与 cover 裁切同域相乘，中心放大取样。拖拽平滑变焦用 ——
     // 相机侧追赶期间由 GL 补齐 FOV 差值，收敛后恒回 1（无跳变）。
     void setPreviewZoom(float z) { previewZoom_ = z > 1.f ? z : 1.f; }
+    // az 时间戳对齐回调（引擎注入）：每消费一帧新预览图像，按该帧 SENSOR_TIMESTAMP
+    // 查询当时的 appliedZoom 并写回 UI —— crop 与显示帧严格同源，消除快拖泵动。
+    // 返回值 ≤0 表示无可用结果，调用方保持旧 az。
+    void setAzSource(std::function<float(int slot, int64_t tsNs)> f) { azSrc_ = std::move(f); }
     void swap();
 
 private:
@@ -100,6 +114,10 @@ private:
         AImageReader_ImageListener listener = {};
         std::mutex pendM;
         AImage* pending = nullptr;
+        // 直方图缓存：GL 降采样统计（kHistW×kHistH FBO readPixels → 64-bin RGB）
+        int32_t hist[3][64] = {};
+        bool histValid = false;
+        double lastHistT = 0;            // 上次统计时刻（steady_clock 秒，节流用）
     };
     Source src_[kSrcN];
 
@@ -128,9 +146,17 @@ private:
     Impl impl_;
     static void onPreviewAvailable(void* ctx, AImageReader* reader);
     void importPreviewImage(Source& s, AImage* img);
+    // 直方图降采样管线：预览纹理 → 小 FBO（LINEAR）→ readPixels → 64-bin RGB。
+    // RGBA_8888 流无法 AImage_getPlaneData（仅支持 YUV_420_888），CPU 直读死路。
+    static constexpr int kHistW = 128, kHistH = 96;
+    bool ensureHistRt();
+    void sampleHistogram(Source& s);
+    GLuint histFbo_ = 0, histTex_ = 0, progHist_ = 0;
+    GLint aHist_ = -1, uHistTex_ = -1;
     ANativeWindow* win_ = nullptr;
     int32_t winW_ = 0, winH_ = 0;
     float previewZoom_ = 1.f;            // 预览数字变焦（setPreviewZoom；默认 1 = 不裁切）
+    std::function<float(int, int64_t)> azSrc_;
 };
 
 } // namespace optic::ui

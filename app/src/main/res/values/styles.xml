@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- windowLayoutInDisplayCutoutMode 只能写在主题里：作为 activity 的 manifest 属性不合法
+     （aapt2 不校验但 PackageManager 忽略），此前一直因此未生效，窗口被 MIUI 从挖孔侧
+     裁掉 150px。always = 窗口延伸进挖孔保留区（挖孔真身 74px 物理黑块除外）。 -->
+<resources>
+    <style name="OpticTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+    </style>
+</resources>

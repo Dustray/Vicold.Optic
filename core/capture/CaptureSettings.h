@@ -11,6 +11,7 @@ namespace optic::capture {
 struct CaptureSettings {
     // AE
     bool aeOn = true;
+    bool aeLock = false;          // 测光锁定（AE_LOCK，aeOn=true 时语义完整）
     int32_t iso = 0;              // aeOn=false 时生效
     int64_t exposureNs = 0;       // aeOn=false 时生效
     int32_t evSteps = 0;          // AE 曝光补偿步数（aeOn=true 时生效，范围来自 characteristics）
@@ -28,7 +29,8 @@ struct CaptureSettings {
 
 // 两个设置是否要求重发 repeating（粗粒度：任一字段变化即重发）
 inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
-    return a.aeOn != b.aeOn || a.iso != b.iso || a.exposureNs != b.exposureNs ||
+    return a.aeOn != b.aeOn || a.aeLock != b.aeLock || a.iso != b.iso ||
+           a.exposureNs != b.exposureNs ||
            a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
            a.awbOn != b.awbOn || a.zoomRatio != b.zoomRatio;
 }

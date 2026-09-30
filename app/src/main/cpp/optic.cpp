@@ -93,6 +93,32 @@ void hideSystemBars(android_app* app) {
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
+    // 全出血双保险：主题里已声明 always，但部分 ROM（MIUI）解析主题时机不透明，
+    // 再在运行时直接改 WindowManager.LayoutParams.layoutInDisplayCutoutMode = 3(ALWAYS)。
+    {
+        jmethodID getAttrs =
+            lookupMethod(env, winCls, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;", false);
+        if (getAttrs) {
+            jobject lp = env->CallObjectMethod(window, getAttrs);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (lp) {
+                jclass lpCls = env->GetObjectClass(lp);
+                if (jfieldID fid = env->GetFieldID(lpCls, "layoutInDisplayCutoutMode", "I")) {
+                    env->SetIntField(lp, fid, 3);   // LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    if (jmethodID setAttrs = lookupMethod(env, winCls, "setAttributes",
+                                                          "(Landroid/view/WindowManager$LayoutParams;)V", false)) {
+                        env->CallVoidMethod(window, setAttrs, lp);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                    }
+                } else {
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                }
+                env->DeleteLocalRef(lpCls);
+                env->DeleteLocalRef(lp);
+            }
+        }
+    }
+
     jmethodID getCtrl =
         lookupMethod(env, winCls, "getInsetsController",
                      "()Landroid/view/WindowInsetsController;", false);
@@ -108,6 +134,10 @@ void hideSystemBars(android_app* app) {
         if (jmethodID m = lookupMethod(env, typeCls, "statusBars", "()I", true))
             types |= env->CallStaticIntMethod(typeCls, m);
         if (jmethodID m = lookupMethod(env, typeCls, "navigationBars", "()I", true))
+            types |= env->CallStaticIntMethod(typeCls, m);
+        // displayCutout：MIUI 横屏下为挖孔保留整条 150px（真机实测挖孔真身仅 74px 宽），
+        // 不隐藏它窗口永远从 x=150 起，设计空间的左导轨无法左移
+        if (jmethodID m = lookupMethod(env, typeCls, "displayCutout", "()I", true))
             types |= env->CallStaticIntMethod(typeCls, m);
         if (env->ExceptionCheck()) env->ExceptionClear();
 
@@ -229,6 +259,20 @@ void handleCommand(android_app* app, int32_t cmd) {
                 engine->start(app->activity->externalDataPath);
             }
             break;
+        case APP_CMD_WINDOW_RESIZED: {
+            // 全出血生效（displayCutout inset 隐藏后 MIUI 放开 150px 保留条）等场景：
+            // 尺寸变了才重建 —— attach 会销毁旧预览 reader，引擎必须重启会话重挂新窗口
+            const int w = ANativeWindow_getWidth(app->window);
+            const int h = ANativeWindow_getHeight(app->window);
+            LOGI("APP_CMD_WINDOW_RESIZED %dx%d (ui=%dx%d)", w, h,
+                 ui ? ui->winW() : -1, ui ? ui->winH() : -1);
+            if (ui && ui->attached() && (w != ui->winW() || h != ui->winH())) {
+                engine->stop();
+                if (ui->attach(app->window))
+                    engine->start(app->activity->externalDataPath);
+            }
+            break;
+        }
         case APP_CMD_TERM_WINDOW:
             LOGI("APP_CMD_TERM_WINDOW");
             engine->stop();
@@ -257,6 +301,7 @@ extern "C" void android_main(android_app* app) {
     app->onAppCmd = handleCommand;
     app->onInputEvent = onInputEvent;
     state.engine.setUi(&state.ui);
+    state.ui.setJni(app->activity->vm, app->activity->clazz);   // 触感反馈（Vibrator）
 
     // 挂焦点钩子：框架在 UI 线程回调，正好用来隐藏系统栏（ glue 原实现转调保留）
     g_glueFocusChanged = app->activity->callbacks->onWindowFocusChanged;

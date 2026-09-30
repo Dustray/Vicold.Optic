@@ -7,6 +7,8 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom) const {
     // 用 i32 写会被框架报 "Mismatched tag type" 并丢弃该 entry（切到超广角物理镜头时尤其致命）。
     uint8_t ae = static_cast<uint8_t>(aeOn ? ACAMERA_CONTROL_AE_MODE_ON : ACAMERA_CONTROL_AE_MODE_OFF);
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_MODE, 1, &ae);
+    uint8_t ael = static_cast<uint8_t>(aeLock ? 1 : 0);
+    ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_LOCK, 1, &ael);
     ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &evSteps);
 
     if (!aeOn) {

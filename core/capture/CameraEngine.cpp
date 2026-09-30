@@ -245,6 +245,14 @@ void CameraEngine::refreshPhysIds() {
     // 导轨下限按 HAL 声称值（0.70）：与系统相机口径一致；代价是最底下
     // 0.70–uwNative(0.774) 约 9% 的行程画不出更广（crop 不能 <1）。
     if (ui_) ui_->setZoomRange(cam_.traits().zoomMin);
+    // EV 量程（EV 值）：traits 的 RANGE 是步数，× STEP 换算；退化（缺报告）时 UI 保留默认 ±3/0.5
+    {
+        const auto& t = cam_.traits();
+        const float lo = float(t.evMin) * t.evStep, hi = float(t.evMax) * t.evStep;
+        LOGI("EV traits: range=[%d,%d] steps step=%.3f EV -> [%.2f, %.2f] EV", t.evMin, t.evMax,
+             t.evStep, lo, hi);
+        ui_->setEvRange(lo, hi, t.evStep);
+    }
 }
 
 std::string CameraEngine::activePhysId() const {
@@ -285,6 +293,20 @@ float CameraEngine::physZoom() const {
 // ALL 模式带内连续变焦完全依赖 per-physical ZOOM_RATIO 真正生效；键缺失或 HAL 忽略
 // 时表现为「长焦固定在原生焦段」（2026-09-29 真机症状）。
 void CameraEngine::probePhysCaps() {
+    // 逻辑摄 activeArray（az meta 漂移日志的基准）
+    {
+        ACameraMetadata* md = nullptr;
+        ACameraMetadata_const_entry e{};
+        if (ACameraManager_getCameraCharacteristics(cam_.manager(), cam_.deviceId().c_str(),
+                                                    &md) == ACAMERA_OK &&
+            md &&
+            ACameraMetadata_getConstEntry(md, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &e) ==
+                ACAMERA_OK &&
+            e.count >= 4) {
+            for (int i = 0; i < 4; ++i) logAa_[i] = e.data.i32[i];
+        }
+        if (md) ACameraMetadata_free(md);
+    }
     const std::string ids[2] = {uwPhysId_, telePhysId_};
     for (const std::string& pid : ids) {
         if (pid.empty()) continue;
@@ -331,24 +353,34 @@ std::vector<CaptureSession::PhysZoom> CameraEngine::allPhysZooms() {
                    ? (perKey ? std::max(1.0f, z / teleMinZoom_) : 1.0f)
                    : 0.f;
     std::vector<CaptureSession::PhysZoom> v;
-    // 键不生效就不写：防未来 ROM 部分生效时与 GL 裁切叠加成双重变焦
-    if (!perKey) return v;
-    auto make = [this](const std::string& id, float rel) {
+    auto make = [this, perKey](const std::string& id, float rel) {
         CaptureSession::PhysZoom pz;
         pz.id = id;
         pz.rel = rel;
-        const auto it = physCaps_.find(id);
-        if (it != physCaps_.end() && it->second.cropKey && it->second.aa[2] > 0) {
-            const float inv = 1.f / std::max(rel, 1.0f);
-            const int cw = int(it->second.aa[2] * inv) & ~1;   // 传感器 crop 常要求偶对齐
-            const int ch = int(it->second.aa[3] * inv) & ~1;
-            pz.crop[0] = it->second.aa[0] + (it->second.aa[2] - cw) / 2;
-            pz.crop[1] = it->second.aa[1] + (it->second.aa[3] - ch) / 2;
-            pz.crop[2] = cw;
-            pz.crop[3] = ch;
+        if (perKey) {
+            const auto it = physCaps_.find(id);
+            if (it != physCaps_.end() && it->second.cropKey && it->second.aa[2] > 0) {
+                const float inv = 1.f / std::max(rel, 1.0f);
+                const int cw = int(it->second.aa[2] * inv) & ~1;   // 传感器 crop 常要求偶对齐
+                const int ch = int(it->second.aa[3] * inv) & ~1;
+                pz.crop[0] = it->second.aa[0] + (it->second.aa[2] - cw) / 2;
+                pz.crop[1] = it->second.aa[1] + (it->second.aa[3] - ch) / 2;
+                pz.crop[2] = cw;
+                pz.crop[3] = ch;
+            }
         }
+        // 曝光三镜头统一：无论 perKey 与否都带上（逐摄键必须写在声明了物理成员的
+        // 请求上）。perKey=false 时 rel=1/crop 空 → setRepeatingAll 不写 ZOOM/CROP。
+        pz.aeOn = settings_.aeOn;
+        pz.aeLock = settings_.aeLock;
+        pz.evSteps = settings_.evSteps;
+        pz.iso = settings_.iso;
+        pz.exposureNs = settings_.exposureNs;
+        pz.awbOn = settings_.awbOn;
         return pz;
     };
+    // 恒返回物理成员（请求 withPhysicalIds 声明 [3,4]）：逐摄曝光同步依赖它。
+    // 旧版 perKey=false 时返回空表，导致 ALL 请求退化为纯逻辑请求、逐摄键全废。
     if (relUw_ > 0.f) v.push_back(make(uwPhysId_, relUw_));
     if (relTele_ > 0.f) v.push_back(make(telePhysId_, relTele_));
     return v;
@@ -387,6 +419,13 @@ bool CameraEngine::rebuildSession() {
 
     refreshPhysIds();
     probePhysCaps();
+
+    // az 时间戳对齐回调：显示线程消费纹理时查环取该帧的 zoomRatio 写回 UI
+    ui_->setAzSource([this](int slot, int64_t tsNs) {
+        const float az = azForSlot(slot, tsNs);
+        if (az > 0.f) ui_->setAppliedZoom(slot, az);
+        return az;
+    });
 
     auto sess = std::make_unique<CaptureSession>();
     sess->onFrameResult = [this](const FrameResult& r) { onFrameResult(r); };
@@ -697,7 +736,7 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         float ev = std::atof(v.c_str());
         settings_.evSteps = std::clamp(int(std::lround(ev / std::max(t.evStep, 0.01f))),
                                        t.evMin, t.evMax);
-        settings_.aeOn = true;
+        recomputeMixed();   // 双自动→AE on（HAL 补偿）；混合→模拟增益；双手动→EV 无效
         changed = true;
     } else if (k == "uvrot") {
         if (ui_) ui_->setUvRot(std::atoi(v.c_str()));
@@ -733,14 +772,30 @@ void CameraEngine::drainUiCmds() {
     while (ui_ && ui_->popCmd(&cmd)) {
         switch (cmd.type) {
             case ui::Ui::Cmd::SET_ISO:
+                isoAuto_ = false;                       // 拖 ISO 滚轮 = 该参数转手动
                 settings_.iso = std::clamp(int(cmd.v), t.isoMin, t.isoMax);
-                settings_.aeOn = false;
+                recomputeMixed();
                 changed = true;
                 break;
             case ui::Ui::Cmd::SET_EXP_US:
+                ssAuto_ = false;                        // 拖 SS 滚轮 = 该参数转手动
                 settings_.exposureNs = std::clamp<int64_t>(
                     int64_t(cmd.v * 1000), t.exposureMinNs, t.exposureMaxNs);
-                settings_.aeOn = false;
+                recomputeMixed();
+                changed = true;
+                break;
+            case ui::Ui::Cmd::SET_ISO_AUTO:
+                isoAuto_ = cmd.v > 0.5f;
+                recomputeMixed();
+                changed = true;
+                break;
+            case ui::Ui::Cmd::SET_SS_AUTO:
+                ssAuto_ = cmd.v > 0.5f;
+                recomputeMixed();
+                changed = true;
+                break;
+            case ui::Ui::Cmd::SET_AE_LOCK:
+                settings_.aeLock = cmd.v > 0.5f;
                 changed = true;
                 break;
             case ui::Ui::Cmd::SET_ZOOM:
@@ -755,7 +810,9 @@ void CameraEngine::drainUiCmds() {
             case ui::Ui::Cmd::SET_EV:
                 settings_.evSteps = std::clamp(int(std::lround(cmd.v / std::max(t.evStep, 0.01f))),
                                                t.evMin, t.evMax);
-                settings_.aeOn = true;
+                // EV 生效方式按模式：双自动 = HAL 补偿（AE on）；混合 = 模拟增益
+                //（冻结 AE 值 × 2^EV，recomputeMixed 内处理）；全手动 = UI 已灰显不可达
+                recomputeMixed();
                 changed = true;
                 break;
             case ui::Ui::Cmd::SET_AE:
@@ -778,8 +835,34 @@ void CameraEngine::drainUiCmds() {
     }
 }
 
-void CameraEngine::triggerBurst() {
-    if (!raw_ || !raw_->ringMode()) {
+// ISO/SS 混合模式状态机（见 CameraEngine.h 注释）。
+// 冻结基准：AE on 期间 onFrameResult 持续跟踪 lastAeIso_/lastAeExpNs_；
+// 转 AE off（任一参数手动）后冻结值不再更新，混合模式下自动参数 = 冻结值 × 2^EV。
+// EV 步长来自 traits（本机 1/3 EV）。
+void CameraEngine::recomputeMixed() {
+    const auto& t = cam_.traits();
+    if (isoAuto_ && ssAuto_) {                       // 双自动：整块交给硬件 AE
+        settings_.aeOn = true;
+        settings_.iso = 0;
+        settings_.exposureNs = 0;
+        return;
+    }
+    settings_.aeOn = false;
+    const double gain = std::pow(2.0, double(settings_.evSteps) * t.evStep);
+    if (isoAuto_) {
+        const int base = lastAeIso_ > 0 ? lastAeIso_
+                                        : (settings_.iso > 0 ? settings_.iso : t.isoMin);
+        settings_.iso = std::clamp(int(std::lround(base * gain)), t.isoMin, t.isoMax);
+    }
+    if (ssAuto_) {
+        const int64_t base = lastAeExpNs_ > 0 ? lastAeExpNs_
+                            : (settings_.exposureNs > 0 ? settings_.exposureNs : t.exposureMinNs);
+        settings_.exposureNs = std::clamp<int64_t>(int64_t(std::lround(base * gain)),
+                                                   t.exposureMinNs, t.exposureMaxNs);
+    }
+}
+
+void CameraEngine::triggerBurst() {    if (!raw_ || !raw_->ringMode()) {
         LOGW("trigger requires raw_mode=ring");
         if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
         return;
@@ -808,25 +891,48 @@ int64_t CameraEngine::nowMs() const {
         .count();
 }
 
-void CameraEngine::onFrameResult(const FrameResult& r) {
-    frameCount_++;
-    lastResultMs_ = nowMs();
-
-    // 帧节奏探针
-    if (lastFrameMs_ != 0) {
-        const int64_t gap = lastResultMs_ - lastFrameMs_;
-        if (gap > 70) ++frameGaps_;
-        if (gap > maxGapMs_) maxGapMs_ = gap;
+// 显示线程按**显示帧**的 SENSOR_TIMESTAMP 查结果环取该时刻的 zoomRatio 作为 az。
+// 这样 crop = zoom_/az 与显示帧严格同源：显示 FOV = az × crop ≡ zoom_，与相机
+// 120ms 节流/管线延迟无关 —— 变焦全程 GL 侧无泵动。
+float CameraEngine::azForSlot(int slot, int64_t tsNs) {
+    // 物理流（quirk 之二：继承逻辑 ZOOM_RATIO 裁切）：纹理真实 FOV = 带基 × 逻辑zoom(t)。
+    // 常量带基（旧做法）在跨带瞬间必错：主摄带逻辑写 4.85 时长焦纹理实际 ≈24.3x，
+    // 却按 5.016 配 crop → 切换闪帧；按帧时间戳取逻辑 zoom 后严格一致。
+    float base = 1.f;
+    if (slot == 1) base = uwNativeZoom_;
+    else if (slot == 2 && teleMinZoom_ < 1e8f) base = teleMinZoom_;
+    std::lock_guard<std::mutex> lk(resMx_);
+    if (resRing_.empty()) return 0.f;               // 无结果：调用方保持旧值
+    // 取 ts ≤ tsNs 的最新结果；图像早于最旧结果（环已卷绕）时用最旧值兜底
+    const ResTs* best = &resRing_.front();
+    for (const auto& e : resRing_) {
+        if (e.ts <= tsNs) best = &e;
+        else break;
     }
-    lastFrameMs_ = lastResultMs_;
+    return base * best->zoom;
+}
+
+void CameraEngine::onFrameResult(const FrameResult& r) {
+    // 心跳：任意结果都算存活（看门狗用）。NDK 单帧单回调（交付逻辑融合结果），
+    // 该结果即预览帧代表，直接计帧率（无需按物理 ID 区分，也不存在三路同频虚高）。
+    lastResultMs_ = nowMs();
+    {
+        frameCount_++;
+        if (lastFrameMs_ != 0) {
+            const int64_t gap = lastResultMs_ - lastFrameMs_;
+            if (gap > 70) ++frameGaps_;
+            if (gap > maxGapMs_) maxGapMs_ = gap;
+        }
+        lastFrameMs_ = lastResultMs_;
+    }
 
     if (firstTs_ == 0) firstTs_ = r.timestampNs;
     lastTs_ = r.timestampNs;
 
     if (raw_) raw_->onFrameResult(r);
 
-    // 近距判定（滞回 + 帧数去抖）：对焦距离过近时长焦模组对不上焦，
-    // 接管点推迟到 teleNearSwitch_（对齐系统相机：近距 1–20x 恒主摄）。
+    // 近距判定取逻辑融合结果（其焦距即当前主源物理摄像头的对焦距离：主摄带=主摄、
+    // 长焦带=长焦，正是接管点推迟判断所需）。NDK 单帧单结果，无需按物理 ID 区分。
     if (nearEnterM_ > 0.f && r.focusDistanceDiopters > 1e-3f) {
         const float distM = 1.f / r.focusDistanceDiopters;
         if (distM < nearEnterM_) {
@@ -850,25 +956,47 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
         }
     }
 
-    // 回传当前出图帧对应的"用户倍率"（UI 平滑变焦的锚点）：
-    // result 里的 zoomRatio 在物理直连下是相对值，需按带基换算回用户域。
-    float userZoom = r.zoomRatio;
-    if (multiStream_ && sessionSig_ == "ALL") {
-        // ALL 模式：result 元数据是逻辑流的（被钳在干净带内），显示源的应用倍率
-        // 按当前显示带换算 —— 物理流 applied = 写入的相对值 × 带基。
-        if (physBand_ == uwPhysId_ && relUw_ > 0.f) {
-            userZoom = relUw_ * uwNativeZoom_;
-        } else if (physBand_ == telePhysId_ && relTele_ > 0.f && teleMinZoom_ < 1e8f) {
-            userZoom = relTele_ * teleMinZoom_;
+    // 平滑变焦锚点 az：NDK 单帧单回调，result 即逻辑融合结果，其 ZOOM_RATIO 就是相机
+    // 实际出图的倍率 —— 直接作为主摄带 az[0] 锚点，每帧刷新（不再按物理 ID 判定"逻辑/物理
+    // 流"，那套假设在 NDK 不成立）。超广/长焦带 az 为恒定带基（与 result 内容无关、幂等），
+    // 任意结果均可触发 —— 无论 HAL 是否下发 per-physical 结果都能正确工作。
+    // 主摄带 az[0] 由逻辑结果 ZOOM_RATIO 驱动，彻底杜绝被超广/长焦流污染（旧 bug：az 被
+    // 冲成 1.0 → 预览周期性被放大到 zoom_² 倍 → 1–5x 卡顿）。
+    if (ui_) {
+        // 结果线程只把 (ts, zoomRatio) 入环；az 回传改由显示线程按**显示帧时间戳**
+        // 查环（Gl::acquirePreview → azForSlot）。旧做法「结果一到就写 az[0]」会让
+        // az 领先显示纹理 1-2 帧：快拖时 crop 与纹理错位，显示 FOV 在两个值间泵动
+        //（1–5x「不丝滑/来回闪」的根因）。时间戳对齐后 crop 与显示帧严格同源。
+        {
+            std::lock_guard<std::mutex> lk(resMx_);
+            if (resRing_.empty() || resRing_.back().ts < r.timestampNs)
+                resRing_.push_back({r.timestampNs, r.zoomRatio});
+            if (resRing_.size() > 64) resRing_.erase(resRing_.begin());
         }
-        // 逻辑带：r.zoomRatio 即真实应用值
-    } else if (sessionIsPhysical_) {
-        if (sessionSig_ == "P:" + uwPhysId_)
-            userZoom = r.zoomRatio * uwNativeZoom_;
-        else if (teleMinZoom_ < 1e8f)
-            userZoom = r.zoomRatio * teleMinZoom_;
+        // 漂移诊断（zoom 变化时）：HAL 变焦裁切中心是否随 zoom 偏离阵列中心
+        //（用户报告 2–5x 拖动中画面中心慢慢右移；静止 6s 互相关零漂移）。
+        if (std::fabs(r.zoomRatio - lastAzLogZoom_) > 0.03f && r.cropRegion[2] > 0 &&
+            logAa_[2] > 0) {
+            lastAzLogZoom_ = r.zoomRatio;
+            const float ccx = r.cropRegion[0] + r.cropRegion[2] * 0.5f;
+            const float ccy = r.cropRegion[1] + r.cropRegion[3] * 0.5f;
+            const float acx = logAa_[0] + logAa_[2] * 0.5f;
+            const float acy = logAa_[1] + logAa_[3] * 0.5f;
+            LOGI("az meta: z=%.2f crop=[%d %d %d %d] off=(%.1f,%.1f)px", r.zoomRatio,
+                 r.cropRegion[0], r.cropRegion[1], r.cropRegion[2], r.cropRegion[3],
+                 ccx - acx, ccy - acy);
+        }
     }
-    if (ui_) ui_->setAppliedZoom(userZoom);
+
+    // AE 实测值跟踪（混合模式冻结基准 + UI 自动参数数值行显示）
+    if (settings_.aeOn && r.iso > 0 && r.exposureNs > 0) {
+        lastAeIso_ = r.iso;
+        lastAeExpNs_ = r.exposureNs;
+        if (ui_) {
+            ui_->setAutoIso(r.iso);
+            ui_->setAutoSsUs(r.exposureNs / 1000);
+        }
+    }
 
     if (forceLog_ || frameCount_ % 120 == 0) {
         forceLog_ = false;
@@ -877,14 +1005,15 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
                                static_cast<double>(lastTs_ - firstTs_)
                          : 0.0;
         if (raw_) {
-            LOGI("stats: frames=%llu fps=%.1f eff(iso=%d exp=%lldns zoom=%.2f) raw: %.1ffps total=%lld",
+            LOGI("stats: frames=%llu fps=%.1f eff(iso=%d exp=%lldns zoom=%.2f phys=%s) raw: %.1ffps total=%lld",
                  static_cast<unsigned long long>(frameCount_), fps, r.iso,
-                 static_cast<long long>(r.exposureNs), r.zoomRatio, raw_->rawFps(),
+                 static_cast<long long>(r.exposureNs), r.zoomRatio, r.physicalId.c_str(),
+                 raw_->rawFps(),
                  static_cast<long long>(raw_->rawCount()));
         } else {
-            LOGI("stats: frames=%llu fps=%.1f eff(iso=%d exp=%lldns zoom=%.2f)",
+            LOGI("stats: frames=%llu fps=%.1f eff(iso=%d exp=%lldns zoom=%.2f phys=%s)",
                  static_cast<unsigned long long>(frameCount_), fps, r.iso,
-                 static_cast<long long>(r.exposureNs), r.zoomRatio);
+                 static_cast<long long>(r.exposureNs), r.zoomRatio, r.physicalId.c_str());
         }
         LOGI("pacing: gaps>70ms=%d max=%lldms (frames=%llu)", frameGaps_,
              (long long)maxGapMs_, static_cast<unsigned long long>(frameCount_));

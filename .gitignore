@@ -6,3 +6,5 @@ out/
 .idea/
 *.user
 *.apk.idsig
+doc/debug/
+.workbuddy/*.png

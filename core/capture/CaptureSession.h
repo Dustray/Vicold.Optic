@@ -34,6 +34,11 @@ struct FrameResult {
     float zoomRatio = 1.f;
     float focusDistanceDiopters = 0.f;  // 屈光度（0=无穷远）；AF 连续时有效
     float wbGains[4] = {1, 1, 1, 1};   // [r, gEven, gOdd, b]（COLOR_CORRECTION_GAINS）
+    int32_t cropRegion[4] = {};        // SCALER_CROP_REGION（activeArray 域；w/h=0 表示未取到）
+    std::string physicalId;             // 当前主源物理摄像头（ACTIVE_PHYSICAL_ID，诊断用）
+                                        // NDK 单帧单回调只交付逻辑融合结果，其 ACTIVE_PHYSICAL_ID
+                                        // 标识当前 backing 摄像头（"2"主/"3"超广/"4"长焦）；
+                                        // 非"哪路输出"标识（NDK 无按输出分发回调），不用于分流。
 };
 
 class CaptureSession {
@@ -65,6 +70,15 @@ public:
         int32_t crop[4] = {};   // 与 rel 一致的 SCALER_CROP_REGION（activeArray 域；
                                 // crop[2]==0 = 不写）。ZOOM_RATIO 被声明但被 HAL 忽略时
                                 //（2026-09-29 真机症状）由 crop region 同义兜底，二者恒一致。
+        // 三镜头曝光统一（2026-09-30）：逻辑请求的 AE/SENSOR 键只约束融合的活动物理摄，
+        // 非活动物理流各跑各的 AE → 超广/长焦亮度与主摄不一致，跨带切换曝光跳变。
+        // 这组键恒逐摄同步下发（请求必须 withPhysicalIds 声明物理成员）。
+        bool aeOn = true;
+        bool aeLock = false;        // 测光锁定逐摄同步（否则非活动物理摄 AE 不锁）
+        int32_t evSteps = 0;
+        int32_t iso = 0;            // aeOn=false 时生效（>0 才写）
+        int64_t exposureNs = 0;     // aeOn=false 时生效（>0 才写）
+        bool awbOn = true;
     };
     bool setRepeatingAll(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s,
                          const std::vector<PhysZoom>& phys);
@@ -97,6 +111,7 @@ private:
         std::vector<ANativeWindow*> wins;
         std::vector<ACameraOutputTarget*> tgts;
         std::string physId;             // 非空 = withPhysicalIds 请求
+        std::string declaredIds;        // ALL 请求声明的物理成员集（变化 → 强制重建请求）
     };
 
     ACameraDevice* device_ = nullptr;

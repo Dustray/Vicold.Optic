@@ -5,6 +5,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="true"/>
     <uses-feature android:name="android.hardware.camera.raw" android:required="false"/>
     <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
 
     <application
         android:label="Vicold.Optic"
@@ -20,8 +21,7 @@
             android:launchMode="singleTask"
             android:screenOrientation="sensorLandscape"
             android:resizeableActivity="false"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
-            android:windowLayoutInDisplayCutoutMode="always"
+            android:theme="@style/OpticTheme"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale">
             <meta-data android:name="android.app.lib_name" android:value="optic"/>
             <intent-filter>

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -79,11 +80,19 @@ private:
     void triggerBurst();
     void applyControl(const std::string& k, const std::string& v, bool& changed);
     void onFrameResult(const FrameResult& r);
+    // ISO/SS 自动-手动混合模式状态机：双自动 = 真 AE（EV 走 HAL 补偿）；一自动一手动 =
+    // AE off，自动参数 = 冻结 AE 值 × 2^EV（模拟补偿，AE off 后冻结值不再更新）；
+    // 双手动 = AE off，EV 无效（UI 灰显）。
+    void recomputeMixed();
 
     CameraDevice cam_;
     std::unique_ptr<CaptureSession> session_;
     std::unique_ptr<RawCapture> raw_;
     CaptureSettings settings_;
+    // 曝光参数自动状态（UI A 键 / 拖滚轮切换）与 AE 冻结值（AE on 时从结果跟踪）
+    bool isoAuto_ = true, ssAuto_ = true;
+    int lastAeIso_ = 0;
+    int64_t lastAeExpNs_ = 0;
     std::string dataDir_;
 
     // 每启动拍摄配额（硬盘保护；save_quota=N 可放宽，0=禁用）
@@ -160,6 +169,20 @@ private:
     };
     std::map<std::string, PhysCaps> physCaps_;
     void probePhysCaps();
+
+    // ---- 时间戳对齐的 az 回传（消除「结果 az 与显示帧错位」的泵动闪烁） ----
+    // 结果回调线程只把 (timestamp, zoomRatio) 入环；显示线程消费纹理时按该帧
+    // SENSOR_TIMESTAMP 查环取当时的 zoomRatio 作为 az —— crop 与显示帧严格同源，
+    // 显示 FOV = az × crop = zoom_ 恒成立，快拖时不再出现两焦距来回闪。
+    struct ResTs {
+        int64_t ts = 0;
+        float zoom = 1.f;
+    };
+    std::mutex resMx_;
+    std::vector<ResTs> resRing_;        // 按 ts 递增，容量 64
+    float azForSlot(int slot, int64_t tsNs);
+    int32_t logAa_[4] = {};             // 逻辑摄 ACTIVE_ARRAY（漂移诊断基准）
+    float lastAzLogZoom_ = 0.f;         // az meta 日志去重
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问

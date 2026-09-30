@@ -3,9 +3,32 @@
 #include "core/util/Log.h"
 
 #include <algorithm>
+#include <string>
+
+#include <camera/NdkCameraMetadataTags.h>
 
 namespace optic::capture {
 namespace {
+
+// 读出该 capture result 的 ACTIVE_PHYSICAL_ID：NDK 的 onCaptureCompleted 每个 repeating 帧
+// 只回调**一次**，交付的是逻辑融合结果；其 ACTIVE_PHYSICAL_ID 标识当前主源物理摄像头
+//（"2"=主摄 / "3"=超广 / "4"=长焦），仅作诊断，不用于区分"哪路输出"（NDK 单帧单结果，
+// 不存在按输出分发的 per-physical 回调）。注意标签名是 ACTIVE_PHYSICAL_ID（复数 PHYSICAL_IDS
+// 是 characteristics 用的），单数 PHYSICAL_ID 在 NDK 中不存在、会编译失败。
+// 物理 ID 以字节串（ASCII）形式存储，稳妥起见同时兼容 int 型（罕见 HAL）。
+std::string parsePhysicalId(const ACameraMetadata* result) {
+    ACameraMetadata_const_entry e{};
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID,
+                                      &e) != ACAMERA_OK ||
+        e.count == 0)
+        return "";
+    if (e.type == ACAMERA_TYPE_BYTE) {
+        std::string s(reinterpret_cast<const char*>(e.data.u8), e.count);
+        while (!s.empty() && s.back() == '\0') s.pop_back();
+        return s;
+    }
+    return std::to_string(e.data.i32[0]);
+}
 
 FrameResult parseResult(const ACameraMetadata* result) {
     FrameResult out;
@@ -18,6 +41,10 @@ FrameResult parseResult(const ACameraMetadata* result) {
         out.exposureNs = e.data.i64[0];
     if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_ZOOM_RATIO, &e) == ACAMERA_OK && e.count > 0)
         out.zoomRatio = e.data.f[0];
+    // 裁切区域（漂移诊断：HAL 变焦裁切中心是否随 zoom 偏离阵列中心）
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_SCALER_CROP_REGION, &e) == ACAMERA_OK &&
+        e.count >= 4)
+        for (int i = 0; i < 4; ++i) out.cropRegion[i] = e.data.i32[i];
     // 对焦距离（屈光度，0=无穷远）→ 近距判定（长焦最小对焦距离之内时推迟接管点）
     if (ACameraMetadata_getConstEntry(result, ACAMERA_LENS_FOCUS_DISTANCE, &e) == ACAMERA_OK &&
         e.count > 0)
@@ -28,6 +55,7 @@ FrameResult parseResult(const ACameraMetadata* result) {
         out.wbGains[2] = e.data.f[2];
         out.wbGains[3] = e.data.f[3];
     }
+    out.physicalId = parsePhysicalId(result);
     return out;
 }
 
@@ -171,7 +199,14 @@ bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
     if (!session_ || targets.empty()) return false;
 
     BandReq& b = bands_["ALL"];
-    if (targets != b.wins || !b.req) {
+    // 声明的物理成员集变化（如空 → [3,4]）必须重建请求：per-physical 键只能写在
+    // withPhysicalIds 声明了该成员的请求上，仅重发 entry 会静默失败。
+    std::string declaredIds;
+    for (const auto& pz : phys) {
+        declaredIds += pz.id;
+        declaredIds += ';';
+    }
+    if (targets != b.wins || !b.req || declaredIds != b.declaredIds) {
         // 目标集变化（或首次）⇒ 重建请求：withPhysicalIds 声明物理流成员，
         // 逻辑流输出（RAW）照常交付 —— RAW 恒出帧，全带可拍。
         if (b.req) { ACaptureRequest_free(b.req); b.req = nullptr; }
@@ -206,13 +241,16 @@ bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
             ACaptureRequest_addTarget(b.req, t);
         }
         b.wins = targets;
+        b.declaredIds = declaredIds;
     }
 
     // 逻辑 zoom 由调用方（CameraEngine::effSettings）钳在干净带内；
     // 物理流逐摄覆盖相对变焦：ZOOM_RATIO + 同值的 SCALER_CROP_REGION（双保险）。
+    // rel>1 才写 ZOOM：perKey=false 的机型（键被 HAL 忽略）恒为 1.0，不写防
+    // 未来 ROM 部分生效时与 GL 裁切叠加成双重变焦。
     applySettings(b.req, s, false, 0.f);
     for (const auto& pz : phys) {
-        if (pz.rel > 0.f) {
+        if (pz.rel > 1.0f) {
             // 返回码必查：部分 HAL 对 per-physical 控制键静默失败。
             const camera_status_t rc = ACaptureRequest_setEntry_physicalCamera_float(
                 b.req, pz.id.c_str(), ACAMERA_CONTROL_ZOOM_RATIO, 1, &pz.rel);
@@ -225,6 +263,47 @@ bool CaptureSession::setRepeatingAll(const std::vector<ANativeWindow*>& targets,
                 b.req, pz.id.c_str(), ACAMERA_SCALER_CROP_REGION, 4, pz.crop);
             if (rc != ACAMERA_OK)
                 LOGW("per-phys CROP_REGION set failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        }
+        // 曝光/AWB 逐摄同步：这些键写在逻辑请求上只约束融合的活动物理摄，非活动
+        // 物理流各自 AE → 三镜头亮度不统一（2026-09-30 真机确诊：主摄 obey、
+        // 超广偏暗、长焦最暗），跨带切换的曝光跳变也是大闪烁来源之一。
+        const uint8_t pAe = static_cast<uint8_t>(pz.aeOn ? ACAMERA_CONTROL_AE_MODE_ON
+                                                         : ACAMERA_CONTROL_AE_MODE_OFF);
+        const uint8_t pAwb = static_cast<uint8_t>(pz.awbOn ? ACAMERA_CONTROL_AWB_MODE_AUTO
+                                                           : ACAMERA_CONTROL_AWB_MODE_OFF);
+        camera_status_t rc = ACaptureRequest_setEntry_physicalCamera_u8(
+            b.req, pz.id.c_str(), ACAMERA_CONTROL_AE_MODE, 1, &pAe);
+        if (rc != ACAMERA_OK)
+            LOGW("per-phys AE_MODE failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        rc = ACaptureRequest_setEntry_physicalCamera_u8(b.req, pz.id.c_str(),
+                                                        ACAMERA_CONTROL_AWB_MODE, 1, &pAwb);
+        if (rc != ACAMERA_OK)
+            LOGW("per-phys AWB_MODE failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        {   // AE_LOCK 恒写两个状态：请求是复用的，解锁时不覆盖写会残留上次的 1
+            const uint8_t pLock = static_cast<uint8_t>(pz.aeLock ? 1 : 0);
+            rc = ACaptureRequest_setEntry_physicalCamera_u8(b.req, pz.id.c_str(),
+                                                            ACAMERA_CONTROL_AE_LOCK, 1, &pLock);
+            if (rc != ACAMERA_OK)
+                LOGW("per-phys AE_LOCK failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        }
+        if (pz.aeOn) {
+            rc = ACaptureRequest_setEntry_physicalCamera_i32(
+                b.req, pz.id.c_str(), ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &pz.evSteps);
+            if (rc != ACAMERA_OK)
+                LOGW("per-phys EV failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+        } else {
+            if (pz.iso > 0) {
+                rc = ACaptureRequest_setEntry_physicalCamera_i32(
+                    b.req, pz.id.c_str(), ACAMERA_SENSOR_SENSITIVITY, 1, &pz.iso);
+                if (rc != ACAMERA_OK)
+                    LOGW("per-phys ISO failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+            }
+            if (pz.exposureNs > 0) {
+                rc = ACaptureRequest_setEntry_physicalCamera_i64(
+                    b.req, pz.id.c_str(), ACAMERA_SENSOR_EXPOSURE_TIME, 1, &pz.exposureNs);
+                if (rc != ACAMERA_OK)
+                    LOGW("per-phys EXP failed (phys=%s rc=%d)", pz.id.c_str(), (int)rc);
+            }
         }
     }
     // 拖拽中 ~8 次/s 重发，值变化才打日志（防淹没 logcat）

@@ -9,6 +9,7 @@ add_library(optic_core STATIC
     capture/CameraEngine.cpp
     dng/DngWriter.cpp
     ui/Gl.cpp
+    ui/Haptics.cpp
     ui/Ui.cpp
 )
 
