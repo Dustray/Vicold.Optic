@@ -8,6 +8,7 @@
 优先级定义：**P0** = 阻塞主线的必做项 | **P1** = 重要，紧跟 P0 | **P2** = 增强项，可延后
 
 > **配套文档**（细节不重复进本文件）
+> - 机型扩展：`doc/DEVICE_ABSTRACTION.md`（IOpticDevice 契约、新增机型步骤、quirk 清单）
 > - 屏幕/交互：`doc/UI_LAYOUT.md`（设计空间、挖孔禁区、布局常量表、文字渲染与验证方法）
 > - 拍摄输出：`doc/STILL_PIPELINE.md`（JPEG/RAW 两通路、WYSIWYG 裁切、相册写入）
 > - 多摄/变焦：`doc/devices/xiaomi17pro/CAM_PATHS.md`（分带机制、ALL 常驻会话、HAL quirks）
@@ -69,18 +70,28 @@
 ### 2.2 机型扩展层设计（项目核心卖点）
 
 ```cpp
-// device/IOpticDevice.h（示意）
+// device/IOpticDevice.h（2026-10-01 定稿）
 struct IOpticDevice {
-    virtual ~IOpticDevice() = default;
-    virtual DeviceInfo probe(ACameraManager*) = 0;   // 能力探测与裁剪
-    virtual void applyQuirks(CaptureConfig&) = 0;    // 流配置/方向/时序修正
-    virtual std::string tuningFileFor(const SensorInfo&) = 0; // per-sensor tuning
-    virtual std::span<const ExtraFeature> extraFeatures() = 0; // 机型独有特性
+    virtual bool matches(std::string_view deviceName, std::string_view marketName) const = 0;
+    virtual DeviceInfo probe(ACameraManager*, const std::string& cameraId,
+                             ACameraMetadata* characteristics) = 0;
+    virtual void applyQuirks(std::vector<StreamConfig>& configs) const = 0;
+
+    // 以下承载**无法从 CameraCharacteristics 问出来**的真机实测结论（见 DEVICE_ABSTRACTION.md §1）
+    virtual DeviceIdentity   identity() const;        // DNG Make/Model
+    virtual ZoomProfile      zoomProfile() const;     // 坏区安全带/接管点/焦段/mm 基准
+    virtual NearTakeoverRule nearTakeover() const;    // 近距推迟接管
+    virtual PhysQuirks       physQuirks() const;      // 物理流继承裁切 / per-key 是否执行
+    virtual SessionPolicy    sessionPolicy() const;   // 槽数/尺寸/流数上限/降级阶梯/帧率
+    virtual UiLayoutPolicy   uiLayout() const;        // 挖孔禁区几何
+    virtual std::string tuningFileFor(const std::string& physicalId) const;   // M4
 };
-// 工厂按 ro.product.device 匹配，未命中回退 GenericDevice
 ```
 
-配套每机型一份 `device/xiaomi17pro/tuning.json`（参考 rpicam-apps 的 per-sensor tuning 模式）。
+> 维护要点：**有一整类 HAL 行为无法探测**（融合管线坏区、物理流继承逻辑裁切、会话流数
+> 上限、近距接管距离、挖孔真实边界）。这些若写在业务代码里，第二台机型会带着 pandora
+> 的参数静默出错。默认值一律取「通用保守」而非「首发机型的值」，未确认的能力默认关闭。
+> 新增机型的完整步骤见 `DEVICE_ABSTRACTION.md §3`。
 
 ---
 
