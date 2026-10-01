@@ -93,7 +93,13 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
 - `activePhysId()`：zoomRatio==0 表示"未设置"，不能当 <1.0（否则冷启动误入直连）。
 - 看门狗 12 次重试耗尽 → 全链路重连（不再永久黑屏）。
 - controls.txt 键：`uw=1`（默认开）、`uw_phys=N`、`tele_phys=N`、`phys_min=N`、`disp=0/1/2`
-  （手动锁显示源）、`tele_native=N`（强制长焦带基，肉眼校准用）。
+  （手动锁显示源）、`tele_native=N`（强制长焦带基，肉眼校准用）、`iso_auto/ss_auto=0/1`
+  （自动/手动切换，与 UI A 键同语义）、`ss=N`（1/x s 分母，ns 精确）。
+- **EV/ISO/SS 曝光守恒联动**（2026-10-01）：混合模式自动参数 = 冻结 AE 乘积 P/手动参数
+  × 2^EV；手动 ISO/SS 动→另一侧反比补、EV 动→自动侧偏移；recomputeMixed 结果回推 UI
+  （自动侧读数/滚轮指针即时跟随）。controls.txt 调试只同步引擎侧标志，UI 侧 auto 标志由
+  触摸驱动。**controls.txt 全量重放语义**：调试时每步整写干净文件（`>`），勿 `>>` 叠加
+  语义冲突的键（unordered_map 顺序不定，旧行为可能覆盖新值）。
 - 真机诊断脚本（tools/）：`zoom_scan.sh`（逐点核对 eff FOV=az×crop 是否 == z）、
   `stall_probe.sh`（逐点数断流，定位逻辑流安全上限）、`logical_limit.sh`、
   `calib_fov.py`（像素标定；**近景视差下不可靠**，需 >3m 远景）。

@@ -93,8 +93,10 @@ private:
     void applyControl(const std::string& k, const std::string& v, bool& changed);
     void onFrameResult(const FrameResult& r);
     // ISO/SS 自动-手动混合模式状态机：双自动 = 真 AE（EV 走 HAL 补偿）；一自动一手动 =
-    // AE off，自动参数 = 冻结 AE 值 × 2^EV（模拟补偿，AE off 后冻结值不再更新）；
-    // 双手动 = AE off，EV 无效（UI 灰显）。
+    // AE off，曝光守恒模型：自动参数 = 冻结 AE 乘积 P(=iso×exp) / 手动参数 × 2^EV ——
+    // 手动 ISO/SS 动 → 自动侧反比补偿（亮度恒定，ISO 优先/快门优先语义），EV 动 →
+    // 自动侧整体 ×2^EV；P 在 AE off 后不再更新；双手动 = AE off，EV 无效（UI 灰显）。
+    // 混合计算结果回推 UI（setAutoIso/setAutoSsUs），自动侧读数/滚轮即时联动。
     void recomputeMixed();
 
     CameraDevice cam_;

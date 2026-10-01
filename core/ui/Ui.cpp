@@ -35,6 +35,21 @@ const float Ui::kSsStops[kSsStopsN] = {
     10,         13,         15,         20,         25,         30,
 };
 
+// log 域最近档位（自动侧联动显示：引擎回推的连续计算值吸附到滚轮档）
+static int nearestStopIdx(const float* stops, int n, float v) {
+    if (!(v > 0.f)) return 0;
+    int best = 0;
+    float bd = 1e30f;
+    for (int i = 0; i < n; ++i) {
+        const float d = std::fabs(std::log(stops[i] / v));
+        if (d < bd) {
+            bd = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
 // ---- 设计空间布局常量（camera-ui.html 移植）----
 namespace layout {
 constexpr Rgba kBg{0, 0, 0, 1};
@@ -275,10 +290,19 @@ void Ui::onDown(float x, float y, double tMs) {
             if (s == 0) isoAuto_ = toAuto; else ssAuto_ = toAuto;
             pushCmd(s == 0 ? Cmd::SET_ISO_AUTO : Cmd::SET_SS_AUTO, toAuto ? 1.f : 0.f);
             // 转手动时同步落位滚轮当前档：settings 里 iso/exp 可能还是 0（从未拖过），
-            // 直接下发 0 是无效请求（HAL 拒绝）
+            // 直接下发 0 是无效请求（HAL 拒绝）。以当前显示的自动值（引擎回推的联动
+            // 计算值）吸附最近档作为手动起点 —— 值不跳变，无缝转手动。
             if (!toAuto) {
-                if (s == 0) pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_]));
-                else pushCmd(Cmd::SET_EXP_US, 1e6f * kSsStops[ssIdx_]);
+                if (s == 0) {
+                    const int aIso = autoIso_.load(std::memory_order_relaxed);
+                    if (aIso > 0) isoIdx_ = nearestStopIdx(kIsoStops, kIsoStopsN, float(aIso));
+                    pushCmd(Cmd::SET_ISO, float(kIsoStops[isoIdx_]));
+                } else {
+                    const int64_t us = autoSsUs_.load(std::memory_order_relaxed);
+                    if (us > 0)
+                        ssIdx_ = nearestStopIdx(kSsStops, kSsStopsN, float(double(us) * 1e-6));
+                    pushCmd(Cmd::SET_EXP_US, 1e6f * kSsStops[ssIdx_]);
+                }
             }
             hap_.click();
             return;
@@ -726,9 +750,16 @@ void Ui::drawTracks() {
         snprintf(ssVal, sizeof(ssVal), "1/%.4g s", (double)(1.f / kSsStops[ssIdx_]));
 
     // 去掉静态标题（2026-10-01 用户要求）：三个滚轮上方只留**实时值**，风格统一
+    // 自动态滚轮指针跟到实际生效档位（联动显示：EV/手动参数变化时自动侧跟着走）
+    const int64_t aSsUs = autoSsUs_.load(std::memory_order_relaxed);
+    int isoIdxEff = isoIdx_;
+    if (isoAuto_ && aIso > 0) isoIdxEff = nearestStopIdx(kIsoStops, kIsoStopsN, float(aIso));
+    int ssIdxEff = ssIdx_;
+    if (ssAuto_ && aSsUs > 0)
+        ssIdxEff = nearestStopIdx(kSsStops, kSsStopsN, float(double(aSsUs) * 1e-6));
     const VSlider sliders[2] = {
-        {kIsoTrackX, isoVal, isoIdx_, kIsoStopsN, false, kIsoStops, 1, isoAuto_},
-        {kSsTrackX, ssVal, ssIdx_, kSsStopsN, true, kSsStops, 3, ssAuto_},
+        {kIsoTrackX, isoVal, isoIdxEff, kIsoStopsN, false, kIsoStops, 1, isoAuto_},
+        {kSsTrackX, ssVal, ssIdxEff, kSsStopsN, true, kSsStops, 3, ssAuto_},
     };
 
     for (int s = 0; s < 2; ++s) {
@@ -740,8 +771,8 @@ void Ui::drawTracks() {
                         dim(20), kTrack, kTrackLine, 1);
         // 渲染位置：拖动中用连续 roll（刻度逐像素滚动），静止时落位到档位
         const float curF =
-            (s == 0 ? (drag_ == Drag::ISO ? isoRoll_ : float(isoIdx_) / (kIsoStopsN - 1))
-                    : (drag_ == Drag::SS ? ssRoll_ : float(ssIdx_) / (kSsStopsN - 1)));
+            (s == 0 ? (drag_ == Drag::ISO ? isoRoll_ : float(isoIdxEff) / (kIsoStopsN - 1))
+                    : (drag_ == Drag::SS ? ssRoll_ : float(ssIdxEff) / (kSsStopsN - 1)));
         RollItem items[64];
         char labels[56][8];
         for (int i = 0; i < v.n; ++i) {

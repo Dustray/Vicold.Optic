@@ -722,13 +722,22 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         bool on = parseOn(v);
         if (on != settings_.aeOn) {
             settings_.aeOn = on;
+            if (on) {
+                isoAuto_ = ssAuto_ = true;   // 回双自动：参数交还 HAL AE
+            } else {
+                // 关 AE = 双手动冻结当前实测值（画面参数保持不变）
+                if (lastAeIso_ > 0) settings_.iso = lastAeIso_;
+                if (lastAeExpNs_ > 0) settings_.exposureNs = lastAeExpNs_;
+                isoAuto_ = ssAuto_ = false;
+            }
             changed = true;
         }
     } else if (k == "iso") {
         int32_t iso = std::clamp(std::atoi(v.c_str()), t.isoMin, t.isoMax);
         if (iso != settings_.iso) {
             settings_.iso = iso;
-            settings_.aeOn = false; // 手动 ISO 隐含 AE off
+            isoAuto_ = false;     // 手动 ISO：与 UI 拖滚轮同语义（同步引擎侧标志）
+            recomputeMixed();     // 联动：自动 SS 反比补偿（曝光守恒）
             changed = true;
         }
     } else if (k == "exp_us") {
@@ -736,7 +745,17 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         int64_t ns = std::clamp<int64_t>(us * 1000, t.exposureMinNs, t.exposureMaxNs);
         if (ns != settings_.exposureNs) {
             settings_.exposureNs = ns;
-            settings_.aeOn = false;
+            ssAuto_ = false;
+            recomputeMixed();
+            changed = true;
+        }
+    } else if (k == "iso_auto" || k == "ss_auto") {
+        // 调试键：与 UI A 按钮同语义（切自动/手动并触发联动重算）
+        bool on = parseOn(v);
+        bool& flag = (k == "iso_auto") ? isoAuto_ : ssAuto_;
+        if (on != flag) {
+            flag = on;
+            recomputeMixed();
             changed = true;
         }
     } else if (k == "af") {
@@ -850,12 +869,13 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGI("save quota = %d triggers per launch", saveQuota_);
         }
     } else if (k == "ss") {
-        // 快门分母（1/x s）→ µs
+        // 快门分母（1/x s）→ ns。曾误写 1e9/den*1000（多乘 1000，1/125s 变 8s）。
         double den = std::atof(v.c_str());
         if (den > 0) {
-            settings_.exposureNs = std::clamp<int64_t>(int64_t(1e9 / den * 1000),
+            settings_.exposureNs = std::clamp<int64_t>(int64_t(1e9 / den),
                                                        t.exposureMinNs, t.exposureMaxNs);
-            settings_.aeOn = false;
+            ssAuto_ = false;
+            recomputeMixed();
             changed = true;
         }
     } else if (k == "ev") {
@@ -969,9 +989,8 @@ void CameraEngine::drainUiCmds() {
 }
 
 // ISO/SS 混合模式状态机（见 CameraEngine.h 注释）。
-// 冻结基准：AE on 期间 onFrameResult 持续跟踪 lastAeIso_/lastAeExpNs_；
-// 转 AE off（任一参数手动）后冻结值不再更新，混合模式下自动参数 = 冻结值 × 2^EV。
-// EV 步长来自 traits（本机 1/3 EV）。
+// 曝光守恒锚点：AE on 期间 onFrameResult 持续跟踪 lastAeIso_/lastAeExpNs_；
+// 转 AE off（任一参数手动）后冻结值不再更新。EV 步长来自 traits（本机 1/3 EV）。
 void CameraEngine::recomputeMixed() {
     const auto& t = cam_.traits();
     if (isoAuto_ && ssAuto_) {                       // 双自动：整块交给硬件 AE
@@ -982,17 +1001,47 @@ void CameraEngine::recomputeMixed() {
     }
     settings_.aeOn = false;
     const double gain = std::pow(2.0, double(settings_.evSteps) * t.evStep);
-    if (isoAuto_) {
-        const int base = lastAeIso_ > 0 ? lastAeIso_
-                                        : (settings_.iso > 0 ? settings_.iso : t.isoMin);
-        settings_.iso = std::clamp(int(std::lround(base * gain)), t.isoMin, t.isoMax);
+    // 曝光守恒模型（ISO 优先 / 快门优先）：转混合时刻的 AE 解乘积
+    // P = lastAeIso_ × lastAeExpNs_（∝ AE 目标曝光量）。
+    //   自动参数 = P / 手动参数 × 2^EV —— 手动 ISO/SS 动 → 自动侧反比补偿（亮度恒定），
+    //   EV 动 → 自动侧整体 ×2^EV；EV=0 且手动=冻结值时恰好回到 AE 解。
+    //   量程钳制后守恒被破坏属物理极限（诚实降级）。
+    if (lastAeIso_ > 0 && lastAeExpNs_ > 0) {
+        if (isoAuto_) {
+            const double ss =
+                double(settings_.exposureNs > 0 ? settings_.exposureNs : t.exposureMinNs);
+            settings_.iso =
+                std::clamp(int(std::lround(double(lastAeIso_) * double(lastAeExpNs_) / ss *
+                                           gain)),
+                           t.isoMin, t.isoMax);
+        }
+        if (ssAuto_) {
+            const double iso = double(settings_.iso > 0 ? settings_.iso : t.isoMin);
+            settings_.exposureNs = std::clamp<int64_t>(
+                std::lround(double(lastAeExpNs_) * double(lastAeIso_) / iso * gain),
+                t.exposureMinNs, t.exposureMaxNs);
+        }
+    } else {
+        // 冷启动尚未收到 AE 帧：退化为单参数基准（无交叉联动）
+        if (isoAuto_) {
+            const int base = settings_.iso > 0 ? settings_.iso : t.isoMin;
+            settings_.iso = std::clamp(int(std::lround(base * gain)), t.isoMin, t.isoMax);
+        }
+        if (ssAuto_) {
+            const int64_t base =
+                settings_.exposureNs > 0 ? settings_.exposureNs : t.exposureMinNs;
+            settings_.exposureNs = std::clamp<int64_t>(int64_t(std::lround(base * gain)),
+                                                       t.exposureMinNs, t.exposureMaxNs);
+        }
     }
-    if (ssAuto_) {
-        const int64_t base = lastAeExpNs_ > 0 ? lastAeExpNs_
-                            : (settings_.exposureNs > 0 ? settings_.exposureNs : t.exposureMinNs);
-        settings_.exposureNs = std::clamp<int64_t>(int64_t(std::lround(base * gain)),
-                                                   t.exposureMinNs, t.exposureMaxNs);
+    // 计算结果回推 UI：自动侧读数/滚轮即时跟随（EV/手动参数变化的联动反馈）
+    if (ui_) {
+        if (isoAuto_) ui_->setAutoIso(settings_.iso);
+        if (ssAuto_) ui_->setAutoSsUs(settings_.exposureNs / 1000);
     }
+    LOGI("mixed: isoAuto=%d ssAuto=%d iso=%d exp=%lldns ev=%d(gain=%.2f)",
+         static_cast<int>(isoAuto_), static_cast<int>(ssAuto_), settings_.iso,
+         static_cast<long long>(settings_.exposureNs), settings_.evSteps, gain);
 }
 
 void CameraEngine::triggerBurst() {
