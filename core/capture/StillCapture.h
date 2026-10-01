@@ -72,11 +72,16 @@ private:
     int32_t w_ = 0, h_ = 0;
     std::string dir_;
     util::GalleryWriter* gallery_ = nullptr;
-    int seq_ = 0;
 
     mutable std::mutex m_;
     std::deque<JpegFrame> saveQ_;
-    std::deque<StillParams> pending_;   // 已登记待到帧的快门快照
+    // 已登记待到帧的快门快照（含登记时刻；超时未到帧自动作废 —— 物理 JPEG 流
+    // 单拍若被 HAL 拒绝交付，pending 会永远挂住「正在保存」进度）
+    struct PendingShot {
+        StillParams params;
+        int64_t expectMs = 0;
+    };
+    std::deque<PendingShot> pending_;
     std::condition_variable cv_;
     bool stop_ = false;
     std::unique_ptr<StillProcessor> proc_;

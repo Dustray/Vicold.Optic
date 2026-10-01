@@ -99,6 +99,12 @@ private:
     std::unique_ptr<CaptureSession> session_;
     std::unique_ptr<RawCapture> raw_;
     std::unique_ptr<StillCapture> still_;   // JPEG 通路（与 raw_ 互斥挂会话输出）
+    // 超广角物理 JPEG 通路：超广带（z<1.0）单拍直连物理 3，照片 = 超广原生 FOV
+    //（0.774x），与预览一致。没有它，超广带照片只能走逻辑流下限 1.0x（主摄），
+    // 拍出来比预览广角差一截（2026-09-30 用户报告「照片焦距与预览不一致」）。
+    // HAL 拒绝 5 流会话时自动拆除并记忆（uwStillOk_=false），退回逻辑流照片。
+    std::unique_ptr<StillCapture> stillUw_;
+    bool uwStillOk_ = true;
     // 拍摄格式：true=JPEG（默认，存系统相册） false=RAW/DNG（fmt=raw 切换）。
     // UI 角标点按切换（Cmd::SET_FMT），会话输出目标随之替换（stillWindow），
     // 需重建会话（~300ms）。

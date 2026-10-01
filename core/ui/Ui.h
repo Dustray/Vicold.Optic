@@ -68,25 +68,18 @@ public:
         batt_.init(vm, activity);
     }
 
-    // 引擎线程回传本次快门是否被配额放行（toast 据此给真实反馈）
+    // 引擎线程回传本次快门是否被配额放行（失败时据此在 HUD 角标行如实反馈）
     void notifyShot(bool accepted, int used, int total) {
         shotOk_.store(accepted ? 1 : 0, std::memory_order_release);
         shotUsed_.store(used, std::memory_order_release);
         shotTotal_.store(total, std::memory_order_release);
     }
 
-    // 拍照保存进度（引擎每轮转发 StillCapture 的原子量）：inFlight>0 = 正在保存；
-    // 归零且 lastDoneMs 有新值 → 「已保存」短暂展示
+    // 拍照保存进度（引擎每轮转发 StillCapture 的原子量）：inFlight>0 = 正在保存 →
+    // HUD 角标行显示 SAVING；归零即消失（不再弹 toast，2026-10-01 用户要求）
     void notifySaveProgress(int inFlight, int64_t lastDoneMs) {
-        int prev = saveInFlight_.exchange(inFlight, std::memory_order_acq_rel);
-        if (prev > 0 && inFlight == 0 && lastDoneMs != lastDoneSeenMs_) {
-            lastDoneSeenMs_ = lastDoneMs;
-            saveDoneUntil_ =
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count() +
-                1.6;
-        }
+        (void)lastDoneMs;
+        saveInFlight_.store(inFlight, std::memory_order_release);
     }
     // 引擎重建会话/重建 StillCapture 时调用：上会话计数不跨会话卡「正在保存」
     void resetSaveProgress() { saveInFlight_.store(0, std::memory_order_release); }
@@ -249,15 +242,12 @@ private:
     // 动效
     float flashA_ = 0;
     double flashUntil_ = 0;
-    double toastUntil_ = 0;
-    int savedCount_ = 4;                                // toast 文案 n/4
+    double shotMsgUntil_ = 0;   // 失败提示（配额用尽）在 HUD 角标行的展示截止
     std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
     std::atomic<int> shotUsed_{0}, shotTotal_{0};
 
-    // 拍照保存进度（引擎 notifySaveProgress 转发；绘制在 toast 位）
+    // 拍照保存状态（引擎 notifySaveProgress 转发；>0 时 HUD 角标行显示 SAVING）
     std::atomic<int> saveInFlight_{0};   // 正在保存/待到帧的帧数
-    int64_t lastDoneSeenMs_ = 0;         // 上次「已保存」用过的完成戳（去重）
-    double saveDoneUntil_ = 0;           // 「已保存」展示截止（steady 秒）
 
     // 真实电量（Battery JNI 轮询，~30s 一次；失败保持上次值）
     Battery batt_;

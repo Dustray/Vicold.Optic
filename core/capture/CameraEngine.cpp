@@ -267,6 +267,10 @@ void CameraEngine::closeSession() {
         still_->close();
         still_.reset();
     }
+    if (stillUw_) {
+        stillUw_->close();
+        stillUw_.reset();
+    }
     cam_.close();
 }
 
@@ -502,17 +506,32 @@ bool CameraEngine::rebuildSession() {
     // 旧会话 close 后进墓地延迟析构（防止 in-flight 回调 UAF），再建新会话
     retireSession();
 
-    // ---- 多流常驻：L + uw + tele (+RAW) 一次 configure ----
+    // ---- 多流常驻：L + uw + tele (+拍摄流) 一次 configure ----
     if (!multiStreamFailed_) {
+        const auto& t = cam_.traits();
         std::vector<CaptureSession::OutDesc> outs = {{ui_->previewWindow(0), nullptr}};
         if (!uwPhysId_.empty()) outs.push_back({ui_->previewWindow(1), uwPhysId_.c_str()});
         if (!telePhysId_.empty()) outs.push_back({ui_->previewWindow(2), telePhysId_.c_str()});
-        // 拍摄输出互斥：JPEG 模式挂 JPEG，否则挂 RAW（4 流组合不变，防 HAL 拒 5 流）
+        // 拍摄输出互斥：JPEG 模式挂 JPEG，否则挂 RAW（防 HAL 拒 5 流）
         if (jpgMode_) {
             if (still_) outs.push_back({still_->window(), nullptr});
+            // 超广物理 JPEG：超广带单拍直连物理 3，照片 FOV = 预览（WYSIWYG）。
+            // reader 开销极低（不进 repeating），会话多一路输出而已。
+            if (still_ && uwStillOk_ && !uwPhysId_.empty()) {
+                if (!stillUw_) {
+                    stillUw_ = std::make_unique<StillCapture>();
+                    stillUw_->setGallery(&gallery_);
+                    if (!stillUw_->create(t.pixelW, t.pixelH, dataDir_)) {
+                        LOGE("uw jpeg reader create failed");
+                        stillUw_.reset();
+                    }
+                }
+                if (stillUw_) outs.push_back({stillUw_->window(), uwPhysId_.c_str()});
+            }
         } else if (raw_) {
             outs.push_back({raw_->window(), nullptr});
         }
+        const size_t nFull = outs.size();
         if (sess->create(cam_.handle(), outs)) {
             session_ = std::move(sess);
             multiStream_ = true;
@@ -522,6 +541,24 @@ bool CameraEngine::rebuildSession() {
                  telePhysId_.c_str(), raw_ ? "+RAW" : "");
             commitSession(false);
             return true;
+        }
+        // HAL 拒绝组合：先怀疑 5 流（uw still 是唯一"多余"输出）—— 拆掉重试 4 流，
+        // 不能直接砸进单流降级（那会丢掉整个多摄架构）。4 流也拒才走降级。
+        if (stillUw_ && outs.size() == nFull) {
+            LOGW("session rejected, retrying without uw-jpeg stream");
+            stillUw_->close();
+            stillUw_.reset();
+            uwStillOk_ = false;   // 本 ROM 拒 5 流，记忆住不再尝试
+            outs.pop_back();
+            if (sess->create(cam_.handle(), outs)) {
+                session_ = std::move(sess);
+                multiStream_ = true;
+                sessionSig_.clear();
+                physBand_ = activePhysId();
+                LOGI("multi-stream session created (4 outputs, uw-jpeg dropped)");
+                commitSession(false);
+                return true;
+            }
         }
         LOGE("multi-stream session rejected by HAL, falling back to single-stream rebuilds");
         multiStreamFailed_ = true;
@@ -946,10 +983,14 @@ void CameraEngine::recomputeMixed() {
 
 void CameraEngine::triggerBurst() {
     // ---- JPEG 模式：单拍请求（repeating 不带 JPEG 流，快门时才让 ISP 编码一帧）----
-    // 曝光/AE/对焦沿用当前会话设置；zoom 钳在逻辑流安全带内（物理带时 JPEG 来自
-    // 逻辑主摄，FOV 上限 ~kLogicalSafeMax，超出部分预览是物理流/数字裁切）。
+    // 曝光/AE/对焦沿用当前会话设置。FOV 与预览严格一致（WYSIWYG，2026-09-30）：
+    //   超广带 → uw 物理流单拍，逻辑 zoom 写 1.0（物理流继承裁切，quirk 之二），
+    //     照片 = uw 原生 0.774x；导轨最底 0.70–0.774 段预览也画不出更广（crop 钳 1）。
+    //   其余 → 逻辑流单拍，zoom 写 min(z, kLogicalSafeMax)。z ≤ 4.85 时照片 FOV 即
+    //     预览 FOV；超出部分（长焦带高倍 / 超广带微差）由 WysiwygCropProcessor 软件
+    //     中心裁切补齐 —— 预览那部分本来就是 GL 数字裁切，照片同口径。
     if (jpgMode_) {
-        if (!still_ || !session_ || !session_->valid()) {
+        if (!session_ || !session_->valid()) {
             LOGW("jpeg unavailable");
             if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
             return;
@@ -959,19 +1000,40 @@ void CameraEngine::triggerBurst() {
             if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
             return;
         }
+        const float z = settings_.zoomRatio <= 0.f ? 1.0f : settings_.zoomRatio;
+        // 超广带判定复用显示源状态机（含滞回：z∈[1.0,1.03) 预览仍在超广带）。
+        // 该段照片 = uw 原生 0.774，比预览（GL crop 到 z）略广，超出部分同样由
+        // WysiwygCropProcessor 中心裁切补齐 —— 全程统一 WYSIWYG。
+        const bool uwShot = uwAllowed_ && stillUw_ && !uwPhysId_.empty() &&
+                            activePhysId() == uwPhysId_;
+        StillParams p = makeStillParams();
         CaptureSettings s = settings_;
-        s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f,
-                                 kLogicalSafeMax);
-        still_->expectShot(makeStillParams());
-        if (!session_->captureOnce({still_->window()}, s)) {
-            still_->cancelShot();
-            LOGE("jpeg captureOnce failed");
-            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
-            return;
+        if (uwShot) {
+            s.zoomRatio = 1.0f;   // 逻辑键 1.0 → uw 物理流继承 = 原生 FOV（0.774）
+            p.appliedZoom = uwNativeZoom_;
+            stillUw_->expectShot(p);
+            if (!session_->captureOnce({stillUw_->window()}, s)) {
+                stillUw_->cancelShot();
+                LOGE("jpeg captureOnce failed (uw physical)");
+                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+                return;
+            }
+        } else {
+            const float applied = std::clamp(z, 1.0f, kLogicalSafeMax);
+            s.zoomRatio = applied;
+            p.appliedZoom = applied;
+            still_->expectShot(p);
+            if (!session_->captureOnce({still_->window()}, s)) {
+                still_->cancelShot();
+                LOGE("jpeg captureOnce failed");
+                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+                return;
+            }
         }
         ++savesUsed_;
         if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_);
-        LOGI("shutter triggered [jpg single] (%d/%d)", savesUsed_, saveQuota_);
+        LOGI("shutter triggered [jpg single %s] z=%.2f applied=%.2f (%d/%d)",
+             uwShot ? "uw" : "logical", z, p.appliedZoom, savesUsed_, saveQuota_);
         return;
     }
     if (!raw_ || !raw_->ringMode()) {

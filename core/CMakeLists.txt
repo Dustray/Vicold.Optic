@@ -7,6 +7,7 @@ add_library(optic_core STATIC
     capture/CaptureSession.cpp
     capture/RawCapture.cpp
     capture/StillCapture.cpp
+    capture/StillProcessor.cpp
     capture/CameraEngine.cpp
     dng/DngWriter.cpp
     util/Gallery.cpp

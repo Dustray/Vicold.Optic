@@ -12,6 +12,17 @@
 #include <fstream>
 
 namespace optic::capture {
+namespace {
+
+// 跨实例全局序列号：主摄/超广两路 JPEG reader 各持一个 StillCapture，各自从 0 起
+// 计数会在同一毫秒内撞名（IMG_<ms>_000），MediaStore 会重名。全局递增根治。
+std::atomic<int> g_seq{0};
+
+// 登记超时：单拍请求提交后 6s 未到帧即作废（物理流被 HAL 拒绝交付的兜底，
+// 防止「正在保存…」胶囊永久卡住）
+constexpr int64_t kPendingTimeoutMs = 6000;
+
+} // namespace
 
 bool StillCapture::create(int32_t w, int32_t h, const std::string& saveDir, int maxImages) {
     w_ = w;
@@ -30,7 +41,9 @@ bool StillCapture::create(int32_t w, int32_t h, const std::string& saveDir, int 
         LOGE("StillCapture setImageListener failed");
         return false;
     }
-    setProcessor(std::make_unique<PassThroughProcessor>());
+    // WYSIWYG 裁切为默认阶段：长焦带高倍（逻辑流 zoom 钳 ≤4.85）照片中心裁切到
+    // 预览 FOV；差异可忽略时内部直通（保 EXIF）。滤镜系统后续替换/串联此阶段。
+    setProcessor(std::make_unique<WysiwygCropProcessor>());
     saver_ = std::thread([this] { saverLoop(); });
     LOGI("jpeg reader ready: %dx%d maxImages=%d dir=%s", w, h, maxImages, saveDir.c_str());
     return true;
@@ -63,7 +76,10 @@ ANativeWindow* StillCapture::window() {
 
 void StillCapture::expectShot(const StillParams& params) {
     std::lock_guard<std::mutex> l(m_);
-    pending_.push_back(params);
+    pending_.push_back(
+        {params, std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()});
     inFlight_.fetch_add(1, std::memory_order_acq_rel);
     LOGI("jpeg shot pending: %d in flight", inFlight_.load(std::memory_order_relaxed));
 }
@@ -85,7 +101,7 @@ void StillCapture::onImage(AImage* img) {
     }
     int64_t ts = 0;
     AImage_getTimestamp(img, &ts);
-    saveQ_.push_back({img, ts, pending_.front()});
+    saveQ_.push_back({img, ts, pending_.front().params});
     pending_.pop_front();
     cv_.notify_one();
 }
@@ -95,8 +111,20 @@ void StillCapture::saverLoop() {
         JpegFrame f;
         {
             std::unique_lock<std::mutex> l(m_);
-            cv_.wait(l, [this] { return stop_ || !saveQ_.empty(); });
+            // 带超时等待：醒来的另一个职责是清理超时未到帧的登记
+            cv_.wait_for(l, std::chrono::milliseconds(500),
+                         [this] { return stop_ || !saveQ_.empty(); });
+            const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
+            while (!pending_.empty() && nowMs - pending_.front().expectMs > kPendingTimeoutMs) {
+                LOGE("still shot timeout (%.1fs), aborting pending save",
+                     kPendingTimeoutMs / 1000.0);
+                pending_.pop_front();
+                inFlight_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             if (stop_ && saveQ_.empty()) return;
+            if (saveQ_.empty()) continue;
             f = std::move(saveQ_.front());
             saveQ_.pop_front();
         }
@@ -140,13 +168,13 @@ void StillCapture::saverLoop() {
                       .count();
         char name[80];
         snprintf(name, sizeof(name), "IMG_%lld_%03d.jpg", static_cast<long long>(ms),
-                 seq_++);
+                 g_seq.fetch_add(1, std::memory_order_relaxed));
 
         // 首选：MediaStore 贡献到 DCIM/Camera（与系统相机同目录，相册可见）
         if (gallery_ && gallery_->ok() &&
             gallery_->saveJpeg(name, sf.blob.data(), sf.blob.size())) {
             LOGI("jpg saved to gallery/DCIM: %s (%d KB, %dx%d)", name,
-                 int(sf.blob.size() / 1024), w_, h_);
+                 int(sf.blob.size() / 1024), sf.w, sf.h);
             finish(true);
             continue;
         }
@@ -160,7 +188,7 @@ void StillCapture::saverLoop() {
             continue;
         }
         LOGI("jpg saved: %s (%d KB, %dx%d)", path.c_str(), int(sf.blob.size() / 1024),
-             w_, h_);
+             sf.w, sf.h);
         finish(true);
     }
 }

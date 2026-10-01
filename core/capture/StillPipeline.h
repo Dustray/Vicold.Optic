@@ -19,7 +19,13 @@ namespace optic::capture {
 
 // 快门时刻的拍摄参数快照（引擎在 triggerBurst 时填充）
 struct StillParams {
-    float zoom = 1.f;          // 用户倍率（导轨值）
+    float zoom = 1.f;          // 用户倍率（导轨值，= 预览显示 FOV）
+    float appliedZoom = 1.f;   // 实际出图的等效倍率（照片 FOV 的真值）：
+                               //   逻辑流单拍 = 钳制后写进 HAL 的 zoom（≤4.85）；
+                               //   超广物理流单拍 = uwNativeZoom（原生 0.774）。
+                               // WysiwygCropProcessor 据 zoom/appliedZoom 补软件裁切，
+                               // 使照片 FOV 与预览严格一致（长焦带高倍曾是
+                               // 「预览 10x、照片 4.85x」的根因，2026-09-30）。
     int iso = 0;               // 实际生效 ISO（自动时 = AE 冻结值）
     int64_t exposureNs = 0;    // 实际生效曝光时间（自动时 = AE 冻结值）
     int evSteps = 0;           // EV 补偿步数
@@ -49,6 +55,16 @@ public:
 class PassThroughProcessor final : public StillProcessor {
 public:
     bool process(StillFrame&) override { return true; }
+};
+
+// WYSIWYG 裁切：照片 FOV 对齐预览显示。逻辑流单拍的 zoom 被钳在安全带内
+//（≤kLogicalSafeMax=4.85，融合管线坏区之上），长焦带高倍预览靠 GL 数字裁切显示
+// zoom_，照片若不补裁切就会比预览广（z=10 时照片只有 4.85x）。差异 >0.2% 时
+// 中心裁切 zoom/appliedZoom 并重编码；否则直通（保留 HAL EXIF 与原画质）。
+// 实现（stb 解码/编码）在 StillProcessor.cpp —— 头文件保持无依赖。
+class WysiwygCropProcessor final : public StillProcessor {
+public:
+    bool process(StillFrame& f) override;
 };
 
 } // namespace optic::capture

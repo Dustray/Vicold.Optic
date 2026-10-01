@@ -55,36 +55,51 @@ constexpr Rgba kWhite{1, 1, 1, 1};
 constexpr Rgba kNone{0, 0, 0, 0};
 
 // 左导轨（面板位置运行时自适应，见 railLX_；轨道右缘 = 面板右缘）
-// 布局左移 + 全出血（2026-09-30）：挖孔真身只占设计 x<88 的窄条（y 337–380），
-// 变焦轨道从 92 起完全避开；预览 198 起，右侧与右导轨间留 22 设计 px。
+// 全出血（2026-09-30）：窗口 frame 已是整屏 2656，布局不必再整块右移避让 150px 黑条。
+// 2026-10-01 布局左移 20（预览/AF）：先后尝试轨道宽 64 / 左压 64，最终因真孔吃掉轨道
+// 左侧而定在「X=88 压 cutout 包络边界 + 宽 80」，详见 kZoomTrackX 注释。
 constexpr float kSafeW = 80;                  // 挖孔避让区（横向溢出时的裁切带宽）
-constexpr float kRailREnd = 192;              // 左导轨面板/轨道公共右缘
-constexpr float kZoomTrackX = 92, kZoomTrackY = 130, kZoomTrackW = 100, kZoomTrackH = 448;
-constexpr float kReadoutY = 104;              // 焦距读数行顶
-constexpr float kUnitBtnD = 66;               // mm/× 单位切换按钮（圆形，滚轮下方）
-constexpr float kUnitBtnY = 592;              // 圆顶
-// 预览区
-constexpr float kPreviewX = 198, kPreviewY = 0, kPreviewW = 960, kPreviewH = 720;
+constexpr float kRailREnd = 168;              // 左导轨面板/轨道公共右缘
+// 变焦轨道：官方文档保守 vs 真孔（2026-10-01 实测三轮）
+// 系统声明 cutout = 竖屏 Rect(573,0-647,150)（DisplayCutout.insets/boundingRect/
+// cutoutSpec "M 0,0 H -37 V 150 H 37 V 0 H 0 Z"），横屏后 = 紧贴左缘、深 150 设备px
+// → 设计 x 0–88。X=64 实测**真孔确把轨道左侧吃掉**（中心确认区正好落在孔的 y 带
+// 336–380 上）→ 说明这块保守包络基本都是黑的，**左缘硬下限 = 88**，不可再往左。
+// 当前取值 X=88（压包络边界）、宽恢复 80（88–168），与预览 178 留 10px。
+// 若嫌离预览太近：只能缩 kZoomTrackW（例如 74 → 间隙 16px），不要动 X。
+constexpr float kZoomTrackX = 88, kZoomTrackY = 130, kZoomTrackW = 80, kZoomTrackH = 448;
+// 三滚轮上方「实时值」的统一排版（2026-10-01：删除静态标题，只留实时预览）
+// 变焦（mm/×）与 ISO、曝光时间三处共用同一基线 / 字号 / 配色规则：
+//   手动 = 强调色 kAccent；自动态跟随 AE = 灰 kT3（只有 ISO / 曝光时间会自动）。
+constexpr float kReadoutY = 100;              // 行顶（ascent）：实测 SS 行含下伸到底 ~130，
+                                              // 与轨道顶 138 留 8px；变焦轨道顶 130 更安全
+constexpr float kReadoutFs = 16.f;            // 字号（×kUiZoom×scale_）
+// 滚轮下方的圆形按钮（三滚轮共用一组规格，2026-10-01 用户要求大小一致）
+// 原两套：mm/× = 66@592、A = 52@596 —— 观感参差。统一为 60@594；
+// 左轨道宽 80、右轨道宽 100，60 均可容纳（可点击热区 = 半径 +8 再外扩）。
+constexpr float kJogBtnD = 60;                // 直径
+constexpr float kJogBtnY = 594;               // 圆顶
+constexpr float kJogBtnFs = 14.f;             // 按钮内文字字号（×kUiZoom×scale_）
+// 预览区（2026-10-01 左移 20：随左导轨改窄；HUD/直方图/保存胶囊均自本值推导）
+constexpr float kPreviewX = 178, kPreviewY = 0, kPreviewW = 960, kPreviewH = 720;
 // HUD
 constexpr float kHudY = 16, kChipH = 26, kChipPadX = 10;
 // 直方图
 constexpr float kHistW = 132, kHistH = 66, kHistY = 52;
-// AF（跟随预览区，保持居中：预览中心 x=678）
-constexpr float kAfX = 626, kAfY = 312, kAfSize = 104, kAfTagY = 264;
+// AF（跟随预览区，保持居中：预览中心 x=658）
+constexpr float kAfX = 606, kAfY = 312, kAfSize = 104, kAfTagY = 264;
 // EV 面板（跟随预览区左移：面板 = 预览左缘 + 24）
-constexpr float kEvPanelX = 222, kEvPanelY = 622, kEvPanelW = 520, kEvPanelH = 84;
-constexpr float kEvTrackX = 234, kEvTrackW = 476, kEvTrackY = 664, kEvTrackH = 24;
-// 右导轨（滑轨宽 100；整组左移拉开与快门的距离：SS 滑轨右缘 1380 ↔ 快门左缘 1410）
-constexpr float kRailRX = 1156, kRailRW = 380;
+constexpr float kEvPanelX = 202, kEvPanelY = 622, kEvPanelW = 520, kEvPanelH = 84;
+constexpr float kEvTrackX = 214, kEvTrackW = 476, kEvTrackY = 664, kEvTrackH = 24;
+// 右导轨（滑轨宽 100；整组左移拉开与快门的距离：SS 滑轨右缘 1380 ↔ 快门左缘 1410）。
+// 面板宽到设计右缘 1560（=404）：短 24px 会在屏幕右缘露一条 GL 清屏黑缝，
+// 比面板底色 #0A0A0C 更黑，看着像遮挡条（2026-10-01 用户报告）。
+constexpr float kRailRX = 1156, kRailRW = 404;
 constexpr float kIsoTrackX = 1166, kSsTrackX = 1280, kTrackY = 138, kTrackW = 100, kTrackH = 440;
 constexpr float kDivX = 1273, kDivY = 260, kDivH = 200;
 constexpr float kShutterX = 1410, kShutterY = 318, kShutterD = 106;
 constexpr float kAeLockD = 54;                // 测光锁定按钮（快门上方圆形）
 constexpr float kAeLockY = 238;               // 圆顶（与快门间距 26）
-constexpr float kAutoBtnD = 52;               // ISO/SS 的 A 自动按钮（滚轮下方圆形）
-constexpr float kAutoBtnY = 596;              // 圆顶
-constexpr float kLabelY = 100;                // 标签行顶（小字）
-constexpr float kValueY = 116;                // 选中值行顶（大字，滚轮上方——用户指定）
 constexpr float kUiZoom = 1.5f;               // UI 整体放大系数：文字 / 按钮 / 滑块统一放大
 } // namespace layout
 
@@ -132,7 +147,10 @@ bool Ui::attach(ANativeWindow* win) {
     // 剩余再两侧均分——这样无论系统为挖孔保留多宽，快门都不会被裁；纵向溢出两侧均分。
     scale_ = std::max(float(gl_.width()) / kStageW, float(gl_.height()) / kStageH);
     float overflowX = kStageW * scale_ - float(gl_.width());
-    if (overflowX > 0) {
+    // 容差 1px：全出血时 2656/1560 的浮点乘回 ≈ +0.0002px，会把下面分支误判成
+    // 「未全出血」→ railLX_=80，左侧避让区整条露黑（用户所见遮挡条，2026-10-01）。
+    // 真实的挖孔保留宽度 ~150px，1px 容差不会误入 else。
+    if (overflowX > 1.f) {
         float left = std::min(overflowX, kSafeW * scale_);
         offX_ = -(left + (overflowX - left) / 2.f);
         // 有横向溢出（系统仍保留挖孔条，窗口未全出血）：面板从裁切线起，
@@ -239,8 +257,8 @@ void Ui::onDown(float x, float y, double tMs) {
     // ISO/SS 的 A 自动按钮（滚轮下方圆形）：点按切回自动（值交还 AE + EV 驱动）
     for (int s = 0; s < 2; ++s) {
         const float bcx = (s == 0 ? kIsoTrackX : kSsTrackX) + kTrackW / 2;
-        const float bcy = kAutoBtnY + kAutoBtnD / 2;
-        if (std::hypot(x - bcx, y - bcy) <= kAutoBtnD / 2 + 8) {
+        const float bcy = kJogBtnY + kJogBtnD / 2;
+        if (std::hypot(x - bcx, y - bcy) <= kJogBtnD / 2 + 8) {
             const bool toAuto = !(s == 0 ? isoAuto_ : ssAuto_);
             if (s == 0) isoAuto_ = toAuto; else ssAuto_ = toAuto;
             pushCmd(s == 0 ? Cmd::SET_ISO_AUTO : Cmd::SET_SS_AUTO, toAuto ? 1.f : 0.f);
@@ -291,8 +309,8 @@ void Ui::onDown(float x, float y, double tMs) {
     }
     // mm/× 单位切换（滚轮下方圆形点按按钮）
     {
-        const float ux = kZoomTrackX + kZoomTrackW / 2, uy = kUnitBtnY + kUnitBtnD / 2;
-        if (std::hypot(x - ux, y - uy) <= kUnitBtnD / 2 + 8) {
+        const float ux = kZoomTrackX + kZoomTrackW / 2, uy = kJogBtnY + kJogBtnD / 2;
+        if (std::hypot(x - ux, y - uy) <= kJogBtnD / 2 + 8) {
             zoomUnit_ ^= 1;   // mm / × 切换
             hap_.click();
             return;
@@ -463,8 +481,7 @@ void Ui::onUp(float x, float y) {
                 shotOk_.store(-1, std::memory_order_release);   // 等引擎回执
                 pushCmd(Cmd::SHOT, 0);
                 flashUntil_ = now + 0.10;
-                toastUntil_ = now + 1.5;
-                savedCount_ = kRingFrames;
+                shotMsgUntil_ = now + 1.5;   // 仅失败（配额用尽）时用于角标提示时长
             }
         }
         shutterDown_ = false;
@@ -670,7 +687,7 @@ void Ui::drawHistogram(float x, float y, float w, float h) {
 // 滚轮下方 A 键切回自动，自动参数由 EV 补偿驱动）
 void Ui::drawTracks() {
     struct VSlider {
-        float tx; const char* label; const char* value;
+        float tx; const char* value;
         int idx, n; bool slash; const float* stops;
         int stride;   // 带数字的整档间隔：ISO=1；SS=3（1/3 EV 细分，中间档只画短刻度）
         bool a;       // 自动态
@@ -694,18 +711,15 @@ void Ui::drawTracks() {
     else
         snprintf(ssVal, sizeof(ssVal), "1/%.4g s", (double)(1.f / kSsStops[ssIdx_]));
 
+    // 去掉静态标题（2026-10-01 用户要求）：三个滚轮上方只留**实时值**，风格统一
     const VSlider sliders[2] = {
-        {kIsoTrackX, "ISO", isoVal, isoIdx_, kIsoStopsN, false, kIsoStops, 1, isoAuto_},
-        {kSsTrackX, "\xe6\x9b\x9d\xe5\x85\x89\xe6\x97\xb6\xe9\x97\xb4", ssVal, ssIdx_,
-         kSsStopsN, true, kSsStops, 3, ssAuto_},
+        {kIsoTrackX, isoVal, isoIdx_, kIsoStopsN, false, kIsoStops, 1, isoAuto_},
+        {kSsTrackX, ssVal, ssIdx_, kSsStopsN, true, kSsStops, 3, ssAuto_},
     };
 
     for (int s = 0; s < 2; ++s) {
         const VSlider& v = sliders[s];
         float cx = v.tx + kTrackW / 2;
-        // 标签（小字，最上）
-        float lw = gl_.textWidth(v.label, 11 * kUiZoom * scale_);
-        gl_.text(v.label, screenX(cx) - lw / 2, screenY(kLabelY), 11 * kUiZoom * scale_, kT3);
 
         // 轨道 + 中心确认刻度盘（档位刻度，拖动连续滚动）
         gl_.roundedRect(screenX(v.tx), screenY(kTrackY), dim(kTrackW), dim(kTrackH),
@@ -734,23 +748,24 @@ void Ui::drawTracks() {
         drawRollerV(screenX(v.tx), screenY(kTrackY), dim(kTrackW), dim(kTrackH),
                     curF, items, n, v.a);
 
-        // 选中值（滚轮上方大字，用户指定）：自动=灰显 AE 实测值；手动=强调色用户值
-        float vw = gl_.textWidth(v.value, 13 * kUiZoom * scale_);
-        gl_.text(v.value, screenX(cx) - vw / 2, screenY(kValueY), 13 * kUiZoom * scale_,
+        // 实时值（滚轮上方，三滚轮统一字号/基线/配色，见 kReadoutFs）
+        const float rfs = kReadoutFs * kUiZoom * scale_;
+        float vw = gl_.textWidth(v.value, rfs);
+        gl_.text(v.value, screenX(cx) - vw / 2, screenY(kReadoutY), rfs,
                  v.a ? kT3 : kAccent);
 
         // A 自动按钮（滚轮下方圆形）：自动=强调环+亮字；手动=暗环+暗字
         {
-            const float bx = cx - kAutoBtnD / 2, by = kAutoBtnY;
-            gl_.roundedRect(screenX(bx), screenY(by), dim(kAutoBtnD), dim(kAutoBtnD),
-                            dim(kAutoBtnD / 2), v.a ? Rgba{kAccent.r, kAccent.g, kAccent.b, 0.22f}
+            const float bx = cx - kJogBtnD / 2, by = kJogBtnY;
+            gl_.roundedRect(screenX(bx), screenY(by), dim(kJogBtnD), dim(kJogBtnD),
+                            dim(kJogBtnD / 2), v.a ? Rgba{kAccent.r, kAccent.g, kAccent.b, 0.22f}
                                                     : Rgba{1, 1, 1, 0.04f},
                             v.a ? kAccent : kLine, 1.5f);
-            const float fs = 13.f * kUiZoom * scale_;
+            const float fs = kJogBtnFs * kUiZoom * scale_;
             float aw = gl_.textWidth("A", fs);
             // textCenterTop：按字形实际墨迹居中（ascent 线估算会整体偏上）
             gl_.text("A", screenX(cx) - aw / 2,
-                     gl_.textCenterTop("A", fs, screenY(by + kAutoBtnD / 2)), fs,
+                     gl_.textCenterTop("A", fs, screenY(by + kJogBtnD / 2)), fs,
                      v.a ? kT1 : kT3);
         }
     }
@@ -806,6 +821,29 @@ void Ui::drawPreviewOverlay() {
             }
             x += w + dim(8);
             dx += w / scale_ + 8;
+        }
+
+        // 状态角标（2026-10-01 用户要求）：取代原先浮在预览下方的两个 toast。
+        // 「保存中」常驻到写入完成为止（SAVING 即消失）；只有失败（配额用尽）才短暂
+        // 提示一句，成功态完全安静。
+        const int inFlight = saveInFlight_.load(std::memory_order_acquire);
+        const char* st = nullptr;
+        Rgba sc = kAccent;
+        char quota[32];
+        if (inFlight > 0) {
+            st = "SAVING";
+        } else if (nowSec() < shotMsgUntil_ &&
+                   shotOk_.load(std::memory_order_acquire) == 0) {
+            snprintf(quota, sizeof(quota),
+                     "\xe9\x85\x8d\xe9\xa2\x9d\xe5\xb7\xb2\xe6\xbb\xa1 %d/%d",
+                     shotUsed_.load(std::memory_order_acquire),
+                     shotTotal_.load(std::memory_order_acquire));
+            st = quota;
+        }
+        if (st) {
+            float sw = gl_.textWidth(st, 12 * kUiZoom * scale_) + 2 * dim(kChipPadX);
+            gl_.roundedRect(x, y, sw, dim(kChipH), dim(6), kChipBg, kNone, 0);
+            gl_.text(st, x + dim(kChipPadX), y + dim(5), 12 * kUiZoom * scale_, sc);
         }
     }
 
@@ -1015,19 +1053,22 @@ void Ui::frame() {
     gl_.roundedRect(screenX(railLX_), screenY(0), dim(railLW_), dim(kStageH), 0, kRail,
                     kLine, 1);
     {
+        // 实时焦距 / 倍率：与右侧 ISO、曝光时间共用 kReadoutY / kReadoutFs / 配色
         char buf[16];
         if (zoomUnit_ == 0) snprintf(buf, sizeof(buf), "%dmm", int(std::lround(kZoomBaseMm * zoom_)));
         else snprintf(buf, sizeof(buf), "%.1f\xc3\x97", zoom_);
-        float w = gl_.textWidth(buf, 18 * kUiZoom * scale_);
-        gl_.text(buf, screenX(kZoomTrackX + kZoomTrackW / 2) - w / 2, screenY(kReadoutY),
-                 18 * kUiZoom * scale_, kT1);
+        const float rfs = kReadoutFs * kUiZoom * scale_;
+        float w = gl_.textWidth(buf, rfs);
+        gl_.text(buf, screenX(kZoomTrackX + kZoomTrackW / 2) - w / 2, screenY(kReadoutY), rfs,
+                 kAccent);
     }
 
     // 变焦轨道 + 刻度 + thumb
     gl_.roundedRect(screenX(kZoomTrackX), screenY(kZoomTrackY), dim(kZoomTrackW),
                     dim(kZoomTrackH), dim(20), kTrack, kTrackLine, 1);
-    gl_.roundedRect(screenX(kZoomTrackX + 26), screenY(kZoomTrackY + 20), dim(2),
-                    dim(kZoomTrackH - 40), 0, kTrackLine, kNone, 0);
+    // 分隔线偏移按轨道宽等比（原宽 80 时 = 26），否则收窄后会压到刻度标签上
+    gl_.roundedRect(screenX(kZoomTrackX + kZoomTrackW * 0.325f), screenY(kZoomTrackY + 20),
+                    dim(2), dim(kZoomTrackH - 40), 0, kTrackLine, kNone, 0);
     {
         // 中心确认刻度盘：关键焦段为主刻度（带标签），段间按对数等分插短刻度
         RollItem items[48];
@@ -1054,12 +1095,12 @@ void Ui::frame() {
 
     // 单位切换（mm / ×）：圆形点按按钮，显示当前单位，点按切换
     {
-        const float cx = kZoomTrackX + kZoomTrackW / 2, cy = kUnitBtnY + kUnitBtnD / 2;
-        gl_.roundedRect(screenX(cx - kUnitBtnD / 2), screenY(cy - kUnitBtnD / 2),
-                        dim(kUnitBtnD), dim(kUnitBtnD), dim(kUnitBtnD / 2),
+        const float cx = kZoomTrackX + kZoomTrackW / 2, cy = kJogBtnY + kJogBtnD / 2;
+        gl_.roundedRect(screenX(cx - kJogBtnD / 2), screenY(cy - kJogBtnD / 2),
+                        dim(kJogBtnD), dim(kJogBtnD), dim(kJogBtnD / 2),
                         {1, 1, 1, 0.06f}, kLine, 1.5f);
         const char* t = zoomUnit_ == 0 ? "mm" : "\xc3\x97";
-        const float fs = 15.f * kUiZoom * scale_;
+        const float fs = kJogBtnFs * kUiZoom * scale_;
         const float w = gl_.textWidth(t, fs);
         // textCenterTop：mm（x 高字形）与 ×（数学符号）高度不同，按墨迹精确居中
         gl_.text(t, screenX(cx) - w / 2, gl_.textCenterTop(t, fs, screenY(cy)), fs, kT1);
@@ -1106,50 +1147,7 @@ void Ui::frame() {
         gl_.roundedRect(screenX(kPreviewX), screenY(kPreviewY), dim(kPreviewW),
                         dim(kPreviewH), 0, f, kNone, 0);
     }
-    if (now < toastUntil_) {
-        char t[64];
-        int ok = shotOk_.load(std::memory_order_acquire);
-        if (ok == 0) {
-            // 配额用尽：如实反馈，不假装已保存
-            snprintf(t, sizeof(t),
-                     "\xe9\x85\x8d\xe9\xa2\x9d\xe5\xb7\xb2\xe7\x94\xa8\xe5\xb0\xbd %d/%d",
-                     shotUsed_.load(std::memory_order_acquire),
-                     shotTotal_.load(std::memory_order_acquire));
-        } else if (fmtJpg_) {
-            snprintf(t, sizeof(t),
-                     "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 JPG \xe2\x86\x92 "
-                     "\xe7\x9b\xb8\xe5\x86\x8c");   // 已保存 · JPG → 相册
-        } else {
-            snprintf(t, sizeof(t),
-                     "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 DNG "
-                     "\xe7\x8e\xaf\xe5\xbd\xa2\xe7\xbc\x93\xe5\x86\xb2 %d/%d",
-                     savedCount_, kRingFrames);
-        }
-        float w = gl_.textWidth(t, 11 * kUiZoom * scale_) + dim(28);
-        float tx = screenX(kPreviewX + kPreviewW / 2) - w / 2;
-        float ty = screenY(kStageH - 56);
-        gl_.roundedRect(tx, ty, w, dim(30), dim(15), {0, 0, 0, 0.6f}, {1, 1, 1, 0.12f}, 1);
-        gl_.text(t, tx + dim(14), ty + dim(9), 11 * kUiZoom * scale_, kWhite);
-    }
-    // 保存进度 pill（优先于拍照 toast；正在保存/已保存短暂展示）
-    {
-        const int inFlight = saveInFlight_.load(std::memory_order_acquire);
-        const char* msg = nullptr;
-        if (inFlight > 0) {
-            msg = "\xe6\xad\xa3\xe5\x9c\xa8\xe4\xbf\x9d\xe5\xad\x98\xe2\x80\xa6";   // 正在保存…
-        } else if (now < saveDoneUntil_) {
-            msg = "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98 \xc2\xb7 DCIM/Camera";   // 已保存 · DCIM/Camera
-        }
-        if (msg) {
-            float w = gl_.textWidth(msg, 11 * kUiZoom * scale_) + dim(28);
-            float tx = screenX(kPreviewX + kPreviewW / 2) - w / 2;
-            float ty = screenY(kStageH - 96);   // 拍照 toast 上方一行
-            gl_.roundedRect(tx, ty, w, dim(30), dim(15), {0, 0, 0, 0.6f},
-                            inFlight > 0 ? kAccent : Rgba{1, 1, 1, 0.12f}, 1);
-            gl_.text(msg, tx + dim(14), ty + dim(9), 11 * kUiZoom * scale_, kWhite);
-        }
-    }
-
+    // 拍照反馈已全部收敛到 HUD 角标行（SAVING / 配额提示），此处不再画浮层 toast
     gl_.swap();
 }
 
