@@ -157,6 +157,11 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
  `am start -f 0x10008000 -n com.vicold.optic/android.app.NativeActivity`。
  僵尸 task 症状："brought to the front" 但 ps 无进程。勿用不带 --user 的
  install-existing（会装进 user 10 隐私空间弹权限框卡前台，需 `pm uninstall --user 10` 清）。
+ 杀后台进程可靠组合：`am stack remove <taskId>`（清 task）→ `am kill`——`am kill` 单用
+ 在 MIUI 上经常静默不杀（HOME+idle 20s+ 也一样）。
+* **Gl 字体图集是固定字符集**（Gl.cpp bakeFont 的 `extra` 串）：新增任何 UI 文案必须把
+ 用到的 CJK 字手工加进 `extra`，否则静默丢字形（文字空白、chip 宽度却正常）——混排时
+ 个别字恰好在集合里会造成"渲染正常"的假象，务必逐字核对。
 * **冷重启（改 controls.txt 后需重启生效时）**：`input keyevent 3`(HOME) → 等 8-12s
  → `am kill com.vicold.optic`（只杀安全后台进程，**不触发 MIUI 冻结**）→ 改配置 →
  `am start -f 0x10008000`。am kill 在 HOME 后立刻执行会因"不安全"静默不杀，必须等 idle。

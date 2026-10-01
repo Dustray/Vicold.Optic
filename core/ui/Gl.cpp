@@ -566,8 +566,11 @@ bool Gl::bakeFont(float bakedPx, const std::vector<std::string>& fonts) {
     // 先构建需要光栅化的字符集（不依赖字体，可提前用于覆盖率统计）
     std::set<uint32_t> cps;
     for (uint32_t c = 0x20; c <= 0x7E; ++c) cps.insert(c);
-    // UI 实际用到的全部非 ASCII 字符（字形按需增删，见 Ui.cpp 文案）
-    const std::string extra = "曝光时间补偿就绪已保存环形缓冲摄像头区域对焦拍摄×·";
+    // UI 实际用到的全部非 ASCII 字符（字形按需增删，见 Ui.cpp 文案）。
+    // 2026-10-01 补快门拒绝文案用字：配额满此段不支持相机未失败
+    //（此前"配额已满"的 配/额/满 三字就一直缺失渲染成空位，因角标罕见未被发现）。
+    const std::string extra =
+        "曝光时间补偿就绪已保存环形缓冲摄像头区域对焦拍摄配额满此段不支持相机未失败×·";
     for (size_t i = 0; i < extra.size();) {
         uint32_t cp = uint8_t(extra[i]);
         int n = 1;

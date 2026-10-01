@@ -241,6 +241,7 @@ bool CameraEngine::openSession() {
         }
         if (ui_) ui_->resetSaveProgress();   // 上会话的保存计数不跨会话卡「正在保存」
     }
+    if (ui_) ui_->setShotQuota(saveQuota_);   // 常显「已拍 n/N」角标（controls.txt 可调）
     if (ui_) ui_->setFmtJpg(jpgMode_);   // 引擎是格式真值源（冷启动读 controls.txt 后校正 UI）
     // 会话按当前模式（逻辑广角 / 超广角物理直连）创建
     if (!rebuildSession()) return false;
@@ -863,10 +864,12 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         triggerBurst();
     } else if (k == "save_quota") {
         // controls.txt 每轮都会被重放，值没变就别刷日志（之前每 400ms 一条，把 logcat 淹了）
+        // 0 = 不限制（曾误实现成"禁用所有拍摄"：savesUsed_(0) >= 0 恒真）
         int n = std::max(0, std::atoi(v.c_str()));
         if (n != saveQuota_) {
             saveQuota_ = n;
-            LOGI("save quota = %d triggers per launch", saveQuota_);
+            LOGI("save quota = %d triggers per launch (0 = unlimited)", saveQuota_);
+            if (ui_) ui_->setShotQuota(saveQuota_);
         }
     } else if (k == "ss") {
         // 快门分母（1/x s）→ ns。曾误写 1e9/den*1000（多乘 1000，1/125s 变 8s）。
@@ -889,21 +892,27 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
     } else if (k == "shot_raw") {
         if (!raw_ || raw_->ringMode()) {
             LOGW("shot_raw requires raw_mode=once");
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotNoRawRing);
             return;
         }
-        if (!activePhysId().empty()) {
-            // 物理带 DNG = 主摄逻辑流（zoom 钳 ≤2.5），与预览 FOV 不一致 —— 拒拍是
-            // 诚实行为（ALL 常驻下曾放行过，实测 8x 预览落盘 2.5x FOV DNG，已撤销）
-            LOGW("shot_raw unavailable in physical band (no matching RAW)");
+        if (!activePhysId().empty() ||
+            settings_.zoomRatio > zoomProf_.logicalSafeMax * 1.02f) {
+            // 与 triggerBurst 同口径：物理带 + 近距长焦推迟区间（5-20x）都拿不到
+            // 与预览同 FOV 的 RAW（逻辑流 zoom 钳 logicalSafeMax），诚实拒拍
+            LOGW("shot_raw unavailable beyond logical RAW reach (z=%.2f phys=%s)",
+                 settings_.zoomRatio, activePhysId().c_str());
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotPhysBand);
             return;
         }
-        if (savesUsed_ >= saveQuota_) {
+        if (saveQuota_ > 0 && savesUsed_ >= saveQuota_) {
             LOGW("save quota exhausted (%d/%d) - restart app to reset", savesUsed_, saveQuota_);
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotQuota);
             return;
         }
         ++savesUsed_;
         raw_->requestSingle();
         session_->captureOnce({raw_->window()}, settings_);
+        if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_, ui::Ui::kShotOk);
     } else if (k == "fps_log") {
         forceLog_ = true;
     }
@@ -1055,12 +1064,12 @@ void CameraEngine::triggerBurst() {
     if (jpgMode_) {
         if (!session_ || !session_->valid()) {
             LOGW("jpeg unavailable");
-            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotNoSession);
             return;
         }
-        if (savesUsed_ >= saveQuota_) {
+        if (saveQuota_ > 0 && savesUsed_ >= saveQuota_) {
             LOGW("save quota exhausted (%d/%d) - restart app to reset", savesUsed_, saveQuota_);
-            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+            if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotQuota);
             return;
         }
         const float z = settings_.zoomRatio <= 0.f ? 1.0f : settings_.zoomRatio;
@@ -1079,7 +1088,7 @@ void CameraEngine::triggerBurst() {
             if (!session_->captureOnce({stillUw_->window()}, s)) {
                 stillUw_->cancelShot();
                 LOGE("jpeg captureOnce failed (uw physical)");
-                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotCaptureFail);
                 return;
             }
         } else {
@@ -1090,36 +1099,42 @@ void CameraEngine::triggerBurst() {
             if (!session_->captureOnce({still_->window()}, s)) {
                 still_->cancelShot();
                 LOGE("jpeg captureOnce failed");
-                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+                if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotCaptureFail);
                 return;
             }
         }
         ++savesUsed_;
-        if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_);
+        if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_, ui::Ui::kShotOk);
         LOGI("shutter triggered [jpg single %s] z=%.2f applied=%.2f (%d/%d)",
              uwShot ? "uw" : "logical", z, p.appliedZoom, savesUsed_, saveQuota_);
         return;
     }
     if (!raw_ || !raw_->ringMode()) {
         LOGW("trigger requires raw_mode=ring");
-        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotNoRawRing);
         return;
     }
-    if (!activePhysId().empty()) {
-        // 物理带 DNG = 主摄逻辑流（zoom 钳 ≤2.5），与预览 FOV 不一致 —— 拒拍是
-        // 诚实行为（ALL 常驻下曾放行过，实测 8x 预览落盘 2.5x FOV DNG，已撤销）
-        LOGW("trigger unavailable in physical band (no matching RAW)");
-        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+    if (!activePhysId().empty() ||
+        settings_.zoomRatio > zoomProf_.logicalSafeMax * 1.02f) {
+        // RAW 帧来自 ALL 常驻会话的**逻辑流**输出，FOV = min(z, logicalSafeMax)；
+        // 预览超出部分是 GL 数字裁切，DNG 拿不到同 FOV —— 拒拍是诚实行为。
+        // 两个入口都要挡：① 物理带（超广直连/长焦带，ALL 下曾放行过 8x 预览落
+        // 2.5x FOV DNG）；② 近距长焦推迟区间（teleSwitchEff()=20x，5–20x 时
+        // activePhysId() 为空，仅查 ① 会漏挡 —— 真机实测 z=6 放行，DNG 4.85x
+        // 比预览窄 ~24%，2026-10-01 确诊）。
+        LOGW("trigger unavailable beyond logical RAW reach (z=%.2f max=%.2f phys=%s)",
+             settings_.zoomRatio, zoomProf_.logicalSafeMax, activePhysId().c_str());
+        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotPhysBand);
         return;
     }
-    if (savesUsed_ >= saveQuota_) {
+    if (saveQuota_ > 0 && savesUsed_ >= saveQuota_) {
         LOGW("save quota exhausted (%d/%d) - restart app to reset", savesUsed_, saveQuota_);
-        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_);
+        if (ui_) ui_->notifyShot(false, savesUsed_, saveQuota_, ui::Ui::kShotQuota);
         return;
     }
     ++savesUsed_;
     raw_->shutterBurst(4);
-    if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_);
+    if (ui_) ui_->notifyShot(true, savesUsed_, saveQuota_, ui::Ui::kShotOk);
     LOGI("shutter triggered (%d/%d)", savesUsed_, saveQuota_);
 }
 

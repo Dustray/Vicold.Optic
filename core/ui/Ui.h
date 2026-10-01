@@ -71,10 +71,29 @@ public:
         batt_.init(vm, activity);
     }
 
-    // 引擎线程回传本次快门是否被配额放行（失败时据此在 HUD 角标行如实反馈）
-    void notifyShot(bool accepted, int used, int total) {
+    // 快门拒绝原因（引擎 triggerBurst 回传；UI 据此在 HUD 角标行**如实**反馈——
+    // 2026-10-01 前所有拒绝都误显示"配额已满"，物理带拒拍时误导用户）
+    enum ShotReject : int {
+        kShotOk = 0,          // 接受
+        kShotQuota = 1,       // 配额用尽（本次启动 save_quota 次已拍完）
+        kShotPhysBand = 2,    // 物理带无对应 RAW（DNG 模式下超广角直连/长焦带）
+        kShotNoRawRing = 3,   // RAW ring 未就绪（DNG 模式但 ring 未挂）
+        kShotNoSession = 4,   // 会话未就绪（启动中/跨带重建 ~300ms 窗口）
+        kShotCaptureFail = 5, // captureOnce 下发失败（HAL 拒绝）
+    };
+
+    // 引擎线程回传本次快门结果（失败时带原因，角标行如实显示）
+    void notifyShot(bool accepted, int used, int total, int reason) {
         shotOk_.store(accepted ? 1 : 0, std::memory_order_release);
+        shotReason_.store(accepted ? int(kShotOk) : reason, std::memory_order_release);
         shotUsed_.store(used, std::memory_order_release);
+        shotTotal_.store(total, std::memory_order_release);
+        markDirty();
+    }
+
+    // 引擎注入配额上限（会话就绪时 + controls.txt save_quota 变更时）：
+    // 常显「已拍 n/N」小角标的数据源（N<=0 不显示）
+    void setShotQuota(int total) {
         shotTotal_.store(total, std::memory_order_release);
         markDirty();
     }
@@ -267,6 +286,7 @@ private:
     double shotMsgUntil_ = 0;   // 失败提示（配额用尽）在 HUD 角标行的展示截止
     std::atomic<int> shotOk_{-1};                       // -1 未定 / 0 被拒 / 1 已接受
     std::atomic<int> shotUsed_{0}, shotTotal_{0};
+    std::atomic<int> shotReason_{0};     // ShotReject（上次快门拒绝原因，0=接受）
 
     // 拍照保存状态（引擎 notifySaveProgress 转发；>0 时 HUD 角标行显示 SAVING）
     std::atomic<int> saveInFlight_{0};   // 正在保存/待到帧的帧数

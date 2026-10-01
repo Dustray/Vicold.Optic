@@ -869,26 +869,64 @@ void Ui::drawPreviewOverlay() {
         }
 
         // 状态角标（2026-10-01 用户要求）：取代原先浮在预览下方的两个 toast。
-        // 「保存中」常驻到写入完成为止（SAVING 即消失）；只有失败（配额用尽）才短暂
-        // 提示一句，成功态完全安静。
+        // 「保存中」常驻到写入完成为止（SAVING 即消失）；只有失败才短暂提示一句，
+        // 且文案按**真实拒绝原因**显示（此前一律误报"配额已满"，物理带拒拍时误导）。
         const int inFlight = saveInFlight_.load(std::memory_order_acquire);
         const char* st = nullptr;
         Rgba sc = kAccent;
-        char quota[32];
+        char quota[48];
         if (inFlight > 0) {
             st = "SAVING";
         } else if (nowSec() < shotMsgUntil_ &&
                    shotOk_.load(std::memory_order_acquire) == 0) {
-            snprintf(quota, sizeof(quota),
-                     "\xe9\x85\x8d\xe9\xa2\x9d\xe5\xb7\xb2\xe6\xbb\xa1 %d/%d",
-                     shotUsed_.load(std::memory_order_acquire),
-                     shotTotal_.load(std::memory_order_acquire));
+            switch (shotReason_.load(std::memory_order_acquire)) {
+                case kShotQuota:
+                    snprintf(quota, sizeof(quota),
+                             "\xe9\x85\x8d\xe9\xa2\x9d\xe5\xb7\xb2\xe6\xbb\xa1 %d/%d",
+                             shotUsed_.load(std::memory_order_acquire),
+                             shotTotal_.load(std::memory_order_acquire));
+                    break;
+                case kShotPhysBand:
+                    // DNG 模式下超广角直连/长焦带：物理流无对应 RAW 流（诚实拒拍）
+                    snprintf(quota, sizeof(quota),
+                             "\xe6\xad\xa4\xe7\x84\xa6\xe6\xae\xb5\xe4\xb8\x8d\xe6\x94\xaf\xe6\x8c\x81 RAW");
+                    break;
+                case kShotNoRawRing:
+                    snprintf(quota, sizeof(quota),
+                             "RAW \xe6\x9c\xaa\xe5\xb0\xb1\xe7\xbb\xaa");
+                    break;
+                case kShotNoSession:
+                    // 启动中/跨带重建 ~300ms 窗口内按了快门
+                    snprintf(quota, sizeof(quota),
+                             "\xe7\x9b\xb8\xe6\x9c\xba\xe6\x9c\xaa\xe5\xb0\xb1\xe7\xbb\xaa");
+                    break;
+                default:
+                    snprintf(quota, sizeof(quota),
+                             "\xe6\x8b\x8d\xe6\x91\x84\xe5\xa4\xb1\xe8\xb4\xa5");
+                    break;
+            }
             st = quota;
         }
         if (st) {
             float sw = gl_.textWidth(st, 12 * kUiZoom * scale_) + 2 * dim(kChipPadX);
             gl_.roundedRect(x, y, sw, dim(kChipH), dim(6), kChipBg, kNone, 0);
             gl_.text(st, x + dim(kChipPadX), y + dim(5), 12 * kUiZoom * scale_, sc);
+            x += sw + dim(8);
+        }
+        // 常显配额小角标「已拍 n/N」：快门次数（DNG 一次快门=4 帧，此处计次数）。
+        // N<=0 不显示；每次快门（含被拒）经 notifyShot/setShotQuota 刷新。
+        {
+            const int used = shotUsed_.load(std::memory_order_acquire);
+            const int total = shotTotal_.load(std::memory_order_acquire);
+            if (total > 0) {
+                snprintf(quota, sizeof(quota),
+                         "\xe5\xb7\xb2\xe6\x8b\x8d %d/%d", used, total);
+                const float w = gl_.textWidth(quota, 12 * kUiZoom * scale_) +
+                                2 * dim(kChipPadX);
+                gl_.roundedRect(x, y, w, dim(kChipH), dim(6), kChipBg, kNone, 0);
+                gl_.text(quota, x + dim(kChipPadX), y + dim(5),
+                         12 * kUiZoom * scale_, kT3);
+            }
         }
     }
 

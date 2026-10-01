@@ -130,7 +130,7 @@ private:
     std::atomic<bool> wantRun_{false};
     std::string pendingDataDir_;    // 主线程写、tryStart 读（同线程），无竞争
 
-    // 每启动拍摄配额（硬盘保护；save_quota=N 可放宽，0=禁用）
+    // 每启动拍摄配额（硬盘保护；save_quota=N 可调，0=不限制——曾误实现为"禁用所有拍摄"）
     // 8 次 ≈ 8×4 张 DNG ≈ 0.8GiB 上限；真机调参走 controls.txt: save_quota=N
     int saveQuota_ = 8;
     int savesUsed_ = 0;
