@@ -861,12 +861,46 @@ void Ui::drawPreviewOverlay() {
         }
     }
 
-    // 预览帧率（芯片行下方，跟芯片文字同字号）
+    // 预览帧率 + CPU/GPU 监控（芯片行下方，跟芯片文字同字号）。
+    // SysMon 通用 sysfs 探测（机型无关）：读不到的项显示 "--"。
     if (fpsValue_ > 0.f) {
         char ftxt[16];
         snprintf(ftxt, sizeof(ftxt), "%.0f FPS", fpsValue_);
-        gl_.text(ftxt, screenX(kPreviewX + 16), screenY(kHudY + kChipH + 8),
-                 12 * kUiZoom * scale_, kT2);
+        const float fs = 12 * kUiZoom * scale_;
+        const float fx = screenX(kPreviewX + 16);
+        const float fy = screenY(kHudY + kChipH + 8);
+        gl_.text(ftxt, fx, fy, fs, kT2);
+
+        const auto& sm = sys_.last();
+        char cF[10], cT[10], gF[10], gT[10], gB[10];
+        if (sm.cpuMaxMHz > 0.f) {
+            snprintf(cF, sizeof(cF), "%.2fG", sm.cpuMaxMHz / 1000.f);
+        } else {
+            snprintf(cF, sizeof(cF), "--");
+        }
+        if (sm.cpuTempC >= 0.f) {
+            snprintf(cT, sizeof(cT), "%.0fC", sm.cpuTempC);
+        } else {
+            snprintf(cT, sizeof(cT), "--");
+        }
+        if (sm.gpuMHz > 0.f) {
+            snprintf(gF, sizeof(gF), "%.2fG", sm.gpuMHz / 1000.f);
+        } else {
+            snprintf(gF, sizeof(gF), "--");
+        }
+        if (sm.gpuTempC >= 0.f) {
+            snprintf(gT, sizeof(gT), "%.0fC", sm.gpuTempC);
+        } else {
+            snprintf(gT, sizeof(gT), "--");
+        }
+        if (sm.gpuBusyPct >= 0.f) {
+            snprintf(gB, sizeof(gB), "%.0f%%", sm.gpuBusyPct);
+        } else {
+            snprintf(gB, sizeof(gB), "--");
+        }
+        char ptxt[96];
+        snprintf(ptxt, sizeof(ptxt), "CPU %s %s  GPU %s %s %s", cF, cT, gF, gT, gB);
+        gl_.text(ptxt, fx + gl_.textWidth(ftxt, fs) + dim(14), fy, fs, kT2);
     }
 
     // 时钟 + 电池（真实电量：Battery JNI 轮询，30s 刷新；失败保持上次值）
@@ -1013,6 +1047,9 @@ void Ui::frame() {
                 fpsValue_ = float(double(cnt - fpsLastCnt_) / (t - fpsLastT_));
                 fpsLastT_ = t;
                 fpsLastCnt_ = cnt;
+                // CPU/GPU 监控与 fps 同步（2Hz）；置脏让覆盖层把新值烤进去
+                sys_.sample();
+                markDirty();
             }
         }
     }

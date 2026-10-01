@@ -22,6 +22,7 @@
 #include "core/ui/Battery.h"
 #include "core/ui/Gl.h"
 #include "core/ui/Haptics.h"
+#include "core/ui/SysMon.h"
 
 namespace optic::ui {
 
@@ -289,6 +290,8 @@ private:
     double fpsLastT_ = 0;
     int64_t fpsLastCnt_ = 0;
     float fpsValue_ = 0.f;
+    // CPU/GPU 频率/温度 sysfs 监控（HUD 与 fps 同行；与 fps 同步 2Hz 采样）
+    SysMon sys_;
 
     // 直方图
     int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};

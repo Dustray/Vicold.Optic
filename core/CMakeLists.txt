@@ -15,6 +15,7 @@ add_library(optic_core STATIC
     ui/Gl.cpp
     ui/Haptics.cpp
     ui/Battery.cpp
+    ui/SysMon.cpp
     ui/Ui.cpp
 )
 
