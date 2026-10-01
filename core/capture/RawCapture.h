@@ -4,8 +4,9 @@
 //  - ring（默认，ZSL）：repeating 请求常驻 RAW 目标，缓存最近 4 帧；快门回溯保存
 //  - once：repeating 不含 RAW，单拍时临时加 RAW 目标，收到即存
 // 保存：DNG（TIFF/CFA + 缩略图 + 全 DNG 必需 tag）。
-// ★ 元数据配对在【落盘时】进行：结果元数据比图像缓冲晚约 2 帧到达，
-//   到达时配对会 miss（实测 delta=66ms 恒定）；落盘时结果早已到达，±20ms 必命中。
+// ★ 元数据配对在【落盘时】进行：结果元数据比图像缓冲晚约 2-3 帧到达，而 ZSL 快门
+//   回溯的恰是 ring 最新帧 —— 落盘瞬间其结果可能仍在途。策略：结果在途时有界等待
+//   （kMetaWaitMs，正常 ~2 帧即命中）；超时或乱序时取时间上最近的 meta 兜底并限频告警。
 // 保存线程异步：dng_<ms>_<seq>.dng
 
 #include <media/NdkImageReader.h>
@@ -34,6 +35,8 @@ public:
     void setRingMode(bool on);
     bool ringMode() const;
     static constexpr int kRingFrames = 4;
+    static constexpr int64_t kMetaPairTolNs = 20000000LL; // 图像/结果时间戳配对容差 20ms
+    static constexpr int kMetaWaitMs = 300;               // 结果在途时的最长等待（~10 帧）
 
     void shutterBurst(int n); // ZSL 快门：回溯最近 n 帧
     void requestSingle();     // once 模式：保存下一帧

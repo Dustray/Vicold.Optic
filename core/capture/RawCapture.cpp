@@ -65,9 +65,12 @@ ANativeWindow* RawCapture::window() {
 }
 
 void RawCapture::onFrameResult(const FrameResult& r) {
-    std::lock_guard<std::mutex> l(m_);
-    meta_.emplace_back(r.timestampNs, r);
-    while (meta_.size() > 64) meta_.pop_front();
+    {
+        std::lock_guard<std::mutex> l(m_);
+        meta_.emplace_back(r.timestampNs, r);
+        while (meta_.size() > 64) meta_.pop_front();
+    }
+    cv_.notify_all(); // 唤醒落盘线程的"结果在途"等待
 }
 
 void RawCapture::setRingMode(bool on) {
@@ -163,26 +166,52 @@ void RawCapture::saverLoop() {
             saveQ_.pop_front();
         }
 
-        // ★ 元数据配对在落盘时进行：此刻该帧的结果元数据早已到达（晚约 2 帧）
+        // ★ 元数据配对在落盘时进行。ZSL 快门回溯的是 ring 最新帧，其结果此刻可能
+        //   仍在途（结果比图像晚 ~2-3 帧，实测 delta≈99ms）：在途时有界等待，
+        //   超时/乱序时取时间上最近的 meta 兜底（限频告警）。
         FrameResult meta;
+        bool paired = false;
+        bool waited = false;
         {
-            std::lock_guard<std::mutex> l(m_);
-            bool paired = false;
-            for (auto it = meta_.rbegin(); it != meta_.rend(); ++it) {
-                if (std::llabs(it->first - f.imgTs) < 20000000LL) {
-                    meta = it->second;
-                    paired = true;
-                    break;
+            std::unique_lock<std::mutex> l(m_);
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(kMetaWaitMs);
+            while (!paired) {
+                for (auto it = meta_.rbegin(); it != meta_.rend(); ++it) {
+                    if (std::llabs(it->first - f.imgTs) < kMetaPairTolNs) {
+                        meta = it->second;
+                        paired = true;
+                        break;
+                    }
                 }
+                if (paired || stop_) break;
+                // 最新结果仍早于本帧 → 结果在途，等它到达后再试（notify_all 唤醒）
+                const bool inFlight = meta_.empty() || meta_.back().first < f.imgTs;
+                if (!inFlight || std::chrono::steady_clock::now() >= deadline) break;
+                cv_.wait_until(l, deadline);
+                waited = true;
+            }
+            if (paired && waited) {
+                LOGI("meta paired after wait: imgTs=%lld", static_cast<long long>(f.imgTs));
             }
             if (!paired && !meta_.empty()) {
-                meta = meta_.back().second;
+                auto best = meta_.begin();
+                int64_t bestD = std::llabs(best->first - f.imgTs);
+                for (auto it = std::next(best); it != meta_.end(); ++it) {
+                    const int64_t d = std::llabs(it->first - f.imgTs);
+                    if (d < bestD) {
+                        bestD = d;
+                        best = it;
+                    }
+                }
+                meta = best->second;
                 if (f.imgTs - lastPairWarn_ > 3000000000LL) {
                     lastPairWarn_ = f.imgTs;
-                    LOGW("meta pairing miss: imgTs=%lld nearestMetaTs=%lld delta=%lldms",
+                    LOGW("meta pairing miss (waited %dms): imgTs=%lld nearestMetaTs=%lld delta=%lldms",
+                         kMetaWaitMs,
                          static_cast<long long>(f.imgTs),
-                         static_cast<long long>(meta_.back().first),
-                         static_cast<long long>(std::llabs(meta_.back().first - f.imgTs)) / 1000000);
+                         static_cast<long long>(best->first),
+                         static_cast<long long>(bestD) / 1000000);
                 }
             }
         }
