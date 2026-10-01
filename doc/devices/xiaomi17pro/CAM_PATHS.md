@@ -57,7 +57,10 @@
 **一个 repeating 请求挂全部输出，永不再换**。启动时一次 configure 配齐：
 
 - 3 路预览 `ACaptureSessionPhysicalOutput`：slot0 = 逻辑 L、slot1 = 物理 3（uw）、slot2 = 物理 4（tele）；
-- 第 4 路：RAW 逻辑输出（与预览同一会话）。
+- 第 4/5 路：**拍摄输出，按格式互斥挂载**
+  - JPEG 模式（默认）：第 4 路 JPEG（逻辑输出）+ 第 5 路 JPEG（**绑物理 3**，超广带专用）；
+  - RAW 模式：第 4 路 RAW_SENSOR（逻辑输出）。
+  > JPEG 两路都在会话里，但**绝不能进 repeating**（见 `STILL_PIPELINE.md` §2：ISP 逐帧编码 12MP ⇒ 18.5fps）。
 - repeating 请求经 `createCaptureRequest_withPhysicalIds([3,4])` 创建（`CaptureSession::setRepeatingAll`，
   按 "ALL" 缓存），**逐摄写 ZOOM_RATIO**（`ACaptureRequest_setEntry_physicalCamera_float`，API 29）：
   uw = max(1, z/0.7)、tele = max(1, z/teleMin)、逻辑 = 钳在 [1.0, teleMin−0.05] 干净带 ——
@@ -67,7 +70,8 @@
 - 三路常流副产物：uw/tele 的 AE/AWB 持续收敛，切换瞬间色彩已稳定（业界"预收敛"思路白拿）。
 - RAW 恒出帧 → **全带可拍 RAW**（物理带的 DNG 来自主摄逻辑流，FOV=主摄当前倍率）。
 - 会话只在启动 / 设备重连 / 致命错误时重建；重建仍走退役墓地（防 UAF，见下）。
-- HAL 拒绝 4 输出组合时自动降级单流重建路径（`multiStreamFailed_`；降级模式物理带无 RAW、拍摄被拒）。
+- HAL 拒绝该输出组合时：先**拆掉 uw 物理 JPEG（第 5 路）重试 4 流**；仍被拒才降级单流重建路径
+  （`multiStreamFailed_`；降级模式物理带无拍摄输出）。
 - 三路 reader 每帧必须全部 drain（不消费会撑满 maxImages=3 队列拖累整条 repeating）。
 - 预览看门狗与墓地机制保留：>1.2s 无 result → 重发 setRepeating（ALL 请求同路径）；
   重建后旧会话延迟 1.5s 析构（立即析构会触发 `C2N-dev-looper` UAF → SIGABRT）。
@@ -94,7 +98,9 @@ ALL 全目标常驻会话（controls.txt 推 zoom，与触摸同一条 commitSes
 
 - ALL 常驻下 result 元数据 `zoomRatio` 是**逻辑流**的（钳在干净带内）；
   UI 的 appliedZoom 由引擎按显示带换算（relUw×0.7 / relTele×teleMin / 逻辑原值）。
-- 物理带拍摄的 DNG 来自主摄逻辑流（RAW 只挂逻辑输出），FOV ≠ 当前显示的超广/长焦视角。
+- RAW 模式下物理带拍摄的 DNG 仍来自主摄逻辑流（RAW 只挂逻辑输出），FOV ≠ 当前显示的超广/长焦视角。
+  **JPEG 模式已解决**：超广带走第 5 路物理 JPEG 直连、其余带由 `WysiwygCropProcessor` 软件裁齐，
+  照片 FOV 严格 = 预览 FOV —— 详见 `doc/STILL_PIPELINE.md` §4。
 - 三传感器常开：功耗高于单流方案（方案 A 的固有代价，换取零切换卡顿）。
 - controls.txt 的 zoom 不联动 UI 导轨读数（UI 本地状态，触摸路径不受影响）。
 - 跨镜头色彩/亮度差异仍在（三路各自收敛，主摄与副摄的 AE/AWB 目标不同），

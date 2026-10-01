@@ -4,8 +4,14 @@
 > 首发定制机型：Xiaomi 17 Pro（保留其他机型扩展接口）
 > 核心代码：C++（除前端壳层）；不使用 Java 源码
 
-版本：v0.1（2026-09-28）
+版本：v0.3（2026-10-01）
 优先级定义：**P0** = 阻塞主线的必做项 | **P1** = 重要，紧跟 P0 | **P2** = 增强项，可延后
+
+> **配套文档**（细节不重复进本文件）
+> - 屏幕/交互：`doc/UI_LAYOUT.md`（设计空间、挖孔禁区、布局常量表、文字渲染与验证方法）
+> - 拍摄输出：`doc/STILL_PIPELINE.md`（JPEG/RAW 两通路、WYSIWYG 裁切、相册写入）
+> - 多摄/变焦：`doc/devices/xiaomi17pro/CAM_PATHS.md`（分带机制、ALL 常驻会话、HAL quirks）
+> - 能力基线：`doc/devices/xiaomi17pro/CAPABILITY_REPORT.md`（M0.2 产出）
 
 ---
 
@@ -29,24 +35,29 @@
 
 ## 2. 总体架构
 
+实际工程结构（截至 2026-10-01，无 Gradle）：
+
 ```
-┌─────────────────────────────────────────────────┐
-│  UI 壳层（NativeActivity，纯 C++ 渲染 HUD）        │
-│  预览 Surface · 手动控制面板 · 直方图/对焦峰值      │
-├─────────────────────────────────────────────────┤
-│  core/（C++17，静态库，无 Android UI 依赖）        │
-│  ├─ capture/  libcamera2ndk 封装：会话/请求/每帧元数据│
-│  ├─ pipeline/ RAW 管线：黑电平→去马赛克→降噪→tonemap │
-│  ├─ dng/      DNG writer + 元数据模型              │
-│  ├─ codec/    JPEG/UltraHDR 编码 · MediaCodec 录制  │
-│  ├─ preview/  GL/Vulkan 预览渲染链                 │
-│  ├─ device/   ★ 机型抽象层：IOpticDevice + quirks  │
-│  └─ util/     线程池 · 环形缓冲 · libyuv 封装       │
-├─────────────────────────────────────────────────┤
-│  NDK：libcamera2ndk · EGL/Vulkan · MediaCodec     │
-│  第三方：libyuv · Halide(可选) · libultrahdr        │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  app/  NativeActivity 壳（无 Java/Kotlin 源码） │
+│        需框架 API 时走 JNI：相册/电池/触感     │
+├──────────────────────────────────────────────┤
+│  core/（C++20，静态库）                        │
+│  ├─ capture/  libcamera2ndk 封装：设备/会话/   │
+│  │            请求/RAW/JPEG 拍摄管线/设置      │
+│  ├─ ui/       Gl（EGL/GLES2 底座）+ Ui（布局） │
+│  │            + Battery / Haptics             │
+│  ├─ dng/      自研 TIFF 构建器 + 元数据模型    │
+│  ├─ device/   ★ 机型抽象层 IOpticDevice +      │
+│  │            generic/ + xiaomi17pro/ quirks  │
+│  └─ util/     Log / ControlFile / Gallery     │
+├──────────────────────────────────────────────┤
+│  NDK：camera2ndk · EGL/GLES2 · AImageReader    │
+│  第三方：stb_truetype · stb_image(_write)      │
+└──────────────────────────────────────────────┘
 ```
+（原计划的 `pipeline/ codec/ preview/` 已分别落实为 `capture/Still*`、`capture/Still*`、`ui/Gl`，
+第三方依赖从"libyuv + Halide + libultrahdr"收敛为 stb 系列单头文件，见 §3。）
 
 ### 2.1 关键设计原则
 
@@ -75,9 +86,19 @@ struct IOpticDevice {
 
 ## 3. 第三方库与许可
 
+**当前实际引入**（均为单头文件、vendored 进源码树，零外部构建依赖）：
+
+| 库 | 位置 | 用途 | 许可 |
+|---|---|---|---|
+| stb_truetype | `core/ui/` | 字体烘焙（CJK 图集） | Public Domain |
+| stb_image | `core/capture/` | JPEG 解码（WYSIWYG 裁切） | Public Domain |
+| stb_image_write | `core/capture/` | JPEG 重编码（质量 92） | Public Domain |
+
+**候选（尚未引入）**
+
 | 库 | 用途 | 许可 | 引入方式 | 优先级 |
 |---|---|---|---|---|
-| libyuv | YUV/RGBA/旋转/缩放 | BSD | 源码编译 | P0 |
+| libyuv | YUV/RGBA/旋转/缩放 | BSD | 源码编译 | P2 |
 | Adobe DNG SDK | DNG 写入备选 | Adobe 免费许可（可商用，需保留声明） | 仅在自研 writer 覆盖不足时 | P2 |
 | timothybrooks/hdr-plus | HDR+ burst 算法参考实现 | MIT | 移植算法思想，代码作参考 | P1 |
 | Halide | 管线 kernel 生成（NEON/GPU） | MIT | 源码 | P1 |
@@ -169,6 +190,18 @@ struct IOpticDevice {
 > - V-UI4：叠加层满帧运行，预览不受影响 ✅
 > - 导轨变焦 0.7–10 全段可用（依赖多摄分带机制，见 devices/xiaomi17pro/CAM_PATHS.md）✅
 
+#### UI 打磨轮（2026-09-30 ~ 10-01，全部真机截图 + 像素采样验证）
+
+> 细节规范已抽到 `doc/UI_LAYOUT.md`，本处只记结论。
+>
+> - **真实电池**：JNI `ACTION_BATTERY_CHANGED` sticky 广播取电量/充电态；充电绿 / ≤20% 橙 / 正常白。
+> - **全出血**：`windowLayoutInDisplayCutoutMode` 必须写在主题 style 里（manifest 属性会被静默忽略）→ 2656 全宽。
+> - **左右遮挡条**：左条 = `attach` 全出血判定被浮点 +0.0002px 误判（改带容差）；右条 = 右面板宽度没到设计右缘（404）。
+> - **布局左移**：预览/AF/EV 整体左移 20；变焦轨道受挖孔约束最终定在 X=88 压禁区边界（详见 UI_LAYOUT §2）。
+> - **三滚轮统一**：删除 ISO/曝光时间的静态标题只留实时值，三处基线/字号/配色规则拉齐；下方圆按钮统一 60@594。
+> - **拍照反馈收敛**：删掉预览区两个浮层 toast，改为 HUD 角标行的橙色 `SAVING`（写完即消失），失败才提示。
+> - **EV 面板**：面板加宽到 520（9px/⅓ 档），双击归零。
+
 ### M-MC — 多摄分带：物理直连绕开坏损融合管线 【P0，2026-09-29】✅ 真机验证通过
 
 > Xiaomi 17 Pro 逻辑多摄的 ZOOM_RATIO 融合管线存在两个坏区（sub-1.0 超广角段、
@@ -199,6 +232,33 @@ struct IOpticDevice {
 | 2.5 | 半透明水印/版权 tag、厂商 opcode（LensShadingMap 可选） | P2 |
 
 **退出标准**：DNG 在 Lightroom 中色彩正确（与厂商相机 RAW 直出比对）、元数据无告警。
+
+### M-JPEG — JPEG 输出 + 系统相册 + WYSIWYG 【P0，2026-09-30】✅ 真机三带验证通过
+
+> 用户：照片默认要普通 JPG，且系统相册里能看到；JPEG 通路要为后续滤镜/自定义算法留出扩展位。
+> 完整实现与验证数据见 `doc/STILL_PIPELINE.md`。
+>
+> - **可插拔管线**：`StillPipeline.h` 定义 `StillProcessor`（滤镜系统预留口），
+>   当前挂 `WysiwygCropProcessor`，`PassThroughProcessor` 保留对照。
+> - **JPEG 恒不在 repeating 里**：曾挂进常驻请求，ISP 逐帧编码 12MP ⇒ 18.5fps / provider CPU 315%；
+>   改「会话里配流、快门才 `captureOnce`」后回到 **30.1fps，断帧 0**。
+> - **系统相册**：`GalleryWriter`（JNI MediaStore 两段提交 `IS_PENDING`）→ `DCIM/Camera`，免存储权限。
+> - **WYSIWYG**：照片 FOV 严格对齐预览。第五路**超广物理 JPEG 流** + 软件中心裁切兜底 ——
+>   修复前长焦带 z=10 拍出主摄 4.85x、超广带拍出主摄 1.0x（用户主诉"有时候焦距跟预览不一样"）。
+> - **单拍健壮性**：`onceReq_` 改 sequenceId 释放（指针比较会让第二张永远拍不了）；
+>   登记 6s 超时作废；文件名 seq 改全局原子（双 reader 同毫秒撞名）。
+
+### M-LIFE — 全异步生命周期与看门狗自愈 【P0，2026-09-30】✅ 两轮打盹零 ANR
+
+> 用户：从后台返回 app 有时卡死。根因 = 主线程同步 `join` 引擎线程，而 HAL `close` 在 Doze 期间挂起
+> （曾触发 `NativeActivity.surfaceDestroyed` 51s ANR）。
+>
+> - `stop()` 只置标志，收摊由引擎线程在 `run()` 尾部自清理；`requestStart()/tryStart()` 意图 + 重试。
+> - 窗口 attach/detach 延后处理（`pendingWin` + `wantAttach/wantDetach`）：GL 预览 reader 在旧会话
+>   拆除期间仍被引用，立即 detach 会 UAF。
+> - 看门狗状态在 `run()` 入口重置（否则重启后误报 `stall 51958ms`）；12 次重试耗尽 → 整链路重连。
+> - 真机：TERM 后 428ms 干净收摊，RESUME 后 20ms 重启，两轮息屏/唤醒零冻结。
+> - 遗留：HAL `close` 在深度打盹下仍可能挂起（异步化只保证不冻结 UI，冷启动时若进程已被杀属正常）。
 
 ### M3 — 极速体验打磨 【P0/P1，2 周】
 
@@ -312,21 +372,28 @@ adb shell dumpsys media.camera        # 全量能力导出，归档到 doc/devic
 
 ---
 
-## 9. 目录结构（M0.4 落地）
+## 9. 目录结构（实际，2026-10-01）
 
 ```
 Vicold.Optic/
-├─ doc/                    # 本计划、能力报告、架构决策记录(ADR)
-│  └─ devices/xiaomi17pro/
-├─ app/                    # NativeActivity 壳 + android_native_app_glue
+├─ doc/
+│  ├─ PLAN.md                  # 本文件（唯一路线图）
+│  ├─ STILL_PIPELINE.md        # 拍摄输出管线（JPEG/RAW、WYSIWYG、相册）
+│  ├─ UI_LAYOUT.md             # UI 布局/渲染/交互规范
+│  └─ devices/xiaomi17pro/     # 能力报告 + 多摄分带 + dumpsys 证据
+├─ app/                        # NativeActivity 壳 + android_native_app_glue + res
 ├─ core/
-│  ├─ capture/  pipeline/  dng/  codec/  preview/
-│  ├─ device/              # IOpticDevice + generic/ + xiaomi17pro/
-│  └─ util/
-├─ third_party/            # libyuv, libultrahdr, halide(可选)
-├─ tools/                  # RAW 比对脚本、性能打点分析（桌面 Python）
-└─ CMakePresets.json
+│  ├─ capture/  设备/会话/请求/设置 + RAW/JPEG 拍摄 + stb vendor
+│  ├─ ui/       Gl(EGL/GLES2) + Ui(布局) + Battery + Haptics + stb_truetype
+│  ├─ dng/      DngWriter + 元数据模型
+│  ├─ device/   IOpticDevice + generic/ + xiaomi17pro/（quirks 唯一出处）
+│  └─ util/     Log / ControlFile(controls.txt) / Gallery(MediaStore)
+├─ tools/       dev.sh(env.sh) / package.sh + 真机诊断脚本
+│               # zoom_scan / stall_probe / logical_limit / calib_fov.py
+└─ CMakePresets.json           # 唯一 preset：android-arm64
 ```
+
+> 约定：注释、文档、commit message 统一**简体中文**；机型判断只允许出现在 `core/device/` 层。
 
 ## 10. 参考项目（详见对话研究结论）
 
