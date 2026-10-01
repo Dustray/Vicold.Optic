@@ -2,7 +2,14 @@
 
 namespace optic::capture {
 
-void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom) const {
+void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview) const {
+    // 钉死帧率（机型层口径）：三路常驻会话只要不写这个 entry，HAL 就可能跑在最大档。
+    // 这是纯收益 —— 预览本来就只要 30fps，多出来的帧全是白烧的带宽和电。
+    if (forPreview && fpsMin > 0 && fpsMax > 0) {
+        const int32_t fps[2] = {fpsMin, fpsMax};
+        ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps);
+    }
+
     // 注意：AE_MODE / AF_MODE / AWB_MODE 在 camera2 里是 TYPE_BYTE，必须用 setEntry_u8，
     // 用 i32 写会被框架报 "Mismatched tag type" 并丢弃该 entry（切到超广角物理镜头时尤其致命）。
     uint8_t ae = static_cast<uint8_t>(aeOn ? ACAMERA_CONTROL_AE_MODE_ON : ACAMERA_CONTROL_AE_MODE_OFF);

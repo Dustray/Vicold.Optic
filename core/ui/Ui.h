@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "core/device/DeviceRegistry.h"
+#include "core/device/IOpticDevice.h"
 #include "core/ui/Battery.h"
 #include "core/ui/Gl.h"
 #include "core/ui/Haptics.h"
@@ -120,7 +122,7 @@ public:
     void setAutoIso(int iso) { autoIso_.store(iso, std::memory_order_relaxed); }
     void setAutoSsUs(int64_t us) { autoSsUs_.store(us, std::memory_order_relaxed); }
     // 导轨上限：引擎侧钳制 UI 下发的 zoom 时用（相机拿不到的高倍由 GL 裁切完成）
-    static constexpr float zoomLimitMax() { return kZoomMax; }
+    float zoomLimitMax() const { return zoomMax_; }
 
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
@@ -139,12 +141,18 @@ public:
 private:
     // 设计空间常量（camera-ui.html 移植）
     static constexpr float kStageW = 1560, kStageH = 720;
-    // 变焦范围 0.7–120（与系统相机口径对齐）：
-    //   [0.7, 1.0) 超广角 / [1.0, 5.0) 广角主摄 / [5.0, 120] 长焦。
-    // 高于相机能力的高倍段（本机长焦原生 ≈5x，HAL 逻辑流上限 5x）全部由 GL 数字裁切
-    // 完成 —— 相机只收到 ≤4.85 的请求，120x 对应约 24 倍裁切（画质软，但取景可用）。
-    static constexpr float kZoomMin = 0.7f, kZoomMax = 120.f, kZoomBaseMm = 23.f;
-    float zoomMin_ = kZoomMin;   // 运行时实际下限（setZoomRange 覆盖，默认按 HAL 量程）
+    // 左侧挖孔/避让几何来自机型层 UiLayoutPolicy（2026-10-01：pandora 三轮实测把
+    // cutoutSafeX 定在 88；无左侧挖孔的机型回落到 10 的常规边距，不多留黑条）。
+    const optic::device::UiLayoutPolicy uiPol_{optic::device::currentDevice().uiLayout()};
+    float trackX_ = uiPol_.hasLeftCutout ? uiPol_.cutoutSafeX : 10.f;
+    float safeW_ = uiPol_.cutoutReserveW;
+
+    // 变焦口径不在此硬编码：量程/关键焦段/mm 基准都由机型层提供（ZoomProfile）。
+    // 高于相机能力的高倍段全部由 GL 数字裁切完成 —— 相机只收到 ≤ logicSafeMax 的请求。
+    const optic::device::ZoomProfile zoomProf_{optic::device::currentDevice().zoomProfile()};
+    float zoomMax_ = zoomProf_.rangeMax;
+    float zoomBaseMm_ = zoomProf_.baseEquivMm;
+    float zoomMin_ = zoomProf_.rangeMin;   // 运行时实际下限（setZoomRange 覆盖，默认按 HAL 量程）
     static constexpr int kRingFrames = 4;
 
     void onDown(float dx, float dy, double tMs);   // tMs = AMotionEvent 事件时间（双击判定）
@@ -208,10 +216,8 @@ private:
     static constexpr int kSsStopsN = 55;                 // 1/8000 s–30 s，1/3 EV 步进全阶梯
     static const float kIsoStops[kIsoStopsN];
     static const float kSsStops[kSsStopsN];              // 秒（≥1 直接秒；<1 为 1/x s 的倒数域）
-    // 关键焦段（与系统相机一致）：0.7 超广 / 1 广角 / 2 / 5 长焦起点 / 10 / 50 / 120。
+    // 关键焦段由机型层给出（0.7 超广 / 1 广角 / 2 / 5 长焦起点 / 10 / 50 / 120），
     // 刻度盘上**等距**分布（见 zoomToF/zoomFromF 的分段映射）。
-    static constexpr int kZoomStopsN = 7;
-    static constexpr float kZoomStops[kZoomStopsN] = {0.7f, 1, 2, 5, 10, 50, 120};
     int isoIdx_ = 9;      // ISO 400（新 23 档表中 400 的下标）
     int ssIdx_ = 30;      // 1/8 s（1/8000→30s 阶梯中 1/8 s 的下标）
     float zoom_ = 1.0f;   // 与引擎初始状态一致（引擎 zoomRatio=0 未设置 ≈ 原生 1.0）
@@ -223,6 +229,8 @@ private:
     std::atomic<int> autoSsUs_{0};          // AE 实测曝光时间 µs
     int zoomUnit_ = 0;                                  // 0=mm 1=×
     bool gridOn_ = true;
+
+    int previewSlots_ = 1;      // 常驻预览源数（机型层 SessionPolicy.previewSlots）
 
     // 触摸
     enum class Drag { NONE, ZOOM, ISO, SS, EV } drag_ = Drag::NONE;
@@ -236,7 +244,7 @@ private:
     // az 变化或 slot 切换时 crop **落位到新 target**（绝不归一到 1 —— 那会让 FOV
     // 退回后再爬升，与纹理过渡叠加成泵动闪烁）。
     double lastCropT_ = 0;      // 上一帧时刻（淡化计时 dt；crop 已时间戳对齐直接落位）
-    float teleMin_ = 2.63f;                 // 长焦直连阈值（setTeleMin 下发）
+    float teleMin_ = zoomProf_.teleSwitchUser;   // 长焦直连阈值（setTeleMin 下发，引擎干活时能覆盖）
     void pushZoomLive(float camTarget);
 
     // 动效

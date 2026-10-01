@@ -95,8 +95,13 @@ public:
     void setAzSource(std::function<float(int slot, int64_t tsNs)> f) { azSrc_ = std::move(f); }
     void swap();
 
+    // 预览源上限（硬件/实现上限）。实际启用几路由机型层 SessionPolicy.previewSlots
+    // 决定：双摄机型不必常开三路只读蒸发器 updates（每路都是一整条 ISP 流水线）。
+    static constexpr int kMaxSources = 3;
+    int maxSources() const { return kMaxSources; }
+
 private:
-    static constexpr int kSrcN = 3;      // 预览源数：0=逻辑 / 1=uw / 2=tele
+    static constexpr int kSrcN = kMaxSources;   // 预览源数上限
     struct Source {
         Gl* gl = nullptr;                // 反向指针（listener 回调定位）
         AImageReader* reader = nullptr;

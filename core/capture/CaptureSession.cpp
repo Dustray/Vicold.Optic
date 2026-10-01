@@ -341,7 +341,7 @@ bool CaptureSession::captureOnce(const std::vector<ANativeWindow*>& targets,
         onceTgts_.push_back(t);
         ACaptureRequest_addTarget(onceReq_, t);
     }
-    applySettings(onceReq_, s);
+    applySettings(onceReq_, s, false, 0.f, false);
 
     int seqId = 0;
     ACaptureRequest* reqArr[1] = {onceReq_};
@@ -376,8 +376,8 @@ void CaptureSession::onSequenceCompleted(void* ctx, ACameraCaptureSession*, int 
 }
 
 void CaptureSession::applySettings(ACaptureRequest* req, const CaptureSettings& s, bool skipZoom,
-                                   float physZoom) const {
-    s.apply(req, skipZoom);
+                                   float physZoom, bool forPreview) const {
+    s.apply(req, skipZoom, forPreview);
     // 物理直连 + 相对数字变焦（>0 才写；值域按该物理镜头自身 zoomRatioRange，HAL 钳制）
     if (skipZoom && physZoom > 0.f) {
         ACaptureRequest_setEntry_float(req, ACAMERA_CONTROL_ZOOM_RATIO, 1, &physZoom);

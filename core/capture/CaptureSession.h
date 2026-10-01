@@ -104,7 +104,7 @@ private:
     // skipZoom=true 时物理直连不写用户 zoomRatio（物理镜头以自身原生 FOV 出图）；
     // physZoom>0 时改写该相对数字变焦（长焦直连的 z/teleNative，HAL 侧自行钳制）。
     void applySettings(ACaptureRequest* req, const CaptureSettings& s, bool skipZoom = false,
-                       float physZoom = 0.f) const;
+                       float physZoom = 0.f, bool forPreview = true) const;
     void closeLocked(); // mutex_ 已持有时使用（create 复用）
 
     // 单个 band 的 repeating 请求（按签名缓存）

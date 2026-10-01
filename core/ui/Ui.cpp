@@ -57,17 +57,13 @@ constexpr Rgba kNone{0, 0, 0, 0};
 // 左导轨（面板位置运行时自适应，见 railLX_；轨道右缘 = 面板右缘）
 // 全出血（2026-09-30）：窗口 frame 已是整屏 2656，布局不必再整块右移避让 150px 黑条。
 // 2026-10-01 布局左移 20（预览/AF）：先后尝试轨道宽 64 / 左压 64，最终因真孔吃掉轨道
-// 左侧而定在「X=88 压 cutout 包络边界 + 宽 80」，详见 kZoomTrackX 注释。
-constexpr float kSafeW = 80;                  // 挖孔避让区（横向溢出时的裁切带宽）
+// 左侧而定在「X=88 压 cutout 包络边界 + 宽 80」，详见 trackX_ 注释。
+// kSafeW 已移入机型层（UiLayoutPolicy.cutoutReserveW），运行时取成员 safeW_
 constexpr float kRailREnd = 168;              // 左导轨面板/轨道公共右缘
-// 变焦轨道：官方文档保守 vs 真孔（2026-10-01 实测三轮）
-// 系统声明 cutout = 竖屏 Rect(573,0-647,150)（DisplayCutout.insets/boundingRect/
-// cutoutSpec "M 0,0 H -37 V 150 H 37 V 0 H 0 Z"），横屏后 = 紧贴左缘、深 150 设备px
-// → 设计 x 0–88。X=64 实测**真孔确把轨道左侧吃掉**（中心确认区正好落在孔的 y 带
-// 336–380 上）→ 说明这块保守包络基本都是黑的，**左缘硬下限 = 88**，不可再往左。
-// 当前取值 X=88（压包络边界）、宽恢复 80（88–168），与预览 178 留 10px。
-// 若嫌离预览太近：只能缩 kZoomTrackW（例如 74 → 间隙 16px），不要动 X。
-constexpr float kZoomTrackX = 88, kZoomTrackY = 130, kZoomTrackW = 80, kZoomTrackH = 448;
+// 挖孔/避让几何来自机型层 UiLayoutPolicy（成员 trackX_ / safeW_）—— 屏幕开孔是硬件
+// 属性，写死在这里会让中置挖孔/无孔机型出现「轨道被吃掉」或「白留一条黑边」
+//（2026-10-01 三轮实测把 pandora 定值打成了注释里的历史记录）。
+constexpr float kZoomTrackY = 130, kZoomTrackW = 80, kZoomTrackH = 448;
 // 三滚轮上方「实时值」的统一排版（2026-10-01：删除静态标题，只留实时预览）
 // 变焦（mm/×）与 ISO、曝光时间三处共用同一基线 / 字号 / 配色规则：
 //   手动 = 强调色 kAccent；自动态跟随 AE = 灰 kT3（只有 ISO / 曝光时间会自动）。
@@ -124,8 +120,10 @@ bool Ui::attach(ANativeWindow* win) {
     // 文字边缘锐利；且与 kUiZoom 解耦，后续再调大字号也不糊。
     if (!gl_.bakeFont(56.f)) LOGE("font bake failed (text disabled)");
 
-    // 预览源尺寸可经 controls.txt 覆盖（preview_w / preview_h），默认 1920x1440 (4:3)
-    int pw = 1920, ph = 1440;
+    // 预览源默认尺寸来自机型层（必须落在本机 preview-size 列表内，否则 HAL 拒绝会话）；
+    // controls.txt 的 preview_w/preview_h 仍可覆盖（诊断用）。
+    const auto& pol = optic::device::currentDevice().sessionPolicy();
+    int pw = pol.previewW, ph = pol.previewH;
     if (!dataDir_.empty()) {
         std::ifstream f(dataDir_ + "/controls.txt");
         std::string line;
@@ -138,10 +136,11 @@ bool Ui::attach(ANativeWindow* win) {
             else if (k == "uvrot" || k == "uv_rot") uvRotOverride_ = std::atoi(v.c_str());
         }
     }
-    if (pw <= 0 || ph <= 0) { pw = 1920; ph = 1440; }
-    // 三路预览源一次建齐（0=逻辑 / 1=uw / 2=tele）：AImageReader 创建无 GL 依赖。
-    // 单流降级模式下 slot1/2 空闲（未挂会话不出帧，无开销）。
-    for (int i = 0; i < 3; ++i) gl_.makePreviewSource(i, pw, ph);
+    if (pw <= 0 || ph <= 0) { pw = pol.previewW > 0 ? pol.previewW : 1920; ph = pol.previewH > 0 ? pol.previewH : 1440; }
+    // 预览源数量来自机型层（三摄 = 逻辑 + uw + tele）：AImageReader 创建无 GL 依赖。
+    // 源数少于机型实际/降级模式下多余槽位空闲（未挂会话不出帧，无开销）。
+    previewSlots_ = std::clamp(pol.previewSlots, 1, gl_.maxSources());
+    for (int i = 0; i < previewSlots_; ++i) gl_.makePreviewSource(i, pw, ph);
 
     // cover：等比铺满。横向溢出优先裁掉左侧摄像头避让区（80 设计 px 的留白），
     // 剩余再两侧均分——这样无论系统为挖孔保留多宽，快门都不会被裁；纵向溢出两侧均分。
@@ -151,11 +150,11 @@ bool Ui::attach(ANativeWindow* win) {
     // 「未全出血」→ railLX_=80，左侧避让区整条露黑（用户所见遮挡条，2026-10-01）。
     // 真实的挖孔保留宽度 ~150px，1px 容差不会误入 else。
     if (overflowX > 1.f) {
-        float left = std::min(overflowX, kSafeW * scale_);
+        float left = std::min(overflowX, safeW_ * scale_);
         offX_ = -(left + (overflowX - left) / 2.f);
         // 有横向溢出（系统仍保留挖孔条，窗口未全出血）：面板从裁切线起，
-        // 可见区即完整面板；设计 x<kSafeW 反正不可见
-        railLX_ = kSafeW;
+        // 可见区即完整面板；设计 x<safeW_ 反正不可见
+        railLX_ = safeW_;
     } else {
         offX_ = -overflowX / 2.f;   // 设计窄于窗口：居中留白
         // 全出血（displayCutout inset 已隐藏，窗口铺满）：面板扩进挖孔保留区，
@@ -274,7 +273,7 @@ void Ui::onDown(float x, float y, double tMs) {
     }
     // 刻度盘：只记基准，不在按下时改值（否则手还没动值先跳到指针位置）。
     // 处于自动态的滚轮灰显不可拖（值由 AE 驱动，拖动 = 点下方 A 键切手动）。
-    if (inR(x, y, kZoomTrackX, kZoomTrackY, kZoomTrackW, kZoomTrackH)) {
+    if (inR(x, y, trackX_, kZoomTrackY, kZoomTrackW, kZoomTrackH)) {
         drag_ = Drag::ZOOM; dragRefPos_ = y; dragRefF_ = zoomFrac(); return;
     }
     if (!isoAuto_ && inR(x, y, kIsoTrackX, kTrackY, kTrackW, kTrackH)) {
@@ -309,7 +308,7 @@ void Ui::onDown(float x, float y, double tMs) {
     }
     // mm/× 单位切换（滚轮下方圆形点按按钮）
     {
-        const float ux = kZoomTrackX + kZoomTrackW / 2, uy = kJogBtnY + kJogBtnD / 2;
+        const float ux = trackX_ + kZoomTrackW / 2, uy = kJogBtnY + kJogBtnD / 2;
         if (std::hypot(x - ux, y - uy) <= kJogBtnD / 2 + 8) {
             zoomUnit_ ^= 1;   // mm / × 切换
             hap_.click();
@@ -331,12 +330,12 @@ void Ui::hapticTickStop(int id) {
     }
 }
 
-// 运行时有效刻度表：首项 = 运行时下限（轨道底），其后取 kZoomStops 中高于下限者。
+// 运行时有效刻度表：首项 = 运行时下限（轨道底），其后取机型关键焦段中高于下限者。
 // 返回项数；各刻度在轨道上均分（等距刻度，用户指定 0.7-1-2-5-10-50-120 同距）。
 int Ui::zoomStopsEff(float out[8]) const {
     int n = 0;
     out[n++] = zoomMin_;
-    for (float s : kZoomStops)
+    for (float s : zoomProf_.stops)
         if (s > zoomMin_ * 1.001f && n < 8) out[n++] = s;
     return n;
 }
@@ -356,14 +355,14 @@ float Ui::zoomFromF(float f) const {
     // 刻度吸附：等距刻度 → 直接按轨道距离吸附（段位差 <0.13 段 ≈ 轨道 2.2%），各档手感一致
     for (int i = 0; i < n; ++i)
         if (std::fabs(seg - i) < 0.13f) { v = eff[i]; break; }
-    return std::clamp(v, zoomMin_, kZoomMax);
+    return std::clamp(v, zoomMin_, zoomMax_);
 }
 
 // 变焦值 → 轨道连续位置（zoomFromF 的严格反函数，刻度绘制与 thumb 定位用）
 float Ui::zoomToF(float z) const {
     float eff[8];
     const int n = zoomStopsEff(eff);
-    const float v = std::clamp(z, zoomMin_, kZoomMax);
+    const float v = std::clamp(z, zoomMin_, zoomMax_);
     for (int i = 0; i + 1 < n; ++i) {
         if (v <= eff[i + 1]) {
             const float t = std::log(std::max(v, eff[i]) / eff[i]) /
@@ -1047,7 +1046,7 @@ void Ui::frame() {
     drawPreviewOverlay();
 
     // ---- 左侧：摄像头避让区（真机只留黑，虚线为设计标注不绘制）----
-    gl_.roundedRect(screenX(0), screenY(0), dim(kSafeW), dim(kStageH), 0, kBg, kNone, 0);
+    gl_.roundedRect(screenX(0), screenY(0), dim(safeW_), dim(kStageH), 0, kBg, kNone, 0);
 
     // ---- 左导轨：变焦（面板位置 attach 自适应，见 railLX_）----
     gl_.roundedRect(screenX(railLX_), screenY(0), dim(railLW_), dim(kStageH), 0, kRail,
@@ -1055,19 +1054,19 @@ void Ui::frame() {
     {
         // 实时焦距 / 倍率：与右侧 ISO、曝光时间共用 kReadoutY / kReadoutFs / 配色
         char buf[16];
-        if (zoomUnit_ == 0) snprintf(buf, sizeof(buf), "%dmm", int(std::lround(kZoomBaseMm * zoom_)));
+        if (zoomUnit_ == 0) snprintf(buf, sizeof(buf), "%dmm", int(std::lround(zoomBaseMm_ * zoom_)));
         else snprintf(buf, sizeof(buf), "%.1f\xc3\x97", zoom_);
         const float rfs = kReadoutFs * kUiZoom * scale_;
         float w = gl_.textWidth(buf, rfs);
-        gl_.text(buf, screenX(kZoomTrackX + kZoomTrackW / 2) - w / 2, screenY(kReadoutY), rfs,
+        gl_.text(buf, screenX(trackX_ + kZoomTrackW / 2) - w / 2, screenY(kReadoutY), rfs,
                  kAccent);
     }
 
     // 变焦轨道 + 刻度 + thumb
-    gl_.roundedRect(screenX(kZoomTrackX), screenY(kZoomTrackY), dim(kZoomTrackW),
+    gl_.roundedRect(screenX(trackX_), screenY(kZoomTrackY), dim(kZoomTrackW),
                     dim(kZoomTrackH), dim(20), kTrack, kTrackLine, 1);
     // 分隔线偏移按轨道宽等比（原宽 80 时 = 26），否则收窄后会压到刻度标签上
-    gl_.roundedRect(screenX(kZoomTrackX + kZoomTrackW * 0.325f), screenY(kZoomTrackY + 20),
+    gl_.roundedRect(screenX(trackX_ + kZoomTrackW * 0.325f), screenY(kZoomTrackY + 20),
                     dim(2), dim(kZoomTrackH - 40), 0, kTrackLine, kNone, 0);
     {
         // 中心确认刻度盘：关键焦段为主刻度（带标签），段间按对数等分插短刻度
@@ -1075,8 +1074,8 @@ void Ui::frame() {
         char labels[16][8];
         int n = 0;
         float prev = -1.f;
-        for (size_t i = 0; i < sizeof(kZoomStops) / sizeof(kZoomStops[0]); ++i) {
-            const float s = kZoomStops[i];
+        for (size_t i = 0; i < zoomProf_.stops.size(); ++i) {
+            const float s = zoomProf_.stops[i];
             if (s < zoomMin_ - 1e-3f) continue;          // 低于光学下限的档位不画
             const float f = zoomToF(s);
             if (prev >= 0.f) {                           // 段间短刻度（对数等分 3 份）
@@ -1089,13 +1088,13 @@ void Ui::frame() {
             items[n++] = {f, true, labels[i]};
             prev = f;
         }
-        drawRollerV(screenX(kZoomTrackX), screenY(kZoomTrackY), dim(kZoomTrackW),
+        drawRollerV(screenX(trackX_), screenY(kZoomTrackY), dim(kZoomTrackW),
                     dim(kZoomTrackH), zoomFrac(), items, n);
     }
 
     // 单位切换（mm / ×）：圆形点按按钮，显示当前单位，点按切换
     {
-        const float cx = kZoomTrackX + kZoomTrackW / 2, cy = kJogBtnY + kJogBtnD / 2;
+        const float cx = trackX_ + kZoomTrackW / 2, cy = kJogBtnY + kJogBtnD / 2;
         gl_.roundedRect(screenX(cx - kJogBtnD / 2), screenY(cy - kJogBtnD / 2),
                         dim(kJogBtnD), dim(kJogBtnD), dim(kJogBtnD / 2),
                         {1, 1, 1, 0.06f}, kLine, 1.5f);

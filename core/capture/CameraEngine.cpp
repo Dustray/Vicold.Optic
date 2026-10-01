@@ -178,6 +178,12 @@ bool CameraEngine::openSession() {
     if (!cam_.openFirstBack(forcedCamId_)) return false;
     const auto& t = cam_.traits();
 
+    // 帧率目标来自机型层（本机三摄常驻下，HAL 按 TEMPLATE 取最大档会让整条管线的
+    // 带宽与发热翻倍）。用户 settings_ 的默认值在此之前可能被 controls.txt 改过，
+    // 这里统一按机型口径覆盖。
+    settings_.fpsMin = sessPol_.targetFpsMin;
+    settings_.fpsMax = sessPol_.targetFpsMax;
+
     // HUD 显示真实 RAW 分辨率（由机型探测结果下发，不写死）
     if (ui_) {
         ui_->setStaticText(t.pixelW, t.pixelH);
@@ -215,7 +221,10 @@ bool CameraEngine::openSession() {
             std::memcpy(sm.blackLevel, t.blackLevel, sizeof(sm.blackLevel));
             sm.whiteLevel = 1023;
             sm.sensorOrientation = t.sensorOrientation;
-            sm.model = "Xiaomi 17 Pro (" + propName("ro.product.device") + ")";
+            // 机身标识一律来自机型层（业务层写死会让第二台机型的 DNG 厂商/型号全错）
+            const auto id = dev_.identity();
+            sm.make = id.make;
+            sm.model = id.model + " (" + propName("ro.product.device") + ")";
             raw_->setStaticMeta(sm);
         } else {
             LOGE("raw reader create failed, RAW disabled");
@@ -305,7 +314,7 @@ void CameraEngine::refreshPhysIds() {
     uwNativeZoom_ = cam_.traits().uwNativeZoom > 0.f ? cam_.traits().uwNativeZoom : 1.0f;
     // 长焦接管点 = 用户口径 5.0x（与系统相机一致：≥5x 走长焦），但不晚于长焦
     // 原生倍率（不可能有比原生更"广"的长焦画面）。
-    teleSwitch_ = std::min(teleMinZoom_, kTeleSwitchUser);
+    teleSwitch_ = std::min(teleMinZoom_, zoomProf_.teleSwitchUser);
     // 注意：接管点 5.0 与逻辑流安全上限 4.85 之间的 0.15 段不靠相机实现 ——
     // effSettings 把下发的 ZOOM_RATIO 钳在 4.85，剩余倍率由 UI 的 GL crop 补足
     //（crop = z/az ≤ 1.031），因此 FOV 仍连续到 5.0，没有死区。
@@ -532,33 +541,37 @@ bool CameraEngine::rebuildSession() {
             outs.push_back({raw_->window(), nullptr});
         }
         const size_t nFull = outs.size();
-        if (sess->create(cam_.handle(), outs)) {
-            session_ = std::move(sess);
-            multiStream_ = true;
-            sessionSig_.clear();              // 强制 commitSession 发首个 repeating
-            physBand_ = activePhysId();
-            LOGI("multi-stream session created (L+uw:%s+tele:%s%s)", uwPhysId_.c_str(),
-                 telePhysId_.c_str(), raw_ ? "+RAW" : "");
-            commitSession(false);
-            return true;
-        }
-        // HAL 拒绝组合：先怀疑 5 流（uw still 是唯一"多余"输出）—— 拆掉重试 4 流，
-        // 不能直接砸进单流降级（那会丢掉整个多摄架构）。4 流也拒才走降级。
-        if (stillUw_ && outs.size() == nFull) {
-            LOGW("session rejected, retrying without uw-jpeg stream");
-            stillUw_->close();
-            stillUw_.reset();
-            uwStillOk_ = false;   // 本 ROM 拒 5 流，记忆住不再尝试
-            outs.pop_back();
+        // 机型层声明的会话输出上限（HAL 资源实测值）：本进程按 full → degradeSteps
+        // 逐级退让，直到 HAL 接受。注意 degradeSteps 里的最小档必须 ≥ 预览槽数 + 1
+        // （否则连拍摄输出都没有，不如直接走单流降级）。
+        const size_t tryCount = std::min(nFull, static_cast<size_t>(sessPol_.maxStreams));
+        for (size_t attempt = 0;; ++attempt) {
+            const size_t want = attempt == 0
+                                    ? tryCount
+                                    : (attempt - 1 < sessPol_.degradeSteps.size()
+                                           ? static_cast<size_t>(sessPol_.degradeSteps[attempt - 1])
+                                           : 0);
+            if (want == 0 || want > outs.size()) break;
+            while (outs.size() > want) {
+                // 被砍掉的输出若持有本进程的 reader，必须释放（否则泄漏 + 下次重试重复计数）
+                if (stillUw_ && outs.back().win == stillUw_->window()) {
+                    stillUw_->close();
+                    stillUw_.reset();
+                    uwStillOk_ = false;   // 本 ROM 拒该组合，记忆住不再尝试
+                }
+                outs.pop_back();
+            }
             if (sess->create(cam_.handle(), outs)) {
                 session_ = std::move(sess);
                 multiStream_ = true;
-                sessionSig_.clear();
+                sessionSig_.clear();              // 强制 commitSession 发首个 repeating
                 physBand_ = activePhysId();
-                LOGI("multi-stream session created (4 outputs, uw-jpeg dropped)");
+                LOGI("multi-stream session created (%zu outputs%s)", outs.size(),
+                     outs.size() < nFull ? ", uw-jpeg dropped" : "");
                 commitSession(false);
                 return true;
             }
+            if (outs.size() == want && attempt > 0) LOGW("session rejected at %zu outputs", want);
         }
         LOGE("multi-stream session rejected by HAL, falling back to single-stream rebuilds");
         multiStreamFailed_ = true;
@@ -603,13 +616,15 @@ CaptureSettings CameraEngine::effSettings() const {
     // 钳制只为"逻辑流不进断流区"（本机实测 4.8 干净、5.0 起持续断流 —— 2026-09-30）。
     // 上界取安全上限而非接管点（5.0）：两者之间那 0.15 段由 UI 的 GL crop 补足
     //（见 refreshPhysIds 注释），相机侧绝不越进断流区。
-    const float zmax = teleSwitch_ < 1e8f ? std::min(teleSwitch_, kLogicalSafeMax) : 2.5f;
+    const float zmax = teleSwitch_ < 1e8f ? std::min(teleSwitch_, zoomProf_.logicalSafeMax)
+                                                                  : zoomProf_.logicalFallbackMax;
     s.zoomRatio = std::clamp(s.zoomRatio <= 0.f ? 1.0f : s.zoomRatio, 1.0f, zmax);
-    // pandora quirk（真机 2026-09-30 确诊）：逐摄变焦键被 CamX 忽略，且物理流会
-    // **继承逻辑 ZOOM_RATIO 的裁切**。长焦带若保持逻辑 4.85，长焦流实际 =
-    // 5.016 × 4.85 ≈ 24x（用户所见「我们的 5x = 系统 25x」）。长焦带逻辑流写 1.0，
-    // 让长焦物理流回到原生 FOV；主摄流此时不显示，跳到 1.0 无副作用。
-    if (activePhysId() == telePhysId_) s.zoomRatio = 1.0f;
+    // 机型 quirk（见 Xiaomi17ProDevice::physQuirks）：部分 HAL 的物理流会**继承逻辑
+    // ZOOM_RATIO 的裁切**。pandora 上长焦带若保持逻辑 4.85，长焦流实际 = 5.016×4.85
+    // ≈ 24x（用户所见「我们的 5x = 系统 25x」）。此时长焦带逻辑流必须写 1.0，让长焦
+    // 物理流回到原生 FOV；主摄流此时不显示，跳到 1.0 无副作用。
+    // 不继承的机型保持逻辑倍率不变（继承式写法会让照片 FOV 塌回 1x）。
+    if (physQ_.inheritsLogicalZoom && activePhysId() == telePhysId_) s.zoomRatio = 1.0f;
     return s;
 }
 
@@ -757,8 +772,7 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         }
         // 上界按 UI 导轨 120x（相机拿不到的高倍由 GL 裁切完成，下发时各自钳制）
         float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
-        float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin,
-                             ui::Ui::zoomLimitMax());
+        float z = std::clamp(static_cast<float>(std::atof(v.c_str())), zmin, zoomLimit());
         if (z != settings_.zoomRatio) {
             settings_.zoomRatio = z;
             if (ui_) ui_->setZoomExternal(z);   // UI crop 基准 / 导轨读数联动
@@ -915,7 +929,7 @@ void CameraEngine::drainUiCmds() {
                     // 下限按 HAL 声称值（用户口径 0.7x）；上限按 UI 导轨 120x —— 相机
                     // 拿不到的高倍由 GL 数字裁切完成（下发时 effSettings/physZoom 各自钳制）。
                     float zmin = uwAllowed_ ? t.zoomMin : std::max(1.0f, t.zoomMin);
-                    settings_.zoomRatio = std::clamp(cmd.v, zmin, ui::Ui::zoomLimitMax());
+                    settings_.zoomRatio = std::clamp(cmd.v, zmin, zoomLimit());
                     changed = true;
                 }
                 break;
@@ -986,7 +1000,7 @@ void CameraEngine::triggerBurst() {
     // 曝光/AE/对焦沿用当前会话设置。FOV 与预览严格一致（WYSIWYG，2026-09-30）：
     //   超广带 → uw 物理流单拍，逻辑 zoom 写 1.0（物理流继承裁切，quirk 之二），
     //     照片 = uw 原生 0.774x；导轨最底 0.70–0.774 段预览也画不出更广（crop 钳 1）。
-    //   其余 → 逻辑流单拍，zoom 写 min(z, kLogicalSafeMax)。z ≤ 4.85 时照片 FOV 即
+    //   其余 → 逻辑流单拍，zoom 写 min(z, logicalSafeMax)。z ≤ 安全上限时照片 FOV 即
     //     预览 FOV；超出部分（长焦带高倍 / 超广带微差）由 WysiwygCropProcessor 软件
     //     中心裁切补齐 —— 预览那部分本来就是 GL 数字裁切，照片同口径。
     if (jpgMode_) {
@@ -1009,7 +1023,8 @@ void CameraEngine::triggerBurst() {
         StillParams p = makeStillParams();
         CaptureSettings s = settings_;
         if (uwShot) {
-            s.zoomRatio = 1.0f;   // 逻辑键 1.0 → uw 物理流继承 = 原生 FOV（0.774）
+            // 继承式 HAL：逻辑写 1.0 → uw 物理流落在原生 FOV；非继承式保持 z 不变
+            s.zoomRatio = physQ_.inheritsLogicalZoom ? 1.0f : std::max(z, 1.0f);
             p.appliedZoom = uwNativeZoom_;
             stillUw_->expectShot(p);
             if (!session_->captureOnce({stillUw_->window()}, s)) {
@@ -1019,7 +1034,7 @@ void CameraEngine::triggerBurst() {
                 return;
             }
         } else {
-            const float applied = std::clamp(z, 1.0f, kLogicalSafeMax);
+            const float applied = std::clamp(z, 1.0f, zoomProf_.logicalSafeMax);
             s.zoomRatio = applied;
             p.appliedZoom = applied;
             still_->expectShot(p);
@@ -1107,20 +1122,20 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
 
     // 近距判定取逻辑融合结果（其焦距即当前主源物理摄像头的对焦距离：主摄带=主摄、
     // 长焦带=长焦，正是接管点推迟判断所需）。NDK 单帧单结果，无需按物理 ID 区分。
-    if (nearEnterM_ > 0.f && r.focusDistanceDiopters > 1e-3f) {
+    if (nearRuleOn_ && nearEnterM_ > 0.f && r.focusDistanceDiopters > 1e-3f) {
         const float distM = 1.f / r.focusDistanceDiopters;
         if (distM < nearEnterM_) {
             farCnt_ = 0;
-            if (++nearCnt_ >= kNearDebounce && !nearSubject_) {
+            if (++nearCnt_ >= nearRule_.debounceFrames && !nearSubject_) {
                 nearSubject_ = true;
                 bandDirty_.store(true, std::memory_order_release);
                 if (teleNearSwitch_ > 1.f)
                     LOGI("subject near (%.2fm) -> tele switch deferred to %.0fx", distM,
                          teleNearSwitch_);
             }
-        } else if (distM > nearEnterM_ * 1.5f) {
+        } else if (distM > nearExitM_) {
             nearCnt_ = 0;
-            if (++farCnt_ >= kNearDebounce && nearSubject_) {
+            if (++farCnt_ >= nearRule_.debounceFrames && nearSubject_) {
                 nearSubject_ = false;
                 bandDirty_.store(true, std::memory_order_release);
                 LOGI("subject far (%.2fm) -> tele switch back at %.2fx", distM, teleSwitch_);

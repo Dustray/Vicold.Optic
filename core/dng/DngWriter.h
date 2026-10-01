@@ -19,8 +19,10 @@ struct StaticMeta {
     int32_t whiteLevel = 1023;                   // 10-bit 传感器
     float colorMatrix1[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // TODO(M2.4)：传感器校准
     int32_t sensorOrientation = 90;              // 映射为 TIFF Orientation
-    std::string make = "Xiaomi";
-    std::string model = "Xiaomi 17 Pro";
+    // 机身标识由机型层注入（core/device IOpticDevice::identity）。此处只留通用占位
+    // 作为兜底：任何机型都不得在 DNG 里留下上一台机型的厂商/型号。
+    std::string make = "Unknown";
+    std::string model = "Unknown";
     std::string software = "Vicold.Optic";
 };
 

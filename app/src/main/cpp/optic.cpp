@@ -351,8 +351,13 @@ extern "C" void android_main(android_app* app) {
         // 有窗口时非阻塞轮询（由 eglSwapBuffers 跟 vsync 限速）；无窗口时：
         // 有等待引擎收摊的挂起操作 → 100ms 轮询（引擎卡 HAL close 时不能永久睡死）；
         // 否则阻塞等事件。
+        //
+        // waiting 必须**先判**：TERM_WINDOW/PAUSE 只置 wantDetach，真正的 ui.detach()
+        // 要等引擎收摊完成，而 HAL close 可能挂起数秒（有 5s+ 真机记录）。这期间
+        // ANativeWindow 已失效、eglSwapBuffers 不再被 vsync 限速 —— 若仍以 timeout=0
+        // 每轮画帧，glue 线程会以单核满速空转数秒。这是「息屏后机身还在发热」的主因。
         const bool waiting = state.wantAttach || state.wantDetach;
-        int timeout = state.ui.attached() ? 0 : (waiting ? 100 : -1);
+        int timeout = (!waiting && state.ui.attached()) ? 0 : (waiting ? 100 : -1);
         int ident = ALooper_pollOnce(timeout, nullptr, &events,
                                      reinterpret_cast<void**>(&source));
         if (ident >= 0 && source != nullptr) source->process(app, source);
@@ -369,7 +374,9 @@ extern "C" void android_main(android_app* app) {
         // 启动意图重试：撞上收摊中的引擎时，这里在收摊完成后补启动（无阻塞）
         state.engine.tryStart();
 
-        if (state.ui.attached()) state.ui.frame();
+        // 收到 window 终止通知（TERM/PAUSE）后停止画帧：表面已不可用，
+        // 继续 swap 只会让 glue 线程空转（详见上方 timeout 注释）。
+        if (state.ui.attached() && !waiting) state.ui.frame();
     }
     LOGI("native main exit");
 }

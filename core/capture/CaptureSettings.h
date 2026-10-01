@@ -23,8 +23,12 @@ struct CaptureSettings {
     // 变焦（逻辑摄 zoomRatio，HAL 自动做物理摄切换）
     float zoomRatio = 0.f;        // 0 = 不设置（保持默认）
 
-    // 应用到请求；返回是否有改动（调用方决定是否重发 repeating）
-    void apply(ACaptureRequest* req, bool skipZoom = false) const;
+    // 帧率目标（机型层 SessionPolicy 提供）：不写 AE_TARGET_FPS_RANGE 时 HAL 往往按
+    // TEMPLATE 取到最大档，三摄常驻下等于把 ISP/DRAM/GPU 负载无条件翻倍。
+    int32_t fpsMin = 30, fpsMax = 30;
+
+    // 应用到请求；forPreview=false 用于单拍请求（不限制其帧率策略）
+    void apply(ACaptureRequest* req, bool skipZoom = false, bool forPreview = true) const;
 };
 
 // 两个设置是否要求重发 repeating（粗粒度：任一字段变化即重发）

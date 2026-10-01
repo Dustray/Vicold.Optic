@@ -200,6 +200,9 @@ bool Gl::attach(ANativeWindow* win) {
         LOGE("eglChooseConfig failed");
         return false;
     }
+    // 别试 EGL_SWAP_BEHAVIOR / EGL_BUFFER_DESTROYED：理论上能省掉每 swap 拷回上一帧的
+    // 13MB 读写，但 2026-10-01 真机实测**该属性会让 eglCreateWindowSurface 直接失败**
+    //（Adreno 对 window surface 不接受覆盖 swap behavior）。保持默认最小值。
     EGLint surfAttrs[] = {EGL_NONE};
     impl_.surf = eglCreateWindowSurface(impl_.dpy, cfg, win, surfAttrs);
     if (impl_.surf == EGL_NO_SURFACE) { LOGE("eglCreateWindowSurface failed"); return false; }

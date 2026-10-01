@@ -115,9 +115,10 @@ bool CameraDevice::readTraits(const char* id) {
     // 高倍数字区（SAT/长焦融合），两者都要物理直连绕开（见 CameraEngine）。
     if (traits_.logical && !traits_.physicalIds.empty()) {
         float fMin = 1e9f, fMax = 0.f, fMain = 0.f;
-        float swMin = 0.f, swMax = 0.f, swMain = 0.f;   // 传感器宽 mm
-        std::string minId, maxId;
+        float swMain = 0.f;                             // 主摄传感器宽 mm
+        std::string minId, maxId;   // 焦距最短/最长者（旧判据的兜底用）
         std::map<std::string, float> swOf;              // id -> sensorW
+        std::map<std::string, float> fOf;               // id -> focal length (mm)
         for (auto& pid : traits_.physicalIds) {
             ACameraMetadata* pc = nullptr;
             if (ACameraManager_getCameraCharacteristics(manager_, pid.c_str(), &pc) != ACAMERA_OK || !pc)
@@ -134,37 +135,52 @@ bool CameraDevice::readTraits(const char* id) {
                     se.count >= 1)
                     sw = se.data.f[0];
                 swOf[pid] = sw;
-                if (fl < fMin) { fMin = fl; minId = pid; swMin = sw; }
-                if (fl > fMax) { fMax = fl; maxId = pid; swMax = sw; }
+                fOf[pid] = fl;
+                if (fl < fMin) { fMin = fl; minId = pid; }
+                if (fl > fMax) { fMax = fl; maxId = pid; }
             }
             ACameraMetadata_free(pc);
         }
-        // 主摄 = 非（最短/最长）的那一个；成员只有 2 个时主摄 = 较长焦者（无长焦）
-        if (swOf.size() >= 3) {
-            for (auto& pid : traits_.physicalIds) {
-                if (pid != minId && pid != maxId && swOf.count(pid)) {
-                    // 主摄焦距：从 characteristics 里拿不到就复用（此处重新读太重，
-                    // 用 fMain 直接由 swOf 成员对应 —— 再读一次 focal）
-                    ACameraMetadata* pc = nullptr;
-                    if (ACameraManager_getCameraCharacteristics(manager_, pid.c_str(), &pc) ==
-                            ACAMERA_OK &&
-                        pc) {
-                        ACameraMetadata_const_entry fe{};
-                        if (ACameraMetadata_getConstEntry(
-                                pc, ACAMERA_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, &fe) == ACAMERA_OK &&
-                            fe.count > 0)
-                            fMain = fe.data.f[0];
-                        ACameraMetadata_free(pc);
-                    }
-                    swMain = swOf[pid];
-                    if (fMain > 0.f && maxId != minId) traits_.telePhysicalId = maxId;
-                    break;
-                }
+        auto f35 = [](float f, float w) { return w > 0.f ? f * 36.f / w : 0.f; };
+        // ---- 主摄判定：35mm 等效焦距最接近 24mm 的成员（业界通用主摄视角）----
+        // 原实现按「成员 ≥3 才认长焦、只有 2 个时把较短者当超广」判定 —— 在
+        // 「主摄 + 长焦」双摄机型上会把**主摄误判成超广角**（minId 无条件写进
+        // uwPhysicalId）。改成按等效焦距选主摄后判定与成员数无关：
+        //   uw + main      → 主摄是较长者；main + tele → 主摄是较短者。两者都对。
+        constexpr float kRefEquivMm = 24.f;
+        std::string mainId, uwId, teleId;
+        float mainEq = 0.f, uwEq = 0.f, teleEq = 0.f;
+        {
+            float bestD = 1e9f;
+            for (auto& kv : swOf) {
+                const float eq = f35(fOf[kv.first], kv.second);
+                if (eq <= 0.f) continue;
+                const float d = std::fabs(eq - kRefEquivMm);
+                if (d < bestD) { bestD = d; mainId = kv.first; mainEq = eq; }
             }
-        } else if (swOf.size() == 2) {
-            fMain = fMax;
-            swMain = swMax;
         }
+        if (mainId.empty() && swOf.size() >= 3) {
+            // 传感器尺寸缺失 → 退回「既非最短也非最长」的老判据
+            for (auto& kv : swOf)
+                if (kv.first != minId && kv.first != maxId) { mainId = kv.first; break; }
+        }
+        if (mainId.empty()) mainId = maxId.empty() ? minId : maxId;   // 最后兜底
+        fMain = fOf[mainId];
+        swMain = swOf[mainId];
+
+        // 副摄角色按与主摄的等效焦距比划分（阈值留足余量：本机 uw=18.5 / main=23.8
+        // / tele=119.6mm，比值 0.78 / 1.0 / 5.02）。
+        for (auto& kv : swOf) {
+            if (kv.first == mainId) continue;
+            const float eq = f35(fOf[kv.first], kv.second);
+            if (eq <= 0.f) continue;
+            if (eq < mainEq * 0.92f) {           // 明显更广 → 超广（取最接近主摄的）
+                if (uwId.empty() || eq > uwEq) { uwId = kv.first; uwEq = eq; }
+            } else if (eq > mainEq * 1.25f) {    // 明显更长 → 长焦（取最接近主摄的）
+                if (teleId.empty() || eq < teleEq) { teleId = kv.first; teleEq = eq; }
+            }
+        }
+        traits_.telePhysicalId = teleId;
         if (fMain > 0.f) {
             traits_.mainFocal = fMain;
             // 等效焦距比（传感器尺寸缺失时回退纯焦距比）
@@ -173,20 +189,17 @@ bool CameraDevice::readTraits(const char* id) {
                 if (w <= 0.f || w0 <= 0.f) return f / f0;
                 return (f / w) / (f0 / w0);
             };
-            if (fMin > 0.f && !minId.empty())
-                traits_.uwNativeZoom = zoomOf(fMin, swMin, fMain, swMain);
+            if (!uwId.empty())
+                traits_.uwNativeZoom = zoomOf(fOf[uwId], swOf[uwId], fMain, swMain);
             if (!traits_.telePhysicalId.empty())
-                traits_.teleNativeZoom = zoomOf(fMax, swMax, fMain, swMain);
+                traits_.teleNativeZoom = zoomOf(fOf[teleId], swOf[teleId], fMain, swMain);
         }
-        if (minId.empty()) {
+        if (mainId.empty()) {
             LOGW("physical lens detection failed (no focal length for members)");
         } else {
-            traits_.uwPhysicalId = minId;
-            auto f35 = [](float f, float w) { return w > 0.f ? f * 36.f / w : 0.f; };
-            LOGI("phys layout: uw=%s f=%.2fmm(eq %.1fmm) main f=%.2fmm(eq %.1fmm)"
-                 " tele=%s f=%.2fmm(eq %.1fmm) -> uw=%.3fx tele=%.3fx",
-                 minId.c_str(), fMin, f35(fMin, swMin), fMain, f35(fMain, swMain),
-                 traits_.telePhysicalId.c_str(), fMax, f35(fMax, swMax),
+            traits_.uwPhysicalId = uwId;
+            LOGI("phys layout: uw=%s main=%s(eq %.1fmm) tele=%s -> uw=%.3fx tele=%.3fx",
+                 uwId.c_str(), mainId.c_str(), mainEq, traits_.telePhysicalId.c_str(),
                  traits_.uwNativeZoom, traits_.teleNativeZoom);
         }
     }

@@ -22,6 +22,8 @@
 #include "core/capture/RawCapture.h"
 #include "core/capture/StillCapture.h"
 #include "core/capture/StillPipeline.h"
+#include "core/device/DeviceRegistry.h"
+#include "core/device/IOpticDevice.h"
 #include "core/util/ControlFile.h"
 
 namespace optic::ui {
@@ -113,7 +115,7 @@ private:
     ANativeWindow* stillWindow() const;
     // 快门时刻参数快照（滤镜/自定义算法管线的用户设置来源）
     StillParams makeStillParams() const;
-    CaptureSettings settings_;
+    CaptureSettings settings_;      // fpsMin/fpsMax 在 openSession 时从 sessPol_ 取
     // 曝光参数自动状态（UI A 键 / 拖滚轮切换）与 AE 冻结值（AE on 时从结果跟踪）
     bool isoAuto_ = true, ssAuto_ = true;
     int lastAeIso_ = 0;
@@ -151,21 +153,31 @@ private:
     std::string uwPhysId_;      // 当前生效的超广角物理 ID（forcedUwPhys_ > 自动探测 > 回退 "2"）
     std::string telePhysId_;    // 当前生效的长焦物理 ID（forcedTelePhys_ > 自动探测）
     float teleMinZoom_ = 1e9f;  // 长焦原生倍率（= teleNativeZoom，长焦带 crop 的换算带基）
+    // ---- 机型差异一律来自 device 层 ----
+    // 这些数值（融合管线坏区边界、接管点、物理流继承裁切、会话流数上限…）是**真机
+    // 实测结论**，无法从 CameraCharacteristics 问出来。业务层不得自带默认值 ——
+    // 否则第二台机型会带着 pandora 的参数跑（会把 EOS/画质/近距规则全搞错）。
+    // 仍可用 controls.txt 覆盖（near_m / tele_near / phys_min 等诊断键）。
+    optic::device::IOpticDevice& dev_ = optic::device::currentDevice();
+    optic::device::ZoomProfile zoomProf_{dev_.zoomProfile()};
+    optic::device::NearTakeoverRule nearRule_{dev_.nearTakeover()};
+    optic::device::PhysQuirks physQ_{dev_.physQuirks()};
+    optic::device::SessionPolicy sessPol_{dev_.sessionPolicy()};
+
     // 长焦接管点：逻辑流能健康出帧的最大倍率（本机实测 4.8 干净、5.0 起持续断流 ——
     // 2026-09-30）。接管点必须在安全区内，否则用户拖到 5x 时逻辑流已在断流：
     // 画面先冻结、再随长焦接管瞬间跳变（用户所见「5x 瞬间放大好多」）。
-    static constexpr float kLogicalSafeMax = 4.85f;
-    // 用户口径的长焦起点（与系统相机一致：≥5x 用长焦）；必须 ≥ 逻辑流安全上限，
-    // 否则逻辑流会被请求到断流区。
-    static constexpr float kTeleSwitchUser = 5.0f;
-    float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, kTeleSwitchUser)：实际接管点
+    // 用户口径的长焦起点（与系统相机一致：≥5x 用长焦）必须 ≥ 逻辑流安全上限。
+    // 变焦上界：UI 已注入时以 UI 为准（会被 setZoomRange 按 HAL 量程收紧），
+    // 否则退回机型层口径（避免 Engine/Ui 各拿一套上界导致请求被拒）。
+    float zoomLimit() const { return zoomProf_.rangeMax; }
+    float teleSwitch_ = 1e9f;   // = min(teleMinZoom_, zoomProf_.teleSwitchUser)：实际接管点
     // 近距推迟接管（对齐系统相机行为：对焦距离过近时长焦对不上焦，1–20x 恒主摄）：
     // 依据逻辑流 result 的 LENS_FOCUS_DISTANCE 判定被摄距离，滞回 + 帧数去抖。
-    static constexpr float kNearEnterM = 0.9f;   // <0.9m 进入近距（接管点 → teleNearSwitch_）
-    static constexpr float kNearExitM = 1.4f;    // >1.4m 退出近距（恢复 5x 接管）
-    static constexpr int kNearDebounce = 12;     // ~0.4s @30fps
-    float teleNearSwitch_ = 20.f;                // controls.txt tele_near=N 可调（0=关）
-    float nearEnterM_ = kNearEnterM;             // controls.txt near_m=N 可调（0=关距离判定）
+    float teleNearSwitch_ = nearRule_.deferredSwitch;   // controls.txt tele_near=N 可调（0=关）
+    float nearEnterM_ = nearRule_.enterM;               // controls.txt near_m=N 可调（0=关距离判定）
+    float nearExitM_ = nearRule_.exitM;                 // 滞回退出阈值（> enter）
+    bool nearRuleOn_ = nearRule_.enabled;               // 机型是否启用近距推迟接管
     float uwNativeZoom_ = 0.7f; // 超广角光学倍率 f(uw)/f(main)（真机 0.388；探测失败回退 0.7）
                                 // —— FOV 换算基准，与导轨下限 0.7 无关，混用会让超广/主摄衔接错位
     bool sessionIsPhysical_ = false;  // 当前会话是否为物理直连

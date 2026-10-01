@@ -1,4 +1,5 @@
 add_library(optic_core STATIC
+    device/IOpticDevice.cpp
     device/DeviceRegistry.cpp
     device/generic/GenericDevice.cpp
     device/xiaomi17pro/Xiaomi17ProDevice.cpp
