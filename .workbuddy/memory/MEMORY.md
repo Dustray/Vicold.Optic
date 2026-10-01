@@ -141,3 +141,21 @@ doc/PLAN.md 是唯一路线图（M0–M7），doc/devices/xiaomi17pro/CAPABILITY
  勿再用 fs×系数估算——Gl::text 的 y 是 ascent 行顶，估算法必然偏。
 * **布局现值**：轨道 x92、预览 x198（右侧间隙 +22）、EV 面板 x222、AF x626；
  Gl::attach 同窗口尺寸变化也重建（视口跟上）。
+
+## 真机调试铁律（2026-10-01，血泪）
+* **绝不 force-stop/-S 本 app**：MIUI 会在 app 停止时把 activity component 置 disabled
+ （`pm enable component` 被 SecurityException 拒，无 root 无解）→ am start 全报
+ "Activity does not exist"。被冻结后的恢复链（全程不碰 force-stop）：
+ `am stack list` 找 taskId → `am stack remove <tid>` 清僵尸 task →
+ `pm install-existing --user 0 com.vicold.optic` 复位 component →
+ `am start -f 0x10008000 -n com.vicold.optic/android.app.NativeActivity`。
+ 僵尸 task 症状："brought to the front" 但 ps 无进程。勿用不带 --user 的
+ install-existing（会装进 user 10 隐私空间弹权限框卡前台，需 `pm uninstall --user 10` 清）。
+* **冷重启（改 controls.txt 后需重启生效时）**：`input keyevent 3`(HOME) → 等 8-12s
+ → `am kill com.vicold.optic`（只杀安全后台进程，**不触发 MIUI 冻结**）→ 改配置 →
+ `am start -f 0x10008000`。am kill 在 HOME 后立刻执行会因"不安全"静默不杀，必须等 idle。
+* **GPU 频率/busy 节点被 SELinux 全域锁死**（kgsl、/sys/kernel/gpu、devfreq 对 shell 也
+ denied）——HUD GPU freq/busy 显示 -- 是设备限制；CPU/GPU 温度与 CPU 频率可读。
+ thermal_zone 的 `cpu-hw-trip-*=95000` 是降频阈值非实测温度，取 max 会误读 95°C；
+ 真实热点看 cpu-0-0-1/gpuss-0/camera-0。
+* 预览 HUD：FPS + SysMon（core/ui/SysMon，CPU/GPU 频率温度，与 fps 同步 2Hz）。

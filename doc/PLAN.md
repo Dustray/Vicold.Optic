@@ -158,7 +158,7 @@ struct IOpticDevice {
 > - 1.7 ⏳ 会话延迟优化（未开工）
 > - **新增：拍摄按钮**（JNI 子窗口 TYPE_APPLICATION_PANEL，主线程 onWindowFocusChanged 创建）+ 每启动配额（saveQuota=1）+ 一次性命令自消费——真机验证：点按钮 → `shutter triggered (1/1)` → 恰好 4 帧 RAW（iso=89）→ 再点 `quota exhausted`
 > - **新增：存储保险丝**（155GB 事故复盘：controls.txt 在 FUSE 上 mtime 抖动导致 zsl_shutter 每轮询重触发；修复 = 内容比对 + 自消费 + 配额）
-> - 遗留：RawCapture 字节保险丝（补丁 D）待套；M2.1 需做落盘时精确配对（当前 miss delta=66ms=2 帧，回退值可用）
+> - 遗留：RawCapture 字节保险丝（补丁 D）待套；M2.1 落盘时精确配对 ✅（2026-10-01 等待在途结果闭环，见 M2 状态）
 
 | # | 任务 | 优先级 |
 |---|---|---|
@@ -230,6 +230,10 @@ struct IOpticDevice {
 >   DNGVersion/BackwardVersion/UniqueCameraModel/ColorMatrix1/AsShotNeutral/BlackLevel×4/WhiteLevel/
 >   DefaultCropOrigin+Size/ActiveArea/CFARepeatPatternDim/CFAPattern/CFALayout/CalibrationIlluminant1/ISO/ExposureTime
 > - 2.1 补充 ✅ 元数据配对移至落盘时（根治 66ms 乱序 miss；到达时配对已废弃）
+> - 2.1 补充 2（2026-10-01）✅ 快门场景配对等待闭环：ZSL 回溯的是 ring 最新帧，结果仍晚 ~2-3 帧
+>   （delta≈99ms）→ 落盘配对改为「结果在途时有界等待 300ms + notify 唤醒」，兜底改取时间最近
+>   meta。真机验证：`meta paired after wait` 命中、无 miss 告警、首张延迟仅增 ~80ms。
+>   同轮复测 RAW 冷启动首窗口即 30fps（此前 ~9fps 骤降未复现，疑为设备长跑热态）。
 > - 2.3 ⏳ 机身方向/EXIF IFD/GPS（Orientation 已按 sensor 90→6 映射；EXIF 子 IFD 待做）
 > - 2.4 ⏳ 校验闭环：Python 结构校验 ✅ + demosaic 预览渲染 ✅（场景可辨、文字清晰）；Lightroom 导入 + 连拍 100 张压力、ColorMatrix1 校准（当前为占位单位阵）、hot pixel（max=65535 离群点待查）待做
 > - 实测：`dng saved: dng_xxx.dng (25756630 bytes, thumb 512x384)` ×4 = 24MiB bayer + 590KiB 缩略图 + tags
