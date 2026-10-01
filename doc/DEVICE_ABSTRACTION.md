@@ -33,8 +33,9 @@
 | `zoomProfile()` | ZoomProfile | 量程、关键焦段、逻辑安全带、接管点、mm 基准 |
 | `nearTakeover()` | NearTakeoverRule | 近距推迟接管的距离/倍率/去抖 |
 | `physQuirks()` | PhysQuirks | 物理流继承裁切、per-key 是否真实执行 |
-| `sessionPolicy()` | SessionPolicy | 预览槽数、预览尺寸、最大输出数、降级阶梯、帧率目标 |
+| `sessionPolicy()` | SessionPolicy | 预览槽数、预览尺寸、**预览缓冲格式**（`previewFormat`，多数 HAL 只有 PRIVATE 零拷贝稳定）、**副摄预览尺寸**（`auxPreviewW/H`，非显示带降分辨率省带宽）、最大输出数、降级阶梯、**帧率目标**与 **UI 渲染节拍上限**（`uiRenderFps`） |
 | `uiLayout()` | UiLayoutPolicy | 挖孔禁区边界与避让带宽 |
+| `fontCandidates()` | vector<string> | 候选中文字体路径（按优先级）。不同 ROM 字体名/格式差异巨大且**无法探测**，只能按机型列举；运行时选静态 TrueType(glyf) 且中文覆盖率最高的 |
 | `applyQuirks(cfgs)` | void | 会话创建前对流配置的最后修正（Hook） |
 | `tuningFileFor(id)` | string | per-sensor tuning 路径（M4） |
 
@@ -57,6 +58,7 @@ quirk 而出错。
 | `CameraEngine` | zoomProfile / nearTakeover / physQuirks / sessionPolicy / identity | `kLogicalSafeMax 4.85`、`kTeleSwitchUser 5.0`、`0.9m/1.4m/12帧/20x`、`:606` 的魔法数 `2.5f`、内联的"物理流继承裁切"分支、`"Xiaomi 17 Pro"` 机型名、5→4 流的降级阶梯 |
 | `CaptureSettings` | sessionPolicy.targetFps* | 原先完全没写 `AE_TARGET_FPS_RANGE` |
 | `Ui` | uiLayout / zoomProfile / sessionPolicy | 挖孔常量 88/80、`kZoomMin/Max/BaseMm 0.7/120/23`、关键焦段表、预览尺寸 1920×1440、预览槽数 3、过期的 `teleMin_ = 2.63` |
+| `Gl`(经由 `Ui`) | sessionPolicy.previewFormat / auxPreviewW/H、fontCandidates() | 预览 `AImageReader` 的硬编码 `AIMAGE_FORMAT_PRIVATE`、副摄同主摄满分辨率、字体路径里的 pandora 硬编码 `/product/fonts/...` 列表（现由机型层提供候选，运行时择优） |
 | `RawCapture`(经由 engine) | identity | `StaticMeta::make/model` 的 `"Xiaomi"` / `"Xiaomi 17 Pro"` 默认值（已改为 `Unknown` 兜底） |
 | `CameraDevice` | — | 镜头角色判定改为**按 35mm 等效焦距选主摄**（原先"≥3 成员才认长焦"，会把「主摄+长焦」双摄机型的主摄误判成超广角） |
 
@@ -76,3 +78,8 @@ quirk 而出错。
   对 window surface 不接受覆盖 swap behavior —— 别再试了。
 - **预览槽数 ≠ 3 时**要确认 `Ui::previewSlots_` 与 `CameraEngine` 的 `previewWindow(slot)`
   循环一致，否则会出现"会话挂了 slot 但 UI 没建 reader"。
+- **UI 静态覆盖层走离屏 FBO 缓存 + 逐帧合成**（2026-10-01 优化）：轨道/刻度/文字/HUD 等
+  不随预览帧变化的元素只在「脏」（输入/状态变化）或直方图刷新（~4Hz）时重烤进一张 RGBA
+  纹理，稳态每帧只做 1 次全屏合成（≈2 draw call），把 ~120 次 UI draw call 从 30Hz 降到
+  ~4Hz —— 这是 glue 线程 GPU/发热的主要杠杆，且机型无关。预览、闪光、跨带淡化不进缓存
+  （逐帧绘制）。要在新机型上复现此收益，只需正常接 `sessionPolicy`；覆盖层缓存是 Gl 内部机制。

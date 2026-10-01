@@ -15,4 +15,17 @@ DeviceIdentity IOpticDevice::identity() const {
     return id;
 }
 
+// 默认字体候选：AOSP 常见路径。厂商机型请覆盖（自家 ROM 的中文字体名/格式各异）——
+// 每个候选都会被实际 InitFont 探测，失败自动跳过，因此多列无害、漏列才会没字。
+std::vector<std::string> IOpticDevice::fontCandidates() const {
+    return {
+        "/system/fonts/NotoSansCJK-Regular.ttc",   // CFF 轮廓，多数 ROM 会被 stb 拒绝
+        "/system/fonts/NotoSansSC-Regular.otf",
+        "/system/fonts/NotoSans-Regular.ttf",
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans.ttf",
+        "/system/fonts/DroidSansFallback.ttf",     // 历史中文备选
+    };
+}
+
 } // namespace optic::device

@@ -117,8 +117,10 @@ bool Ui::attach(ANativeWindow* win) {
     if (attached() && gl_.width() == ANativeWindow_getWidth(win)) return true;
     if (!gl_.attach(win)) return false;
     // 字体烘焙固定高分辨率（56px）：渲染时 px 永远 < 烘焙值 → 始终为**缩小**采样，
-    // 文字边缘锐利；且与 kUiZoom 解耦，后续再调大字号也不糊。
-    if (!gl_.bakeFont(56.f)) LOGE("font bake failed (text disabled)");
+    // 文字边缘锐利；且与 kUiZoom 解耦，后续再调大字号也不糊。候选字体**来自机型层**
+    //（不同 ROM 的中文字体名/格式差异巨大，无法探测，只能列举），运行时选 CJK 覆盖率最高者。
+    if (!gl_.bakeFont(56.f, optic::device::currentDevice().fontCandidates()))
+        LOGE("font bake failed (text disabled)");
 
     // 预览源默认尺寸来自机型层（必须落在本机 preview-size 列表内，否则 HAL 拒绝会话）；
     // controls.txt 的 preview_w/preview_h 仍可覆盖（诊断用）。
@@ -140,7 +142,16 @@ bool Ui::attach(ANativeWindow* win) {
     // 预览源数量来自机型层（三摄 = 逻辑 + uw + tele）：AImageReader 创建无 GL 依赖。
     // 源数少于机型实际/降级模式下多余槽位空闲（未挂会话不出帧，无开销）。
     previewSlots_ = std::clamp(pol.previewSlots, 1, gl_.maxSources());
-    for (int i = 0; i < previewSlots_; ++i) gl_.makePreviewSource(i, pw, ph);
+    // 格式来自机型层（多数 HAL 只有 PRIVATE 零拷贝路径稳定出帧）；副摄（uw/tele，slot≥1）
+    // 预览尺寸可被机型层降到 auxPreviewW/H —— 非显示带降分辨率省 ISP/GPU 带宽与发热，
+    // 显示带（slot 0 逻辑 / 切到的物理带）仍满分辨率。aux=0 表示副摄同主摄（pandora 即如此）。
+    const int auxW = pol.auxPreviewW > 0 ? pol.auxPreviewW : pw;
+    const int auxH = pol.auxPreviewH > 0 ? pol.auxPreviewH : ph;
+    for (int i = 0; i < previewSlots_; ++i) {
+        const int w = i == 0 ? pw : auxW;
+        const int h = i == 0 ? ph : auxH;
+        gl_.makePreviewSource(i, w, h, pol.previewFormat);
+    }
 
     // cover：等比铺满。横向溢出优先裁掉左侧摄像头避让区（80 设计 px 的留白），
     // 剩余再两侧均分——这样无论系统为挖孔保留多宽，快门都不会被裁；纵向溢出两侧均分。
@@ -163,6 +174,7 @@ bool Ui::attach(ANativeWindow* win) {
     }
     railLW_ = kRailREnd - railLX_;
     offY_ = -(kStageH * scale_ - float(gl_.height())) / 2.f;
+    dirty_ = true;   // 尺寸/布局变化后覆盖层必须重烤
     LOGI("ui attached: win=%dx%d scale=%.3f off=(%.0f,%.0f)", gl_.width(), gl_.height(),
          scale_, offX_, offY_);
     return true;
@@ -226,6 +238,7 @@ void Ui::onInputEvent(AInputEvent* e) {
 }
 
 void Ui::onDown(float x, float y, double tMs) {
+    markDirty();     // 任何触摸都改变覆盖层（格式/快门/AE 锁/拖拽起点），重烤
     hapStop_ = -1;   // 新触摸重置落档触感跟踪
     // RAW/JPG 格式角标（预览左上第一枚）：点按切换拍摄格式（引擎重建会话 ~300ms）。
     // 热区存设计坐标（onDown 的 x/y 已是 toDesign 反变换后的设计值），上下各放宽 6px 好按
@@ -421,6 +434,7 @@ void Ui::onMove(float x, float y) {
         }
         default: break;
     }
+    markDirty();     // 拖拽中 zoom/iso/ss/ev 实时变化，覆盖层需重烤
 }
 
 void Ui::onUp(float x, float y) {
@@ -486,6 +500,7 @@ void Ui::onUp(float x, float y) {
         shutterDown_ = false;
     }
     drag_ = Drag::NONE;
+    markDirty();     // 松手落位改变 zoom/iso/ss/ev，覆盖层需重烤
 }
 
 // ---- 绘制 ----
@@ -917,7 +932,7 @@ void Ui::drawPreviewOverlay() {
                  12 * kUiZoom * scale_, evAcc);
     }
     // EV 轨：水平中心确认刻度盘，量程/步长按设备 traits（引擎 setEvRange 下发）。
-    // 本机 pandora：±8 EV、1/3 步长（49 档）。
+    // EV 量程/步长来自设备 traits（setEvRange 下发），此处按值映射绘制刻度。
     {
         const float span = evMaxEv_ - evMinEv_;
         const int nSteps = std::clamp(int(std::lround(span / evStepEv_)) + 1, 2, 241);
@@ -1004,17 +1019,13 @@ void Ui::frame() {
 
     gl_.beginFrame(kBg);
 
-    // ---- 预览（相机 → GL 纹理）----
+    // ---- 预览（相机 → GL 纹理，主帧缓冲）----
     // 全带统一的 crop 补偿：crop = zoom_（手指目标）/ az（相机实际出图倍率）。
-    //  - 为什么逻辑带也要补：相机侧下发有 120ms 节流，画面若全靠相机跟随就是
-    //    8 次/s 的阶梯跳。补差后相机阶梯跳一步、crop 同步收一点，FOV 每帧连续。
+    //  - 逻辑带相机侧 120ms 节流：补差后 FOV 每帧连续，不表现为 8 次/s 阶梯跳。
     //  - **az 必须与显示帧时间戳对齐**（Gl::acquirePreview → 引擎结果环查询）：
-    //    旧做法用「最新结果」的 az，领先显示纹理 1-2 帧，快拖时 crop 与纹理错位，
-    //    显示 FOV 在两个值间泵动（1–5x「不丝滑/来回闪」根因）。对齐后
     //    显示 FOV = az × crop ≡ zoom_ 恒成立，crop 直接落位、无需任何平滑。
     //  - 物理带（quirk physPerKeyZoom=false）：az = 带基常量，crop 纯由手指驱动。
-    //  - az 变化（相机真实变焦生效）时 crop 直接落位，绝不能归一到 1：归一会让
-    //    FOV 先退回 az 再爬升 = 泵动闪烁（2026-09-29 全程闪烁的元凶）。
+    //  - az 变化时 crop 直接落位，绝不归一到 1（否则泵动闪烁）。
     {
         const float az = az_[previewActive_].load(std::memory_order_acquire);
         float target = 1.f;
@@ -1034,15 +1045,40 @@ void Ui::frame() {
     gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                     int(dim(kPreviewH)), resolveUvRot(), previewActive_);
     if (fadeT_ > 0.f && fadeFrom_ >= 0 && fadeFrom_ != previewActive_) {
-        // 淡化旧层用**自己的 az** 求 crop：新带 crop 已按新带落位，旧带纹理若沿用会被
-        // 放大 (zoom_/az_旧带) 倍 —— 跨带切换大闪烁的元凶之二（元凶之一是带基 az 陈旧，
-        // 见 CameraEngine::onFrameResult）。
+        // 淡化旧层用**自己的 az** 求 crop（跨带切换大闪烁元凶之二）。
         const float azo = az_[fadeFrom_].load(std::memory_order_acquire);
         float fadeCrop = 1.f;
         if (azo > 0.01f) fadeCrop = std::clamp(zoom_ / azo, 1.f, 32.f);
         gl_.drawPreview(int(screenX(kPreviewX)), int(screenY(kPreviewY)), int(dim(kPreviewW)),
                         int(dim(kPreviewH)), resolveUvRot(), fadeFrom_, fadeT_, fadeCrop);
     }
+
+    // ---- 静态覆盖层（轨道/刻度/文字/HUD/直方图框）：离屏缓存 + 逐帧合成 ----
+    // 仅「脏」（输入/状态变化）或直方图刷新（~4Hz）时重烤进纹理；稳态每帧只做 1 次
+    // 全屏合成（≈2 draw call），把 ~120 次 draw call 从 30Hz 降到 ~4Hz —— glue 线程
+    // GPU/发热的主要杠杆（机型无关，常量在 Gl.h 注释）。预览/闪光/跨带淡化不进缓存。
+    if (dirty_ || gl_.consumeHistUpdated(histSlot)) {
+        if (gl_.beginOverlay()) {
+            paintOverlay();
+            gl_.endOverlay();
+            dirty_ = false;
+        }
+    }
+    gl_.drawOverlayFull();   // 合成缓存覆盖层（透明区透出下方预览）
+
+    // ---- 白闪（最顶层，逐帧绘制）----
+    double now = nowSec();
+    if (now < flashUntil_) {
+        Rgba f = kWhite;
+        f.a = 0.85f * float((flashUntil_ - now) / 0.10);
+        gl_.roundedRect(screenX(kPreviewX), screenY(kPreviewY), dim(kPreviewW),
+                        dim(kPreviewH), 0, f, kNone, 0);
+    }
+    // 拍照反馈已全部收敛到 HUD 角标行（SAVING / 配额提示），此处不再画浮层 toast
+    gl_.swap();
+}
+
+void Ui::paintOverlay() {
     drawPreviewOverlay();
 
     // ---- 左侧：摄像头避让区（真机只留黑，虚线为设计标注不绘制）----
@@ -1137,17 +1173,6 @@ void Ui::frame() {
                  gl_.textCenterTop("AE", fs, screenY(kAeLockY + kAeLockD / 2)), fs,
                  aeLock_ ? kT1 : kT3);
     }
-
-    // ---- 白闪 + toast ----
-    double now = nowSec();
-    if (now < flashUntil_) {
-        Rgba f = kWhite;
-        f.a = 0.85f * float((flashUntil_ - now) / 0.10);
-        gl_.roundedRect(screenX(kPreviewX), screenY(kPreviewY), dim(kPreviewW),
-                        dim(kPreviewH), 0, f, kNone, 0);
-    }
-    // 拍照反馈已全部收敛到 HUD 角标行（SAVING / 配额提示），此处不再画浮层 toast
-    gl_.swap();
 }
 
 } // namespace optic::ui

@@ -60,6 +60,9 @@ ZoomProfile Xiaomi17ProDevice::zoomProfile() const {
     p.logicalFallbackMax = 2.5f;   // 无长焦时的兜底
     p.baseEquivMm = 23.f;          // 本机主摄 35mm 等效焦距（1x = 23mm）
     p.stops = {0.7f, 1, 2, 5, 10, 50, 120};
+    // 成员布局 uw=18.5 / main=23.8 / tele=119.6mm（等效比 0.78 / 1.0 / 5.02）
+    p.uwRoleRatio = 0.92f;
+    p.teleRoleRatio = 1.25f;
     return p;
 }
 
@@ -97,8 +100,17 @@ SessionPolicy Xiaomi17ProDevice::sessionPolicy() const {
     s.allowSingleStreamFallback = true;
     s.previewW = 1920;
     s.previewH = 1440;
+    // 三路预览都用 PRIVATE：本机 YUV/RGBA ImageReader 通路被 HAL 劫持不供帧，
+    // 只有 PRIVATE + GPU_SAMPLED_IMAGE → EGLImage（samplerExternalOES）稳定。
+    s.previewFormat = AIMAGE_FORMAT_PRIVATE;
+    // 三个物理成员都能出 1920×1440（= 0），故副摄不降级：
+    // 任一带都可能成为当前显示源，降尺寸会直接牺牲该带的取景清晰度。
+    s.auxPreviewW = 0;
+    s.auxPreviewH = 0;
     s.targetFpsMin = 30;       // 三路常驻已在吃满 ISP 带宽，不要把自己跑到 60
     s.targetFpsMax = 30;
+    // UI 渲染跟着 30fps 预览走即可（不必要只看实拍帧，单纯浪费 GPU 和电）
+    s.uiRenderFps = 30;
     return s;
 }
 
@@ -111,6 +123,24 @@ UiLayoutPolicy Xiaomi17ProDevice::uiLayout() const {
     u.cutoutReserveW = 80.f;       // 150 设备px 保留带 ÷ 1.7026（设计 px）
     u.hasLeftCutout = true;
     return u;
+}
+
+// pandora /product/fonts 下的中文候选。必须**静态 TrueType(glyf)**：
+//   MiSansVF.ttf = 可变字体（stb 不支持 gvar → 连笔）、
+//   NotoSansCJK.ttc = CFF 轮廓（InitFont 失败）、
+//   MiSansC_3.005.ttf = 仅西文子集（CJK 覆盖 0）。
+// 运行时按「实际覆盖了多少个 UI 需要的汉字」择优，多列候选无害。
+std::vector<std::string> Xiaomi17ProDevice::fontCandidates() const {
+    std::vector<std::string> v = IOpticDevice::fontCandidates();   // 通用兜底排在后面
+    v.insert(v.begin(), {
+        "/product/fonts/FZFWZhuZiAYuanJWB.TTF",   // 本机实测命中（cjk 23/23）
+        "/product/fonts/MiSansRoundedSC.ttf",
+        "/product/fonts/BeihaibeiSC-Regular.ttf",
+        "/product/fonts/MiSansC_3.005.ttf",
+        "/product/fonts/MiSansVF.ttf",            // 可变字体，已知可能连笔
+        "/system/fonts/MiSansVF.ttf",
+    });
+    return v;
 }
 
 } // namespace optic::device

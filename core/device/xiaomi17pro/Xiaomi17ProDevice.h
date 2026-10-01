@@ -23,6 +23,8 @@ public:
     PhysQuirks physQuirks() const override;
     SessionPolicy sessionPolicy() const override;
     UiLayoutPolicy uiLayout() const override;
+    // 本机 ROM 自带的中文字体（顺序无关，运行时按实际 CJK 覆盖率择优）
+    std::vector<std::string> fontCandidates() const override;
 
     const char* name() const override { return "Xiaomi17Pro"; }
 };

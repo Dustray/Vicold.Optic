@@ -173,6 +173,16 @@ const char* kFsHist =
     "uniform samplerExternalOES uTex;\n"
     "varying vec2 vUv;\n"
     "void main(){ gl_FragColor = vec4(texture2D(uTex, vUv).rgb, 1.0); }\n";
+// 覆盖层合成：把离屏 RGBA 纹理全屏铺到窗口（1:1 像素对齐）
+const char* kVsBlit =
+    "attribute vec2 aPos;\n"
+    "varying vec2 vUv;\n"
+    "void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+const char* kFsBlit =
+    "precision mediump float;\n"
+    "uniform sampler2D uTex;\n"
+    "varying vec2 vUv;\n"
+    "void main(){ gl_FragColor = texture2D(uTex, vUv); }\n";
 } // namespace
 
 // ---- Gl 接口实现 ----
@@ -219,12 +229,17 @@ bool Gl::attach(ANativeWindow* win) {
     impl_.progRect = program(kVsRect, kFsRect);
     impl_.progText = program(kVsText, kFsText);
     impl_.progSolid = program(kVsSolid, kFsSolid);
-    if (!impl_.progPreview || !impl_.progRect || !impl_.progText || !impl_.progSolid) return false;
+    impl_.progBlit_ = program(kVsBlit, kFsBlit);
+    if (!impl_.progPreview || !impl_.progRect || !impl_.progText || !impl_.progSolid ||
+        !impl_.progBlit_)
+        return false;
     impl_.aPv = glGetAttribLocation(impl_.progPreview, "aPos");
     impl_.aRect = glGetAttribLocation(impl_.progRect, "aPos");
     impl_.aText = glGetAttribLocation(impl_.progText, "aPos");
     impl_.aUv = glGetAttribLocation(impl_.progText, "aUv");
     impl_.aSolid = glGetAttribLocation(impl_.progSolid, "aPos");
+    impl_.aBlit_ = glGetAttribLocation(impl_.progBlit_, "aPos");
+    impl_.uBlitTex_ = glGetUniformLocation(impl_.progBlit_, "uTex");
     impl_.uPv.rect = glGetUniformLocation(impl_.progPreview, "uRect");
     impl_.uPv.viewport = glGetUniformLocation(impl_.progPreview, "uViewport");
     impl_.uPv.uv = glGetUniformLocation(impl_.progPreview, "uUv");
@@ -289,6 +304,11 @@ void Gl::detach() {
         if (impl_.progRect) glDeleteProgram(impl_.progRect);
         if (impl_.progText) glDeleteProgram(impl_.progText);
         if (impl_.progSolid) glDeleteProgram(impl_.progSolid);
+        if (impl_.progBlit_) glDeleteProgram(impl_.progBlit_);
+        if (impl_.overlayFbo_) glDeleteFramebuffers(1, &impl_.overlayFbo_);
+        if (impl_.overlayTex_) glDeleteTextures(1, &impl_.overlayTex_);
+        impl_.overlayFbo_ = impl_.overlayTex_ = 0;
+        impl_.overlayW_ = impl_.overlayH_ = 0;
         if (histFbo_) glDeleteFramebuffers(1, &histFbo_);
         if (histTex_) glDeleteTextures(1, &histTex_);
         if (progHist_) glDeleteProgram(progHist_);
@@ -303,7 +323,7 @@ void Gl::detach() {
     impl_.dpy = EGL_NO_DISPLAY;
     impl_.surf = EGL_NO_SURFACE;
     impl_.ctx = EGL_NO_CONTEXT;
-    impl_.progPreview = impl_.progRect = impl_.progText = impl_.progSolid = 0;
+    impl_.progPreview = impl_.progRect = impl_.progText = impl_.progSolid = impl_.progBlit_ = 0;
     impl_.uPv = {};
     impl_.uRect = {};
     impl_.uText = {};
@@ -323,19 +343,17 @@ bool Gl::ready() const { return impl_.dpy != EGL_NO_DISPLAY && impl_.surf != EGL
 int32_t Gl::width() const { return winW_; }
 int32_t Gl::height() const { return winH_; }
 
-bool Gl::makePreviewSource(int slot, int32_t w, int32_t h) {
+bool Gl::makePreviewSource(int slot, int32_t w, int32_t h, int32_t fmt) {
     if (!ready()) return false;
     if (slot < 0 || slot >= kSrcN) return false;
     Source& s = src_[slot];
     if (s.reader) return true;
-    // 17 Pro 实测：YUV/RGBA ImageReader 通路被小米 HAL 劫持不供帧，
-    // 走标准零拷贝路径：PRIV(0x22) + GPU_SAMPLED_IMAGE → EGLImage → samplerExternalOES。
-    // maxImages=3（acquireLatest 语义只需浅队列）；三路源 ×3 buffer 控制内存。
+    // 格式由机型层决定（默认 PRIVATE）：多数 HAL 只对 PRIVATE(+GPU_SAMPLED_IMAGE)
+    // → EGLImage → samplerExternalOES 这条零拷贝路径稳定供帧，申请 YUV/RGBA 有不
+    // 出帧的先例。maxImages=3（acquireLatest 语义只需浅队列）；三路源 ×3 buffer 控制内存。
     uint64_t usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
-    if (AImageReader_newWithUsage(w, h, AIMAGE_FORMAT_PRIVATE, usage, 3, &s.reader) !=
-            AMEDIA_OK ||
-        !s.reader) {
-        LOGE("preview AImageReader_new failed (slot=%d)", slot);
+    if (AImageReader_newWithUsage(w, h, fmt, usage, 3, &s.reader) != AMEDIA_OK || !s.reader) {
+        LOGE("preview AImageReader_new failed (slot=%d fmt=0x%x)", slot, fmt);
         return false;
     }
 
@@ -352,7 +370,7 @@ bool Gl::makePreviewSource(int slot, int32_t w, int32_t h) {
     }
     s.w = w;
     s.h = h;
-    LOGI("preview source ready: slot=%d %dx%d PRIV(GPU)", slot, w, h);
+    LOGI("preview source ready: slot=%d %dx%d fmt=0x%x GPU", slot, w, h, fmt);
     return true;
 }
 
@@ -454,15 +472,16 @@ bool Gl::acquirePreview(int slot, bool wantHist) {
     AImage_delete(img);
     ++s.frameNo;
 
-    // 直方图统计：RGBA_8888 流无法 AImage_getPlaneData（仅支持 YUV_420_888），
-    // CPU 直读是死路 —— 走 GL 降采样（纹理 → 128×96 FBO → readPixels → 64-bin）。
-    // 只对显示源开启 + ~120ms 节流：readPixels 同步 stall 管线，逐帧全开会掉帧。
+    // 直方图统计：预览软件頻 RGBA 取不到（YUV_420_888 才行 AImage_getPlaneData），
+    // CPU 直读是死路 —— 走 GL 降采样（纹理 → 小 FBO → readPixels → 64-bin）。
+    // 只对显示源开启 + 机型无关的固定节流（见 Gl.h 的 kHistPeriodSec 注释）：
+    // readPixels 同步 stall 管线，逐帧全开会掉帧。
     // 注意在 AImage_delete 之后执行（读回期间不占用 reader 的 maxImages 配额）。
     if (wantHist) {
         const double now =
             std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
                 .count();
-        if (now - s.lastHistT >= 0.12) {
+        if (now - s.lastHistT >= kHistPeriodSec) {
             sampleHistogram(s);
             s.lastHistT = now;
         }
@@ -528,6 +547,7 @@ void Gl::sampleHistogram(Source& s) {
         ++s.hist[2][p[2] >> 2];
     }
     s.histValid = true;
+    s.histNew = true;                                // 标记新样本（UI 据此重烤覆盖层）
 }
 
 void Gl::copyHistogram(int slot, int32_t outR[64], int32_t outG[64], int32_t outB[64]) const {
@@ -539,8 +559,9 @@ void Gl::copyHistogram(int slot, int32_t outR[64], int32_t outG[64], int32_t out
     std::memcpy(outB, s.hist[2], 64 * sizeof(int32_t));
 }
 
-bool Gl::bakeFont(float bakedPx) {
+bool Gl::bakeFont(float bakedPx, const std::vector<std::string>& fonts) {
     if (!ready()) return false;
+    if (fonts.empty()) { LOGE("font: no candidates supplied"); return false; }
 
     // 先构建需要光栅化的字符集（不依赖字体，可提前用于覆盖率统计）
     std::set<uint32_t> cps;
@@ -560,32 +581,25 @@ bool Gl::bakeFont(float bakedPx) {
     int cjkNeed = 0;
     for (uint32_t c : cps) if (c >= 0x4E00 && c <= 0x9FFF) ++cjkNeed;
 
-    // 候选字体：必须「静态 TrueType(glyf)」。MiSansVF 是可变字体(stb 不支持 gvar→连笔)，
-    // NotoSansCJK ttc 是 CFF 轮廓(stb InitFont 失败)。自动选中文覆盖率最高的那一个。
-    static const char* kFonts[] = {
-        "/product/fonts/MiSansC_3.005.ttf",
-        "/product/fonts/BeihaibeiSC-Regular.ttf",
-        "/product/fonts/MiSansRoundedSC.ttf",
-        "/product/fonts/FZFWZhuZiAYuanJWB.TTF",
-        "/system/fonts/DroidSans.ttf",
-        "/system/fonts/MiSansVF.ttf",  // 最后兜底（可变字体，已知可能连笔）
-    };
+    // 候选字体来自机型层（fonts 参数）：不同 ROM 的中文字体名/格式差异巨大，无法探测，
+    // 只能按机型列举。逐个探测，选**静态 TrueType(glyf)** 且中文覆盖率最高的那一个
+    //（MiSansVF 可变字体 stb 不支持 gvar→连笔；NotoSansCJK ttc 是 CFF 轮廓 InitFont 失败）。
     std::vector<uint8_t> font;
     const char* used = nullptr;
     int bestCov = -1;
-    for (const char* p : kFonts) {
+    for (const std::string& p : fonts) {
         std::ifstream f(p, std::ios::binary);
-        if (!f) { LOGI("font skip (missing): %s", p); continue; }
+        if (!f) { LOGI("font skip (missing): %s", p.c_str()); continue; }
         f.seekg(0, std::ios::end); size_t n = size_t(f.tellg()); if (!n) continue;
         f.seekg(0); font.resize(n); f.read(reinterpret_cast<char*>(font.data()), n);
         stbtt_fontinfo t{};
         int off = stbtt_GetFontOffsetForIndex(font.data(), 0);
-        if (!stbtt_InitFont(&t, font.data(), off)) { LOGI("font skip (init fail): %s", p); continue; }
+        if (!stbtt_InitFont(&t, font.data(), off)) { LOGI("font skip (init fail): %s", p.c_str()); continue; }
         int got = 0;
         for (uint32_t c : cps) if (c >= 0x4E00 && c <= 0x9FFF)
             if (stbtt_FindGlyphIndex(&t, int(c)) != 0) ++got;
-        LOGI("font candidate: %s init=ok cjk=%d/%d", p, got, cjkNeed);
-        if (got > bestCov) { bestCov = got; used = p; }  // 记下覆盖率最高的
+        LOGI("font candidate: %s init=ok cjk=%d/%d", p.c_str(), got, cjkNeed);
+        if (got > bestCov) { bestCov = got; used = p.c_str(); }  // 记下覆盖率最高的
     }
     if (!used) { LOGE("no usable font found"); return false; }
     // 重新读入选中字体（上一轮 font 可能属于另一个候选）
@@ -849,6 +863,69 @@ void Gl::beginFrame(const Rgba& c) {
     if (!ready()) return;
     glViewport(0, 0, winW_, winH_);
     clear(c);
+}
+
+bool Gl::ensureOverlayFbo(int w, int h) {
+    if (impl_.overlayFbo_ && impl_.overlayW_ == w && impl_.overlayH_ == h) return true;
+    if (impl_.overlayFbo_) glDeleteFramebuffers(1, &impl_.overlayFbo_);
+    if (impl_.overlayTex_) glDeleteTextures(1, &impl_.overlayTex_);
+    impl_.overlayFbo_ = impl_.overlayTex_ = 0;
+    glGenTextures(1, &impl_.overlayTex_);
+    glBindTexture(GL_TEXTURE_2D, impl_.overlayTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &impl_.overlayFbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, impl_.overlayFbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, impl_.overlayTex_, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!ok) {
+        LOGE("overlay FBO incomplete %dx%d", w, h);
+        glDeleteFramebuffers(1, &impl_.overlayFbo_);
+        glDeleteTextures(1, &impl_.overlayTex_);
+        impl_.overlayFbo_ = impl_.overlayTex_ = 0;
+        return false;
+    }
+    impl_.overlayW_ = w;
+    impl_.overlayH_ = h;
+    return true;
+}
+
+bool Gl::beginOverlay() {
+    if (!ready()) return false;
+    if (!ensureOverlayFbo(winW_, winH_)) return false;
+    glBindFramebuffer(GL_FRAMEBUFFER, impl_.overlayFbo_);
+    glViewport(0, 0, impl_.overlayW_, impl_.overlayH_);
+    glClearColor(0, 0, 0, 0);            // 透明底：合成时预览透过透明区显示
+    glClear(GL_COLOR_BUFFER_BIT);
+    return true;
+}
+
+void Gl::endOverlay() {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, winW_, winH_);
+}
+
+void Gl::drawOverlayFull() {
+    if (!impl_.overlayTex_) return;
+    glUseProgram(impl_.progBlit_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, impl_.overlayTex_);
+    glUniform1i(impl_.uBlitTex_, 0);
+    glEnableVertexAttribArray(impl_.aBlit_);
+    glVertexAttribPointer(impl_.aBlit_, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(impl_.aBlit_);
+}
+
+bool Gl::consumeHistUpdated(int slot) {
+    if (slot < 0 || slot >= kSrcN) return false;
+    bool v = src_[slot].histNew;
+    src_[slot].histNew = false;
+    return v;
 }
 
 } // namespace optic::ui

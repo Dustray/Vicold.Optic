@@ -10,12 +10,15 @@ namespace optic::ui {
 class Battery {
 public:
     void init(JavaVM* vm, jobject activity);   // android_main 注入（幂等，与 Haptics 同型）
+    ~Battery();
     // pct：0-100（失败 -1）；*charging = 正在充电/已充满
     int query(bool* charging);
 
 private:
     JavaVM* vm_ = nullptr;
     jobject activity_ = nullptr;   // 全局引用
+    jclass ifCls_ = nullptr;       // IntentFilter 类（全局引用，init 缓存，避免每次查询泄漏）
+    jclass intentCls_ = nullptr;   // Intent 类（全局引用）
     jmethodID mReg_ = nullptr;     // Context.registerReceiver(BroadcastReceiver, IntentFilter)
     jmethodID mIfCtor_ = nullptr;  // IntentFilter.<init>(String)
     jmethodID mGetInt_ = nullptr;  // Intent.getIntExtra(String, int)

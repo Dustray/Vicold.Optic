@@ -2,7 +2,8 @@
 // M-UI：GL 渲染底座（EGL / GLES2）。
 // ① 主窗口 EGL surface（预览改为 GPU 纹理合成，替代相机直写）
 // ② 预览帧源：RGBA AImageReader（GPU_SAMPLED_IMAGE）→ AHardwareBuffer → EGLImage → 2D 纹理（零拷贝）
-// ③ 文字图集：stb_truetype 烘焙设备字体（MiSansVF 优先），ASCII + 常用 CJK
+// ③ 文字图集：stb_truetype 烘焙设备字体（候选路径由机型层 fontCandidates() 提供，
+//    运行时选静态 TrueType(glyf) 且中文覆盖率最高者；MiSansVF 等可变字体已知会连笔，靠后）
 // ④ 绘制原语：预览四边形（UV 旋转可调）、圆角矩形（SDF 填充+描边）、文字
 // 线程模型：attach/draw/输入 全部在 glue 线程（UI=渲染=输入 同线程）。
 
@@ -50,10 +51,11 @@ public:
     int32_t width() const;
     int32_t height() const;
 
-    // 预览帧源（RGBA_8888 + GPU_SAMPLED_IMAGE 用途）；window 交给引擎挂会话输出。
+    // 预览帧源（GPU_SAMPLED_IMAGE 用途）；window 交给引擎挂会话输出。
     // 多源：slot 0=逻辑主摄 / 1=超广角直连 / 2=长焦直连 —— 会话常驻三路输出，
     // 跨带切换 repeating 请求即可换源（不重建会话，纹理永不失效 → 无黑帧闪烁）。
-    bool makePreviewSource(int slot, int32_t w, int32_t h);
+    // fmt 由机型层给出（多数 HAL 只有 PRIVATE 才稳定供帧，见 SessionPolicy::previewFormat）。
+    bool makePreviewSource(int slot, int32_t w, int32_t h, int32_t fmt);
     ANativeWindow* previewWindow(int slot);
     int32_t previewW(int slot) const;
     int32_t previewH(int slot) const;
@@ -64,8 +66,9 @@ public:
     // 取该 slot 最近一次直方图统计的快照（64-bin × R,G,B；从未统计过时全 0）
     void copyHistogram(int slot, int32_t outR[64], int32_t outG[64], int32_t outB[64]) const;
 
-    // 文字图集（attach 后调用一次；bakedPx 为烘焙像素高）
-    bool bakeFont(float bakedPx);
+    // 文字图集（attach 后调用一次；bakedPx 为烘焙像素高）。
+    // fonts = 机型层给出的候选字体路径（按优先级），运行时选 CJK 覆盖率最高的那个。
+    bool bakeFont(float bakedPx, const std::vector<std::string>& fonts);
     float textWidth(const std::string& utf8, float px) const;
     // y 为「行顶」（ascent 线），不是基线：字形落在 y 下方，与 CSS line box 对齐
     void text(const std::string& utf8, float x, float yTop, float px, const Rgba& c);
@@ -74,8 +77,19 @@ public:
     // 字形取 min(bearingY)/max(bearingY+h) 精确居中。
     float textCenterTop(const std::string& utf8, float px, float cy) const;
 
-    void beginFrame(const Rgba& c);   // viewport + 清屏
+    void beginFrame(const Rgba& c);   // viewport + 清屏（主窗口）
     void clear(const Rgba& c);
+
+    // 静态覆盖层离屏缓存：UI 的轨道/刻度/文字/HUD 等**不随预览帧变化**的元素，
+    // 只在「脏」时（输入/状态变化/直方图刷新 ~4Hz）重绘进一张 RGBA 纹理，每帧只做
+    // 1 次全屏合成（≈2 draw call），把稳态 ~120 次 draw call 从 30Hz 降到 ~4Hz，
+    // 是 glue 线程 GPU/发热的主要杠杆（机型无关，常量已在 Gl.cpp 内）。
+    // 用法：beginOverlay()(清透明) → 绘制全部覆盖层 → endOverlay()；drawOverlayFull() 合成。
+    bool beginOverlay();
+    void endOverlay();
+    void drawOverlayFull();
+    // 返回 slot 是否自上次查询后有新的直方图样本（供 UI 决定是否重烤覆盖层）
+    bool consumeHistUpdated(int slot);
     // alpha < 1 用于跨带显示切换的交叉淡化（新源为底、旧源叠画淡出）。
     // zoom < 0 = 沿用全局 previewZoom_；淡化旧层必须传自己的 crop（zoom_/az_旧带），
     // 否则旧纹理会被新带的 crop 放大到错误倍率（跨带大闪烁元凶之二）。
@@ -122,6 +136,7 @@ private:
         // 直方图缓存：GL 降采样统计（kHistW×kHistH FBO readPixels → 64-bin RGB）
         int32_t hist[3][64] = {};
         bool histValid = false;
+        bool histNew = false;            // 自上次消费以来是否产生了新样本（UI 重烤标记）
         double lastHistT = 0;            // 上次统计时刻（steady_clock 秒，节流用）
     };
     Source src_[kSrcN];
@@ -132,6 +147,10 @@ private:
         EGLContext ctx = EGL_NO_CONTEXT;
 
         GLuint progPreview = 0, progRect = 0, progText = 0, progSolid = 0;
+        GLuint progBlit_ = 0;            // 覆盖层合成（sampler2D 全屏 blit）
+        GLint aBlit_ = -1, uBlitTex_ = -1;
+        GLuint overlayFbo_ = 0, overlayTex_ = 0;   // 静态覆盖层离屏缓存
+        int overlayW_ = 0, overlayH_ = 0;
         struct U {
             GLint rect = -1, viewport = -1, uv = -1, tex = -1, center = -1, half = -1,
                   radius = -1, fill = -1, border = -1, borderW = -1, color = -1, quad = -1,
@@ -152,12 +171,16 @@ private:
     static void onPreviewAvailable(void* ctx, AImageReader* reader);
     void importPreviewImage(Source& s, AImage* img);
     // 直方图降采样管线：预览纹理 → 小 FBO（LINEAR）→ readPixels → 64-bin RGB。
-    // RGBA_8888 流无法 AImage_getPlaneData（仅支持 YUV_420_888），CPU 直读死路。
-    static constexpr int kHistW = 128, kHistH = 96;
+    // RGBA/PRIVATE 流无法 AImage_getPlaneData（仅支持 YUV_420_888），CPU 直读死路。
+    // readPixels 会同步 stall 整个 GL 管线：尺寸和频率都是**功耗/掉帧的直接杠杆**，
+    // 64×48 + 0.25s 节流 ≈ 每次 12KB 回读，肉眼无法察觉，成本只有原 128×96@0.12s 的 1/16。
+    static constexpr int kHistW = 64, kHistH = 48;
+    static constexpr double kHistPeriodSec = 0.25;
     bool ensureHistRt();
     void sampleHistogram(Source& s);
-    GLuint histFbo_ = 0, histTex_ = 0, progHist_ = 0;
+        GLuint histFbo_ = 0, histTex_ = 0, progHist_ = 0;
     GLint aHist_ = -1, uHistTex_ = -1;
+    bool ensureOverlayFbo(int w, int h);   // 惰性创建/复用覆盖层离屏帧缓冲
     ANativeWindow* win_ = nullptr;
     int32_t winW_ = 0, winH_ = 0;
     float previewZoom_ = 1.f;            // 预览数字变焦（setPreviewZoom；默认 1 = 不裁切）

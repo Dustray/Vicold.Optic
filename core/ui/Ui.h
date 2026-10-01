@@ -53,7 +53,7 @@ public:
 
     void setStaticText(int32_t rawW, int32_t rawH) { rawW_ = rawW; rawH_ = rawH; }
     // 拍摄格式真值同步（引擎冷启动读 controls.txt 后校正；UI 点按角标时乐观翻转）
-    void setFmtJpg(bool j) { fmtJpg_ = j; }
+    void setFmtJpg(bool j) { fmtJpg_ = j; markDirty(); }
     void setUvRot(int rot) { uvRotOverride_ = rot; }
     // 定向的两个真值输入（比"猜方向"可靠）：
     //   sensorDeg  = ACAMERA_SENSOR_ORIENTATION（缓冲需顺时针转多少度才在"本机自然方向"下正立）
@@ -75,6 +75,7 @@ public:
         shotOk_.store(accepted ? 1 : 0, std::memory_order_release);
         shotUsed_.store(used, std::memory_order_release);
         shotTotal_.store(total, std::memory_order_release);
+        markDirty();
     }
 
     // 拍照保存进度（引擎每轮转发 StillCapture 的原子量）：inFlight>0 = 正在保存 →
@@ -82,9 +83,10 @@ public:
     void notifySaveProgress(int inFlight, int64_t lastDoneMs) {
         (void)lastDoneMs;
         saveInFlight_.store(inFlight, std::memory_order_release);
+        markDirty();
     }
     // 引擎重建会话/重建 StillCapture 时调用：上会话计数不跨会话卡「正在保存」
-    void resetSaveProgress() { saveInFlight_.store(0, std::memory_order_release); }
+    void resetSaveProgress() { saveInFlight_.store(0, std::memory_order_release); markDirty(); }
 
     // ---- 平滑拖拽变焦（引擎线程回传）----
     // 每路预览源（0=逻辑主摄 / 1=超广角 / 2=长焦）各自维护一个 az（当前出图帧对应的
@@ -104,11 +106,11 @@ public:
     // 外部 zoom 同步（controls.txt 诊断通道）：UI 内部 zoom_ 是 crop 补偿与导轨读数的
     // 基准，诊断值不联动会让 crop 停在旧值（2026-09-30 截图验证失真的根因）。
     // 导轨把手位置不搬动（视觉跳变），仅同步数值状态。
-    void setZoomExternal(float z) { zoom_ = z; }
+    void setZoomExternal(float z) { zoom_ = z; markDirty(); }
 
     // 导轨下限 = 超广角光学倍率（运行时探测）：低于它画不了更广，拖到底会有一段
     // 画面不动的死区（本机 uw 原生 0.774x > HAL 声称的 0.70x，2026-09-30）。
-    void setZoomRange(float zmin) { zoomMin_ = std::max(zmin, 0.5f); }
+    void setZoomRange(float zmin) { zoomMin_ = std::max(zmin, 0.5f); markDirty(); }
     // EV 量程（EV 值，非步数）：来自设备 traits（AE_COMPENSATION_RANGE×STEP）。
     // 全手动（ISO/SS 都非自动）时 EV 面板灰显不可拖 —— EV 只作用于处于自动态的参数。
     void setEvRange(float minEv, float maxEv, float stepEv) {
@@ -116,16 +118,20 @@ public:
             evMinEv_ = minEv;
             evMaxEv_ = maxEv;
             evStepEv_ = stepEv;
+            markDirty();
         }   // traits 缺失/退化时保留默认 ±3.0/0.5
     }
     // AE 实时回传（自动参数的当前生效值，UI 数值行显示用；引擎每帧从结果更新）
-    void setAutoIso(int iso) { autoIso_.store(iso, std::memory_order_relaxed); }
-    void setAutoSsUs(int64_t us) { autoSsUs_.store(us, std::memory_order_relaxed); }
+    void setAutoIso(int iso) { autoIso_.store(iso, std::memory_order_relaxed); markDirty(); }
+    void setAutoSsUs(int64_t us) { autoSsUs_.store(us, std::memory_order_relaxed); markDirty(); }
     // 导轨上限：引擎侧钳制 UI 下发的 zoom 时用（相机拿不到的高倍由 GL 裁切完成）
     float zoomLimitMax() const { return zoomMax_; }
 
     void onInputEvent(AInputEvent* e);   // glue 线程
     void frame();                        // 绘制一帧（glue 线程，vsync 节奏）
+
+    // 覆盖层脏标记（见 Gl.h 注释）：输入/状态变化时置位，frame() 据此重烤离屏覆盖层
+    void markDirty() { dirty_ = true; }
 
     Haptics hap_;                        // 触感反馈（按钮点按 / 刻度落档）
     int hapStop_ = -1;                   // 本次拖拽上次落档的档位 id（跨档变化才震）
@@ -141,6 +147,10 @@ public:
 private:
     // 设计空间常量（camera-ui.html 移植）
     static constexpr float kStageW = 1560, kStageH = 720;
+
+    // 覆盖层脏标记：输入/状态变化/直方图刷新时置位，frame() 据此重烤离屏覆盖层。
+    // 初始 true 保证首帧必定烘焙。
+    bool dirty_ = true;
     // 左侧挖孔/避让几何来自机型层 UiLayoutPolicy（2026-10-01：pandora 三轮实测把
     // cutoutSafeX 定在 88；无左侧挖孔的机型回落到 10 的常规边距，不多留黑条）。
     const optic::device::UiLayoutPolicy uiPol_{optic::device::currentDevice().uiLayout()};
@@ -168,6 +178,9 @@ private:
     void draw();
     void drawTracks();
     void drawPreviewOverlay();
+    // 静态覆盖层（轨道/刻度/文字/HUD/直方图框等）：仅在脏时重绘进离屏纹理，
+    // 每帧由 drawOverlayFull() 合成（见 Gl.h 注释）。与预览/闪光/跨带淡化分离。
+    void paintOverlay();
     void drawHistogram(float x, float y, float w, float h);
     void drawGrid(float x, float y, float w, float h);
     void drawVTicks(float tx, float ty, float tw, float th,

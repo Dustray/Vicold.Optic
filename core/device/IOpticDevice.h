@@ -2,6 +2,7 @@
 // Vicold.Optic 机型扩展层核心接口（doc/PLAN.md §2.2）
 // 规则：所有机型差异必须收敛到 device/ 层，业务代码禁止出现机型判断。
 
+#include <media/NdkImage.h>         // AIMAGE_FORMAT_*（预览流格式）
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,6 +53,11 @@ struct ZoomProfile {
     float logicalFallbackMax = 2.5f;  // 无长焦机型时的兜底上限（:606 曾用魔法数 2.5）
     float baseEquivMm = 24.f;         // 1x 对应的 35mm 等效焦距（mm 读数换算基准）
     std::vector<float> stops{0.7f, 1, 2, 5, 10, 50, 120};   // 导轨关键焦段（等距刻度）
+    // 镜头角色判据：物理成员相对主摄的**等效焦距比**落在哪个区间算超广/长焦。
+    // 成员命名/焦距拓扑随厂商而变（pandora 是 uw 0.78 / main 1.0 / tele 5.02），
+    // 判据必须由机型层给出，不能写死在 CameraDevice 里。
+    float uwRoleRatio = 0.92f;        // < main×此值 → 超广
+    float teleRoleRatio = 1.25f;      // > main×此值 → 长焦
 };
 
 // ---- 近距接管规则 ----
@@ -83,9 +89,18 @@ struct SessionPolicy {
     std::vector<int> degradeSteps{4};  // 降级阶梯：被拒时依次尝试的输出数
     bool allowSingleStreamFallback = true;
     int previewW = 1920, previewH = 1440;   // 预览尺寸（须在本机 preview-size 列表内）
+    // 预览缓冲格式：HAL 偶尔劫持 YUV/RGBA ImageReader 不供帧（pandora 实锤），
+    // 只有 PRIVATE(+GPU_SAMPLED_IMAGE) → EGLImage 零拷贝路径稳定。机型层可覆盖。
+    int previewFormat = AIMAGE_FORMAT_PRIVATE;
+    // 副摄（超广/长焦）预览尺寸：部分机型的 aux 传感器不支持主摄同分辨率，
+    // 0 = 与主摄一致。
+    int auxPreviewW = 0, auxPreviewH = 0;
     // 帧率必须显式钉死：不写 AE_TARGET_FPS_RANGE 时 HAL 通常按 TEMPLATE_PREVIEW 取到
     // 最大档（本机三摄常驻，跑满箇 = ISP/GPU 带宽与发热直接翻倍）。
     int targetFpsMin = 30, targetFpsMax = 30;
+    // UI 重绘节拍上限（glue 线程）。渲染低于预览帧率必然丢帧、高于则纯属白烧 GPU；
+    // 默认跟着相机目标帧率走，静止时进一步降到低频（见 Ui::frame 的脏标记逻辑）。
+    int uiRenderFps = 30;
 };
 
 // ---- UI 布局约束（挖孔等物理几何）----
@@ -129,6 +144,11 @@ public:
 
     // UI 布局约束：挖孔禁区等屏幕物理几何
     virtual UiLayoutPolicy uiLayout() const { return UiLayoutPolicy{}; }
+
+    // 字体候选（按优先级尝试）：stb_truetype 只认**静态 TrueType(glyf)**轮廓，
+    // 厂商 ROM 的字体文件名与格式（VF/CFF）差异很大，且不存在「探测 API」——
+    // 只能按机型列举。取默认 AOSP 路径，厂商机型应覆盖为自家 ROM 的真实中文字体。
+    virtual std::vector<std::string> fontCandidates() const;
 
     // per-sensor tuning 配置路径（M4 起使用）
     virtual std::string tuningFileFor(const std::string& physicalId) const { (void)physicalId; return {}; }
