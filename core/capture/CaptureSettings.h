@@ -4,6 +4,7 @@
 
 #include <camera/NdkCaptureRequest.h>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace optic::capture {
@@ -18,6 +19,25 @@ struct CaptureSettings {
     // AF
     bool afOn = true;
     float focusDistance = 0.f;    // 屈光度；afOn=false 时生效
+    // 0 = CONTINUOUS_PICTURE（CAF，恒定 track）；1 = AUTO（单次 AF-S：trigger 后合焦并锁定）。
+    // 点按对焦走 AF-S：本机 CAF 下 trigger 会退化成「镜头退回无穷远 → 从 10m 一路扫到
+    // 近处」的 full sweep，起扫就要 1.1s（2026-10-02 实测）；AUTO 模式让 HAL 走
+    // 单次 course+fine 流程，通常显著更快。合焦/失败后由引擎定时切回 CAF。
+    int32_t afMode = 0;
+    // 触摸对焦区域（active array 域，MeteringRectangle 编码）
+    // AF/AE 同区：点按既驱动对焦也驱动测光（业界通行语义）。区域恒由引擎按
+    // 用户变焦换算到逻辑 active array 坐标（见 CameraEngine::onTapFocus）。
+    // **必须 5 元素** [xmin, ymin, xmax, ymax, weight]：camera2 的 metering rectangle 就长这样
+    //（NDK 头文件明写 every five elements = (xmin,ymin,xmax,ymax,weight)，矩形左闭右开），
+    // weight∈[1,1000] 且 ≠0。**写成 (x,y,w,h) 是致命的**：xmax(=w) < xmin(=x) 时 HAL 会把
+    // 矩形钳成退化点（pandora 实测回显 [1740 1228 1740 1228]），等于把统计窗口压成左上角
+    // 一个像素 —— 这正是 2026-10-02 用户报「点了不对焦」的真根因。
+    int32_t afRegion[5] = {};
+    int32_t aeRegion[5] = {};
+    // 一次性 AF 触发（CONTROL_AF_TRIGGER，写入 = START）。**只能出现在单帧请求上**：
+    // trigger 落在 repeating 请求里会被每个请求实例各执行一次（每帧重启扫描 ⇒ 永不结束），
+    // 因此该字段恒由点按后的 captureTrigger 临时请求携带，settings_ 自身保持 0。
+    int32_t afTrigger = 0;
     // AWB
     bool awbOn = true;            // TODO(M2): CCT 手动（colorTemperature tag 需真机验证）
     // 变焦（逻辑摄 zoomRatio，HAL 自动做物理摄切换）
@@ -36,7 +56,9 @@ inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
     return a.aeOn != b.aeOn || a.aeLock != b.aeLock || a.iso != b.iso ||
            a.exposureNs != b.exposureNs ||
            a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
-           a.awbOn != b.awbOn || a.zoomRatio != b.zoomRatio;
+           a.afMode != b.afMode || a.awbOn != b.awbOn || a.zoomRatio != b.zoomRatio ||
+           std::memcmp(a.afRegion, b.afRegion, sizeof(a.afRegion)) != 0 ||
+           std::memcmp(a.aeRegion, b.aeRegion, sizeof(a.aeRegion)) != 0;
 }
 
 } // namespace optic::capture

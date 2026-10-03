@@ -35,6 +35,10 @@ struct FrameResult {
     float focusDistanceDiopters = 0.f;  // 屈光度（0=无穷远）；AF 连续时有效
     float wbGains[4] = {1, 1, 1, 1};   // [r, gEven, gOdd, b]（COLOR_CORRECTION_GAINS）
     int32_t cropRegion[4] = {};        // SCALER_CROP_REGION（activeArray 域；w/h=0 表示未取到）
+    // AF 诊断回显（触摸对焦闭环确认：HAL 到底收没收区域、扫没扫）
+    int32_t afState = -1;              // CONTROL_AF_STATE（-1 = 该帧没取到）
+    int32_t afRegions[5] = {};         // result 回显的 CONTROL_AF_REGIONS（== 下发值才算被接受）
+    int32_t aeRegions[5] = {};         // result 回显的 CONTROL_AE_REGIONS
     std::string physicalId;             // 当前主源物理摄像头（ACTIVE_PHYSICAL_ID，诊断用）
                                         // NDK 单帧单回调只交付逻辑融合结果，其 ACTIVE_PHYSICAL_ID
                                         // 标识当前 backing 摄像头（"2"主/"3"超广/"4"长焦）；
@@ -84,6 +88,15 @@ public:
                          const std::vector<PhysZoom>& phys);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
+    // 一次性 AF 触发请求（触摸对焦专用）：带 AF_REGIONS + AF_TRIGGER_START。
+    // 必须与 repeating 分开提交 —— camera2 里 trigger 是"每个请求实例执行一次"的语义，
+    // 写在 repeating 上会让 HAL 每帧重启一次扫描，镜头永远合不上焦。
+    // **targets 必须挂成与 repeating 完全一致**：本机 CamX 对目标集合变化极敏感
+    //（2026-10-02 实测：只挂一个 target 的 trigger 请求会让流断 ~500ms，点按后
+    // 画面先卡半秒才开始起扫 —— 用户感知的"延迟"就来自这里）。
+    // 请求由 sequenceId 事件回收（与 captureOnce 互不干扰，可并发在途）。
+    bool captureTrigger(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
+
     std::function<void(const FrameResult&)> onFrameResult;
     std::function<void(int reason)> onFrameFailed;
 
@@ -128,6 +141,14 @@ private:
     int onceSeq_ = -1;
     std::vector<ANativeWindow*> onceWins_;
     std::vector<ACameraOutputTarget*> onceTgts_;
+
+    // AF 触发请求：seqId → (请求, 输出目标)，等 onSequenceCompleted 回收（请求复用会
+    // 残留 AF_TRIGGER_START，导致后续 repeating 每帧重扫）
+    struct TrigReq {
+        ACaptureRequest* req = nullptr;
+        std::vector<ACameraOutputTarget*> tgts;
+    };
+    std::map<int, TrigReq> trigs_;
 
     ACameraCaptureSession_stateCallbacks sessCbs_{};
     ACameraCaptureSession_captureCallbacks capCbs_{};

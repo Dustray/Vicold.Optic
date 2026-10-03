@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,7 +50,8 @@ public:
     bool stopped() const { return stopped_.load(std::memory_order_acquire); }
 
     // GL UI（optic.cpp 注入；引擎线程消费其命令队列，预览窗挂会话输出）
-    void setUi(ui::Ui* u) { ui_ = u; }
+    // 实现在 .cpp（此处只有 Ui 的前向声明，不能 inline 调其成员）
+    void setUi(ui::Ui* u);
     // JNI 注入（android_main）：相册写入用（MediaStore → DCIM/Camera）
     void setJni(JavaVM* vm, jobject activity) { gallery_.init(vm, activity); }
 
@@ -84,6 +86,41 @@ private:
     std::vector<ANativeWindow*> bandTargets(const std::string& sig) const;  // 该带 repeating 目标
     int slotFromSig(const std::string& sig) const;                          // 该带 GL 预览源槽位
     void pollControls();
+    // 触摸对焦：UI 点按预览（预览区内占比 fx/fy）→ 用户 FOV → 逻辑 active array
+    // 坐标 → settings 的 AF/AE 区域。返回 true = 设置有变化需重发 repeating。
+    // mode：0=点击即对焦 1=仅选择对焦位置（不重扫、不兜底） 2=点击即对焦并拍照
+    bool onTapFocus(float fx, float fy, int mode);
+    // 点按后发一次 AF_TRIGGER_START（单帧请求，与 repeating 分离）。改区域本身在多数
+    // 3A 实现里只更新统计窗口，未必立刻重扫 —— 必须显式触发才能"点哪合哪"。
+    void sendAfTrigger();
+    bool tapTriggerPending_ = false;
+    // 点按对焦用单次 AF-S（见 CaptureSettings::afMode）。合焦/失败锁定后维持该时长再切回
+    // CAF —— 一直锁着会让用户以为"相机不对焦了"，立刻切回又会因为 CAF 重评而动一次镜头。
+    // 点按对焦三策略（controls.txt: aft=0/1/2），用于对比" HAL 侧的合焦开销 "：
+    //   0 = 只换统计区域（保持 CAF，不下发 trigger）——依赖 3A 自行按新 ROI 重扫
+    //   1 = 换区域 + CAF 下 trigger（典型第三方 App 做法）
+    //   2 = 换区域 + 切 AF-S(AUTO) + trigger（最慢，保留做对照）
+    // 实测（2026-10-02 大行程：手动推到无穷远后点近距目标，两次取均值）：
+    //   0 ≈ 0.8s / 1 ≈ 1.7s / 2 ≈ 1.6s —— 显式 trigger 会让 CamX 重启 AF 状态机
+    //   （先甩到无穷远再全程扫描），白跑一大段；只换 ROI 则由已在跑的 CAF 用新统计
+    //   窗口自然收敛，这也是系统相机快的做法。
+    int afTapPolicy_ = 0;
+    bool afSingleMode_ = false;             // controls.txt: afs=1 切回 AF-S + trigger（对照用）
+    // 兜底：只换 ROI 之后若 HAL 长时间没有任何 AF 动作，补一次传统 trigger（防个别固件
+    // 不按新 ROI 重扫）。短于它就能正常合焦的场景不会走到这里。
+    static constexpr int64_t kAfFallbackMs = 1500;
+    // 点按到"用户可以认为合上了"的端到端耗时：首次满足 UI 合焦判据时打一条日志，
+    // 用来横向比较三种策略（只看 afState 变化会被镜头仍在移动误导）。
+    int64_t afTapT0Ms_ = 0;
+    bool afFocusLogged_ = false;
+    bool afScanned_ = false;             // 点按后 AF 是否真的跑过一轮（scan/lock 状态出现过）
+    // ~的下限：本机 CamX 从下发 trigger 到镜头真正起扫实测可达 670ms，在此之前若镜头
+    // 被"还没来得及动"骗到，会被误判成"已合焦"（2026-10-02 三策略对照全测出 90ms 的
+    // 假绿）。只有真正无法移动的场合（点按前本来就在焦上）才用这个超时兜底。
+    static constexpr int64_t kAfGreenMinMs = 800;
+    static constexpr int64_t kAfLockHoldMs = 2500;
+    int64_t afLockUntilMs_ = 0;             // >0 = 处于 AF-S 锁定窗口，到期由主循环切回 CAF
+    bool afSLocked_ = false;                // 本轮 AF-S 已进入 FOCUSED_LOCKED（UI 合焦判定用）
     // 注意：必须复用同一实例（成员）。此前每轮新建局部 ControlFile，内容比对状态被重置，
     // 导致 controls.txt 全量重放 —— UI 刚设置的 zoom 会在 100ms 后被文件里的旧值盖回
     // （表现为"松手瞬间预览回到 1.0，导轨不动"，2026-09-29 真机确诊）。
@@ -136,6 +173,11 @@ private:
     int savesUsed_ = 0;
 
     ui::Ui* ui_ = nullptr;
+
+    // 主循环节拍：命令通知可即时唤醒（见 setUi），无命令时退回 50ms 轮询。
+    std::mutex tickMx_;
+    std::condition_variable tickCv_;
+    std::atomic<bool> cmdWake_{false};
 
     std::thread thread_;
     std::atomic<bool> running_{false};
@@ -228,6 +270,17 @@ private:
     float azForSlot(int slot, int64_t tsNs);
     int32_t logAa_[4] = {};             // 逻辑摄 ACTIVE_ARRAY（漂移诊断基准）
     float lastAzLogZoom_ = 0.f;         // az meta 日志去重
+
+    // AF 回显诊断（触摸对焦闭环）：只有状态/回显区域/屈光度变化才打，避免 30fps 刷屏；
+    // afDbgUntilMs_ 是点按后的加密采窗。
+    int32_t lastAfState_ = -1;
+    int32_t lastAfRegions_[5] = {};
+    float lastAfFd_ = -1.f;
+    int64_t afDbgUntilMs_ = 0;
+    int64_t lastAfLogMs_ = 0;
+    // UI 合焦判定的稳态跟踪（AF 报锁定时镜头常仍在移动，见 onFrameResult）
+    float lastFdUi_ = -1.f;
+    int fdSteadyCnt_ = 0;
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问

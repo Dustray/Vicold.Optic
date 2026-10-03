@@ -23,10 +23,30 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
         ACaptureRequest_setEntry_i64(req, ACAMERA_SENSOR_EXPOSURE_TIME, 1, &exposureNs);
     }
 
-    uint8_t af = static_cast<uint8_t>(afOn ? ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE : ACAMERA_CONTROL_AF_MODE_OFF);
+    // CAF vs 单次 AF-S：见 CaptureSettings.h 注释（点按走 AF-S 以避免 CAF 的 full sweep）
+    uint8_t af = static_cast<uint8_t>(
+        afOn ? (afMode == 1 ? ACAMERA_CONTROL_AF_MODE_AUTO
+                            : ACAMERA_CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+             : ACAMERA_CONTROL_AF_MODE_OFF);
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AF_MODE, 1, &af);
     if (!afOn) {
         ACaptureRequest_setEntry_float(req, ACAMERA_LENS_FOCUS_DISTANCE, 1, &focusDistance);
+    }
+    // 触摸对焦/测光区域（active array 域）：逻辑请求按逻辑阵列解释，CamX SAT 会把
+    // 区域换算到当前 backing 物理摄（无缝变焦的核心职责之一），跨带无需分带写。
+    // 区域恒在用户可见 FOV 内（引擎换算保证），变焦后超出 crop 的部分 HAL 自行钳制。
+    // 每项 5 个 int32（x,y,w,h,weight）—— camera2 metering rectangle 编码，缺 weight
+    // 会被 HAL 整组忽略；weight 恒最大值 1000（点按区域权重最高）。
+    if (afRegion[2] > 0) {
+        ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AF_REGIONS, 5, afRegion);
+    }
+    if (aeRegion[2] > 0) {
+        ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_REGIONS, 5, aeRegion);
+    }
+    // AF 触发：仅单帧 trigger 请求携带（写进 repeating 会每帧重扫，永远合不了焦）
+    if (afTrigger > 0) {
+        const uint8_t trg = static_cast<uint8_t>(ACAMERA_CONTROL_AF_TRIGGER_START);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AF_TRIGGER, 1, &trg);
     }
 
     uint8_t awb = static_cast<uint8_t>(awbOn ? ACAMERA_CONTROL_AWB_MODE_AUTO : ACAMERA_CONTROL_AWB_MODE_OFF);

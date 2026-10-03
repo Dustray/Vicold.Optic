@@ -97,8 +97,8 @@ constexpr float kPreviewX = 178, kPreviewY = 0, kPreviewW = 960, kPreviewH = 720
 constexpr float kHudY = 16, kChipH = 26, kChipPadX = 10;
 // 直方图
 constexpr float kHistW = 132, kHistH = 66, kHistY = 52;
-// AF（跟随预览区，保持居中：预览中心 x=658）
-constexpr float kAfX = 606, kAfY = 312, kAfSize = 104, kAfTagY = 264;
+// 点按模式按钮（预览右上角，直方图下方），右缘与直方图对齐
+constexpr float kTapModeY = kHistY + kHistH + 12, kTapModeH = 34;
 // EV 面板（跟随预览区左移：面板 = 预览左缘 + 24）
 constexpr float kEvPanelX = 202, kEvPanelY = 622, kEvPanelW = 520, kEvPanelH = 84;
 constexpr float kEvTrackX = 214, kEvTrackW = 476, kEvTrackY = 664, kEvTrackH = 24;
@@ -200,8 +200,31 @@ void Ui::detach() { gl_.detach(); }
 // ---- 命令队列（glue 线程生产，引擎线程消费）----
 
 void Ui::pushCmd(Cmd::Type t, float v) {
-    std::lock_guard<std::mutex> l(cmdM_);
-    if (cmds_.size() < 64) cmds_.push_back({t, v});   // 拖拽节流：积压时丢弃最旧
+    pushCmd(t, v, 0.f);
+}
+
+void Ui::pushCmd(Cmd::Type t, float v, float v2) {
+    {
+        std::lock_guard<std::mutex> l(cmdM_);
+        if (cmds_.size() < 64) cmds_.push_back({t, v, v2});   // 拖拽节流：积压时丢弃最旧
+    }
+    // 出锁后再通知（避免持有 cmdM_ 时回调进引擎、与 popCmd 抢锁）
+    if (cmdNotify_) cmdNotify_();
+}
+
+void Ui::pushCmd(Cmd::Type t, float v, float v2, float v3) {
+    {
+        std::lock_guard<std::mutex> l(cmdM_);
+        if (cmds_.size() < 64) {
+            Cmd c;
+            c.type = t;
+            c.v = v;
+            c.v2 = v2;
+            c.v3 = v3;
+            cmds_.push_back(c);
+        }
+    }
+    if (cmdNotify_) cmdNotify_();
 }
 
 bool Ui::popCmd(Cmd* out) {
@@ -352,6 +375,59 @@ void Ui::onDown(float x, float y, double tMs) {
             return;
         }
     }
+    // 点按模式按钮（预览右上角）：点击即对焦 → 仅选位置 → 对焦并拍照，循环。
+    // 必须在预览区判定之前命中（否则会被当成一次对焦点按）。热区四周放宽（按钮窄，
+    // 按视觉边缘点经常差几像素落空 —— 2026-10-02 真机：视觉 1028 起，点 1023 落空）。
+    if (tapModeR_ > tapModeL_ && x >= tapModeL_ - 10 && x <= tapModeR_ + 10 &&
+        y >= tapModeT_ - 8 && y <= tapModeB_ + 8) {
+        tapMode_ = TapMode((int(tapMode_) + 1) % 3);
+        // 切模式不清除已选框：仅选位置定下的框恒常驻（统计区域仍在生效），
+        // 其他模式的动画框走自己的时长自然收尾。
+        shotAfterFocus_ = false;
+        shotAfterFocusT0_ = -1;
+        LOGI("tap mode -> %d", int(tapMode_));
+        hap_.click();
+        markDirty();
+        return;
+    }
+    // 触摸对焦候选：落在预览区且上方所有控件都未命中。**按下即刻触发**（不等抬手）——
+    // 抬手才处理会白吃一整个按压时长（手指抬起 80~150ms），用户直接读成"点了没反应"。
+    // 预览区本身没有任何拖拽手势（变焦/ISO/SS/EV/快门都在各自热区且已 return），
+    // 从预览区下滑不会引发别的操作，故不存在误触发。
+    if (inR(x, y, kPreviewX, kPreviewY, kPreviewW, kPreviewH)) {
+        tapDownX_ = x;
+        tapDownY_ = y;
+        fireTapFocus(x, y);
+    }
+}
+
+// AF 状态回显（引擎每帧回传）：合焦时若处于"对焦并拍照"模式，立刻按快门。
+void Ui::setAfState(int s) {
+    afState_.store(s, std::memory_order_relaxed);
+    if (shotAfterFocus_ && (s == 2 || s == 4)) {   // PASSIVE_FOCUSED / FOCUSED_LOCKED
+        shotAfterFocus_ = false;
+        shotAfterFocusT0_ = -1;
+        LOGI("tap mode: focused -> shutter");
+        pushCmd(Cmd::SHOT, 0.f);
+    }
+}
+
+// 触摸对焦落地下发：位置换算成预览区占比，同时起对焦框动画 + 轻触感。
+// 语义随 tapMode_ 变化（见 TapMode）：仅选位置不重扫、对焦并拍照等合焦后自动拍摄。
+void Ui::fireTapFocus(float x, float y) {
+    const float fx = std::clamp((x - kPreviewX) / kPreviewW, 0.f, 1.f);
+    const float fy = std::clamp((y - kPreviewY) / kPreviewH, 0.f, 1.f);
+    LOGI("tap: down fx=%.2f fy=%.2f -> TAP_FOCUS (mode=%d)", fx, fy, int(tapMode_));
+    pushCmd(Cmd::TAP_FOCUS, fx, fy, float(int(tapMode_)));
+    afBoxX_ = x;
+    afBoxY_ = y;
+    afBoxT0_ = nowSec();
+    afFocusedAt_ = -1;   // 新一轮对焦：重新等待合焦回显
+    shotAfterFocus_ = (tapMode_ == TapMode::FocusShot);
+    shotAfterFocusT0_ = shotAfterFocus_ ? nowSec() : -1.;
+    afBoxSticky_ = (tapMode_ == TapMode::LockPos);   // 仅选位置：白框常驻不消失
+    hap_.tick();
+    markDirty();
 }
 
 // 刻度落档触感：拖动跨到新档位时 tick 一次。id<0 = 离开吸附带（先复位，
@@ -523,6 +599,8 @@ void Ui::onUp(float x, float y) {
         }
         shutterDown_ = false;
     }
+    // 触摸对焦已在 onDown 即时下发（见 fireTapFocus），此处不再处理 —— 抬手才做会让
+    // 用户多等一个按压时长，且对焦框出现得比手指晚（视觉上"卡了一下"）。
     drag_ = Drag::NONE;
     markDirty();     // 松手落位改变 zoom/iso/ss/ev，覆盖层需重烤
 }
@@ -823,26 +901,59 @@ void Ui::drawPreviewOverlay() {
 
     drawGrid(px, py, pw, ph);
 
-    // AF 框 + 十字标记 + 标注
-    gl_.roundedRect(screenX(kAfX), screenY(kAfY), dim(kAfSize), dim(kAfSize), dim(4),
-                    kNone, {1, 1, 1, 0.7f}, dim(1));
-    {
-        std::vector<float> v;
-        float cxp = screenX(kAfX + kAfSize / 2), cyp = screenY(kAfY + kAfSize / 2);
-        float t = std::max(dim(1), 1.f), arm = dim(12);
-        // 上边中点竖线
-        float x0 = cxp - t / 2, y0 = screenY(kAfY) - arm / 2;
-        float q1[12] = {x0, y0, x0 + t, y0, x0, y0 + arm,
-                        x0, y0 + arm, x0 + t, y0, x0 + t, y0 + arm};
-        v.insert(v.end(), std::begin(q1), std::end(q1));
-        // 左边中点横线
-        float x1 = screenX(kAfX) - arm / 2, y1 = cyp - t / 2;
-        float q2[12] = {x1, y1, x1 + arm, y1, x1, y1 + t,
-                        x1, y1 + t, x1 + arm, y1, x1 + arm, y1 + t};
-        v.insert(v.end(), std::begin(q2), std::end(q2));
-        gl_.triangles(v.data(), int(v.size() / 2), {1, 1, 1, 0.85f});
+    // "对焦并拍照"的兜底：HAL 迟迟不报合焦（低反差/纯色墙面）也不能把快门吊死，
+    // 等满 kShotAfterFocusMaxS 直接拍 —— 晚拍一张好过完全不拍。
+    if (shotAfterFocus_ && shotAfterFocusT0_ >= 0 &&
+        nowSec() - shotAfterFocusT0_ > kShotAfterFocusMaxS) {
+        shotAfterFocus_ = false;
+        shotAfterFocusT0_ = -1;
+        LOGI("tap mode: focus timeout %.1fs -> shutter anyway", kShotAfterFocusMaxS);
+        pushCmd(Cmd::SHOT, 0.f);
     }
-    gl_.text("AF-S \xc2\xb7 f/1.65", screenX(kAfX), screenY(kAfTagY), 10 * kUiZoom * scale_, kT2);
+
+    // 触摸对焦框：点按位置缩放落入（1.4→1.0，ease-out）+ 中心点（对焦/测光区域可视化）。
+    // 颜色随 AF 状态回显（橙=扫描中、绿=已合焦、红=合焦失败）—— 用户不用看日志就知道
+    // 点了之后相机有没有真的去合焦。扫描慢于动画时框会延长到 kAfBoxHold，合焦后留 0.6s 收尾。
+    if (afBoxT0_ >= 0) {
+        const double now = nowSec();
+        const double age = now - afBoxT0_;
+        const int st = afState_.load(std::memory_order_relaxed);
+        const bool focused = (st == 2 || st == 4);   // PASSIVE_FOCUSED / FOCUSED_LOCKED
+        if (focused && afFocusedAt_ < 0) afFocusedAt_ = now;
+        double dur = kAfBoxDur;
+        if (st >= 0 && !focused) dur = kAfBoxHold;
+        if (focused && afFocusedAt_ >= 0) dur = std::max(dur, (afFocusedAt_ - afBoxT0_) + 0.6);
+        // "仅选位置"选中的框：白色、常驻不淡出 —— 用户要的就是"位置一直标在那"。
+        // 常驻期间每帧重烤，否则覆盖层缓存不会刷新（AF 状态配色变化同理）。
+        const bool persist = afBoxSticky_;
+        if (persist) markDirty();
+        if (persist || age < dur) {
+            const float in = persist ? 1.f : std::clamp(float(age / 0.18), 0.f, 1.f);
+            const float scl = persist ? 1.f : 1.4f - 0.4f * (1.f - (1.f - in) * (1.f - in));
+            float a = 1.f;
+            if (!persist && age > dur - 0.35)
+                a = float((dur - age) / 0.35);
+            // 状态配色：合焦=绿，失败=红，其余（扫描中/未知）= 强调橙；常驻框恒白
+            Rgba c = kAccent;
+            if (persist) {
+                c = kWhite;
+            } else if (st == 2 || st == 4) {
+                c = Rgba{74 / 255.f, 222 / 255.f, 128 / 255.f, 1};
+            } else if (st == 5 || st == 6) {
+                c = Rgba{1, 77 / 255.f, 64 / 255.f, 1};
+            }
+            const float side = dim(92 * scl);
+            gl_.roundedRect(screenX(afBoxX_) - side / 2, screenY(afBoxY_) - side / 2, side,
+                            side, dim(6 * scl), kNone, {c.r, c.g, c.b, 0.9f * a}, dim(1.6f));
+            const float d = std::max(dim(2.4f), 1.5f);
+            const float cx = screenX(afBoxX_) - d / 2, cy = screenY(afBoxY_) - d / 2;
+            gl_.triangles((float[12]){cx, cy, cx + d, cy, cx, cy + d,
+                                      cx, cy + d, cx + d, cy, cx + d, cy + d},
+                          6, {c.r, c.g, c.b, a});
+        } else {
+            afBoxT0_ = -1;   // 动画结束，停刷
+        }
+    }
 
     // HUD chips（RAW|JPG / DNG / 分辨率 / ZSL）。首枚角标是格式切换按钮：点按 RAW↔JPG
     {
@@ -1014,6 +1125,41 @@ void Ui::drawPreviewOverlay() {
                     {0, 0, 0, 0.42f}, kNone, 0);
     drawHistogram(hx, screenY(kHistY), dim(kHistW), dim(kHistH));
 
+    // 点按模式按钮（右上角，直方图下方）：三态循环 —— 点击即对焦 / 仅选位置 / 对焦并拍照。
+    // 热区按设计坐标记录（onDown 与绘制同在 glue 线程，无竞争）。
+    {
+        const char* txt = tapMode_ == TapMode::Focus
+                              ? "\xe7\x82\xb9\xe5\x87\xbb\xe5\x8d\xb3\xe5\xaf\xb9\xe7\x84\xa6"
+                              : (tapMode_ == TapMode::LockPos
+                                     ? "\xe4\xbb\x85\xe9\x80\x89\xe4\xbd\x8d\xe7\xbd\xae"
+                                     : "\xe5\xaf\xb9\xe7\x84\xa6\xe5\xb9\xb6\xe6\x8b\x8d\xe7\x85\xa7");
+        const float fs = 12 * kUiZoom * scale_;
+        const float tw = gl_.textWidth(txt, fs);
+        // 最小宽度 100 设计 px：三态文字长短不一（4/5/5 字），固定宽度让热区不随
+        // 模式漂移 —— 否则"仅选位置"态按钮变窄，用户按惯性点旧位置会落空变成对焦点按。
+        const float wDes = std::max(tw / scale_ + 2 * kChipPadX, 100.f);
+        const float w = dim(wDes);
+        const float x = screenX(kPreviewX + kPreviewW - 16 - wDes);
+        const float y = screenY(kTapModeY);
+        // 非默认态用强调色描边（一眼看出"当前点按会拍照"这类副作用）
+        const bool hi = (tapMode_ != TapMode::Focus);
+        gl_.roundedRect(x, y, w, dim(kTapModeH), dim(8), kChipBg,
+                        hi ? kAccent : Rgba{1, 1, 1, 0.14f}, hi ? dim(1.4f) : 1.f);
+        // textCenterTop 只返回行顶（不绘制），再交给 text 落笔：按字形墨迹精确居中
+        const float yTop = gl_.textCenterTop(txt, fs, y + dim(kTapModeH) / 2);
+        gl_.text(txt, x + (w - tw) / 2, yTop, fs, hi ? kAccent : kWhite);
+        tapModeL_ = kPreviewX + kPreviewW - 16 - wDes;
+        tapModeR_ = tapModeL_ + wDes;
+        tapModeT_ = kTapModeY;
+        tapModeB_ = kTapModeY + kTapModeH;
+        static bool hotLogged = false;   // 一次性：核对热区与视觉是否一致（命中异常时排查）
+        if (!hotLogged) {
+            hotLogged = true;
+            LOGI("tapmode btn hot: L=%.0f R=%.0f T=%.0f B=%.0f (scale=%.3f wDes=%.0f)",
+                 tapModeL_, tapModeR_, tapModeT_, tapModeB_, scale_, wDes);
+        }
+    }
+
     // EV 面板（ISO/SS 全手动时灰显：EV 只作用于处于自动态的参数，全手动下无意义）
     const bool evGrey = !(isoAuto_ || ssAuto_);
     const Rgba evT2 = evGrey ? Rgba{kT2.r, kT2.g, kT2.b, kT2.a * 0.32f} : kT2;
@@ -1106,6 +1252,8 @@ void Ui::frame() {
 
     // 预览帧率：活动 slot 的相机出帧速率，500ms 窗口（预览左上角显示）
     {
+        // 对焦框动画期间逐帧重烤覆盖层（动画在静态层里，不脏不刷会定帧）
+        if (afBoxT0_ >= 0) markDirty();
         const double t = nowSec();
         if (previewActive_ >= 0) {
             const int64_t cnt = slotFrames_[previewActive_].load(std::memory_order_relaxed);

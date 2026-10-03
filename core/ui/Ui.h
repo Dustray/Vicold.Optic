@@ -30,9 +30,18 @@ class Ui {
 public:
     struct Cmd {
         enum Type { SET_ISO, SET_EXP_US, SET_ZOOM, SET_EV, SET_AE, SET_ISO_AUTO,
-                    SET_SS_AUTO, SET_AE_LOCK, SET_FMT, SHOT } type = SET_ISO;
+                    SET_SS_AUTO, SET_AE_LOCK, SET_FMT, SHOT, TAP_FOCUS } type = SET_ISO;
         float v = 0;
+        float v2 = 0;    // TAP_FOCUS：预览区内归一化坐标 (fx, fy) ∈ [0,1]²
+        float v3 = 0;    // TAP_FOCUS：点按模式（见 TapMode）
     };
+
+    // 点按预览的语义（右上角按钮三态循环切换）：
+    //   Focus     = 点击即对焦（对焦框动画后消失）
+    //   LockPos   = 仅选择对焦位置（只换统计区域、不主动重扫，框常驻标示位置）
+    //   FocusShot = 点击即对焦，合焦后自动拍一张
+    enum class TapMode { Focus, LockPos, FocusShot };
+    TapMode tapMode() const { return tapMode_; }
 
     ~Ui();                               // 析构出线（Gl::Impl 完整性在 Ui.cpp）
     bool attach(ANativeWindow* win);     // EGL + 字体（幂等）
@@ -144,6 +153,12 @@ public:
     // AE 实时回传（自动参数的当前生效值，UI 数值行显示用；引擎每帧从结果更新）
     void setAutoIso(int iso) { autoIso_.store(iso, std::memory_order_relaxed); markDirty(); }
     void setAutoSsUs(int64_t us) { autoSsUs_.store(us, std::memory_order_relaxed); markDirty(); }
+    // AF 状态回显（CONTROL_AF_STATE，-1 = 未知）：决定对焦框配色，
+    // 让用户在取景里直接看出"点的地方有没有合上焦"（不看日志也知道 AF 是否在工作）。
+    void setAfState(int s);   // 实现在 .cpp：合焦时可能顺带触发"对焦并拍照"
+    // 命令即刻通知：由引擎线程注入（see CameraEngine::setUi），pushCmd 后调用，
+    // 使一次性命令（点按对焦/格式切换）不必等主循环的 50ms 轮询边界。
+    void setCmdNotify(std::function<void()> f) { cmdNotify_ = std::move(f); }
     // 导轨上限：引擎侧钳制 UI 下发的 zoom 时用（相机拿不到的高倍由 GL 裁切完成）
     float zoomLimitMax() const { return zoomMax_; }
 
@@ -268,6 +283,24 @@ private:
     // 触摸
     enum class Drag { NONE, ZOOM, ISO, SS, EV } drag_ = Drag::NONE;
     bool shutterDown_ = false;
+    // 触摸对焦：onDown 落在预览区且未命中任何控件即触发（按下即下发，不等抬手）。
+    // 保留按下坐标做位移判定（后续可能用于"按住锁焦"等手势）。
+    float tapDownX_ = 0, tapDownY_ = 0;
+    // 对焦框动画（设计坐标，afBoxT0_ = 触发时刻；<0 无动画）
+    float afBoxX_ = 0, afBoxY_ = 0;
+    double afBoxT0_ = -1;
+    double afFocusedAt_ = -1;           // 进入合焦态的时刻（此后 0.6s 收尾淡出）
+    TapMode tapMode_ = TapMode::Focus;  // 点按语义（右上角按钮循环切换）
+    float tapModeL_ = 0, tapModeR_ = 0, tapModeT_ = 0, tapModeB_ = 0;   // 按钮热区（设计坐标）
+    // "仅选位置"选中的框常驻（白色描边）：一旦选定就一直标在那，直到下一次点按
+    // 换位置 —— 切模式也不清除（统计区域本来就还在生效，清掉反而丢失位置信息）。
+    bool afBoxSticky_ = false;
+    bool shotAfterFocus_ = false;       // FocusShot：等待合焦后自动拍一张
+    double shotAfterFocusT0_ = -1;      // 超时兜底（HAL 迟迟不报合焦也不能卡住快门）
+    static constexpr double kShotAfterFocusMaxS = 2.5;
+    static constexpr double kAfBoxDur = 1.6;   // 动画基准时长（s）：0.18s 缩放落入 + 保持 + 0.35s 淡出
+    static constexpr double kAfBoxHold = 6.0;  // 未合焦时的最长保持（扫描慢于动画时也能看到结果）
+    std::atomic<int> afState_{-1};
     double lastShotAt_ = 0;
     double lastZoomPush_ = 0;   // 上次实时变焦下发时刻（拖拽节流，见 pushZoomLive）
     float lastCamPush_ = 0.f;   // 上次下发给相机的目标值
@@ -326,6 +359,12 @@ private:
     std::mutex cmdM_;
     std::deque<Cmd> cmds_;
     void pushCmd(Cmd::Type t, float v);
+    void pushCmd(Cmd::Type t, float v, float v2);
+    void pushCmd(Cmd::Type t, float v, float v2, float v3);
+    // 命令即刻通知（引擎线程不再死等 50ms tick）：点按对焦的响应延迟直接少半拍。
+    std::function<void()> cmdNotify_;
+    // 触摸对焦：按下即触发（见 onDown 注释）
+    void fireTapFocus(float x, float y);
 };
 
 } // namespace optic::ui

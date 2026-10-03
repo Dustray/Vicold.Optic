@@ -55,6 +55,15 @@ FrameResult parseResult(const ACameraMetadata* result) {
         out.wbGains[2] = e.data.f[2];
         out.wbGains[3] = e.data.f[3];
     }
+    // AF 回显：result 里的 CONTROL_AF_REGIONS 是 HAL「我实际用上的区域」，与下发值比对
+    // 即可判定区域是被接受、被钳制还是被丢弃（丢弃 = 恒为默认/全零/无该标签）。
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_REGIONS, &e) == ACAMERA_OK)
+        for (int i = 0; i < 5 && i < (int)e.count; ++i) out.afRegions[i] = e.data.i32[i];
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AE_REGIONS, &e) == ACAMERA_OK)
+        for (int i = 0; i < 5 && i < (int)e.count; ++i) out.aeRegions[i] = e.data.i32[i];
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_STATE, &e) == ACAMERA_OK &&
+        e.count > 0)
+        out.afState = e.data.u8[0];
     out.physicalId = parsePhysicalId(result);
     return out;
 }
@@ -129,6 +138,13 @@ void CaptureSession::closeLocked() {
     if (onceReq_) { ACaptureRequest_free(onceReq_); onceReq_ = nullptr; }
     for (auto* t : onceTgts_) ACameraOutputTarget_free(t);
     onceTgts_.clear();
+    // AF 触发请求：会话关闭后其 sequenceCompleted 不会再来（且 session_ 已停止），
+    // 这里必须兜底回收，否则进程生命周期内泄漏。
+    for (auto& [seq, tr] : trigs_) {
+        if (tr.req) ACaptureRequest_free(tr.req);
+        for (auto* p : tr.tgts) ACameraOutputTarget_free(p);
+    }
+    trigs_.clear();
     for (auto* o : outputs_) ACaptureSessionOutput_free(o);
     outputs_.clear();
     if (container_) {
@@ -361,6 +377,49 @@ bool CaptureSession::captureOnce(const std::vector<ANativeWindow*>& targets,
     return true;
 }
 
+// AF 触发（触摸对焦）：一次性单帧请求，只挂 win 一个输出（该 window 必须已在会话里，
+// 否则 HAL 直接报错）。挂谁的无所谓 —— 我们只需要一个合法 target 让这帧能被处理。
+// **绝不能复用 bands_ 里的 repeating 请求**：那会把 AF_TRIGGER_START 永久留在 repeating
+// 上（camera2 的 trigger 是「每个请求实例执行一次」语义 ⇒ 每帧重启一次扫描，永不结束）。
+// 请求在本次 capture 的 sequenceCompleted 事件里回收。
+bool CaptureSession::captureTrigger(const std::vector<ANativeWindow*>& targets,
+                                    const CaptureSettings& s) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!session_ || targets.empty()) return false;
+    ACaptureRequest* req = nullptr;
+    if (ACameraDevice_createCaptureRequest(device_, TEMPLATE_PREVIEW, &req) != ACAMERA_OK || !req) {
+        LOGE("createCaptureRequest(af trigger) failed");
+        return false;
+    }
+    TrigReq tr;
+    tr.req = req;
+    for (ANativeWindow* w : targets) {
+        ACameraOutputTarget* t = nullptr;
+        if (ACameraOutputTarget_create(w, &t) != ACAMERA_OK || !t) {
+            LOGE("output target create failed (af trigger)");
+            for (auto* p : tr.tgts) ACameraOutputTarget_free(p);
+            ACaptureRequest_free(req);
+            return false;
+        }
+        tr.tgts.push_back(t);
+        ACaptureRequest_addTarget(req, t);
+    }
+    // forPreview=false：触发请求不参与帧率策略（它只跑一帧，钉 30fps 无意义）
+    s.apply(req, false, false);
+    int seqId = 0;
+    ACaptureRequest* arr[1] = {req};
+    if (ACameraCaptureSession_capture(session_, &capCbs_, 1, arr, &seqId) != ACAMERA_OK) {
+        LOGE("capture(af trigger) failed");
+        for (auto* p : tr.tgts) ACameraOutputTarget_free(p);
+        ACaptureRequest_free(req);
+        return false;
+    }
+    trigs_[seqId] = std::move(tr);
+    LOGI("af trigger sent (seq=%d targets=%zu region=[%d %d %d %d %d])", seqId, targets.size(),
+         s.afRegion[0], s.afRegion[1], s.afRegion[2], s.afRegion[3], s.afRegion[4]);
+    return true;
+}
+
 // 序列结束：sequenceId 匹配的单拍请求在此释放（成功/失败都保证回调）
 void CaptureSession::onSequenceCompleted(void* ctx, ACameraCaptureSession*, int sequenceId,
                                          int64_t) {
@@ -372,6 +431,13 @@ void CaptureSession::onSequenceCompleted(void* ctx, ACameraCaptureSession*, int 
         self->onceSeq_ = -1;
         for (auto* t : self->onceTgts_) ACameraOutputTarget_free(t);
         self->onceTgts_.clear();
+    }
+    // AF 触发请求同样以 sequenceId 为准回收（必须等这次 capture 真正完成才能释放）
+    auto it = self->trigs_.find(sequenceId);
+    if (it != self->trigs_.end()) {
+        if (it->second.req) ACaptureRequest_free(it->second.req);
+        for (auto* p : it->second.tgts) ACameraOutputTarget_free(p);
+        self->trigs_.erase(it);
     }
 }
 
