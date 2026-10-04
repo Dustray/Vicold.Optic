@@ -1213,12 +1213,43 @@ void CameraEngine::drainUiCmds() {
                 recomputeMixed();
                 changed = true;
                 break;
-            case ui::Ui::Cmd::SET_AE:
+            case ui::Ui::Cmd::SET_AE: {
+                // 面板「自动曝光」开关。**不能只翻 aeOn**：关 AE 后 CaptureSettings::apply
+                // 会把 SENSITIVITY/EXPOSURE_TIME 写进请求，而双自动态下这两个值是 0
+                // → HAL 按 ISO 0 / 曝光 0ns 成像，预览直接全黑（2026-10-04 真机实测）。
+                //
+                // 关 AE = 全手动（与滚轮拖到两端同义）：两侧都退出自动，用 AE on 期间冻结的
+                // lastAeIso_/lastAeExpNs_ 补成有效值 —— 曝光守恒，关 AE 前后亮度不变。
+                // 注意 recomputeMixed() 在双手动时**不填值**（它的补偿分支都以 isoAuto_/
+                // ssAuto_ 为条件），故这里显式补齐后再让它重算 EV 增益。开 AE 侧对称还原。
+                const auto& tr = cam_.traits();
+                if (cmd.v > 0.5f) {
+                    isoAuto_ = ssAuto_ = true;
+                    recomputeMixed();          // 双自动分支：清零 iso/exp，交给硬件 AE
+                    if (ui_) ui_->setExpAuto(true, true, 0, 0);
+                } else {
+                    isoAuto_ = ssAuto_ = false;
+                    if (settings_.iso <= 0)
+                        settings_.iso = lastAeIso_ > 0 ? lastAeIso_ : tr.isoMin;
+                    if (settings_.exposureNs <= 0)
+                        settings_.exposureNs =
+                            lastAeExpNs_ > 0 ? lastAeExpNs_ : tr.exposureMinNs;
+                    settings_.iso = std::clamp(settings_.iso, tr.isoMin, tr.isoMax);
+                    settings_.exposureNs =
+                        std::clamp<int64_t>(settings_.exposureNs, tr.exposureMinNs,
+                                            tr.exposureMaxNs);
+                    // 双手动时 EV 无处生效（UI 灰显），清零避免残留补偿叠加到固定曝光上
+                    settings_.evSteps = 0;
+                    if (ui_)
+                        ui_->setExpAuto(false, false, settings_.iso, settings_.exposureNs);
+                }
                 settings_.aeOn = cmd.v > 0.5f;
                 changed = true;
                 break;
+            }
             case ui::Ui::Cmd::SET_AWB:
                 settings_.awbOn = cmd.v > 0.5f;
+                LOGI("awb -> %s (mode=%d)", settings_.awbOn ? "on" : "off", settings_.awbMode);
                 changed = true;
                 break;
             case ui::Ui::Cmd::SET_WB_PRESET: {
@@ -1227,6 +1258,7 @@ void CameraEngine::drainUiCmds() {
                 int idx = int(cmd.v + 0.5f);
                 settings_.awbMode = (idx >= 0 && idx < 8) ? kEnum[idx] : 1;
                 settings_.awbOn = true;   // 选预设即开启白平衡
+                LOGI("awb preset[%d] -> AWB_MODE=%d", idx, settings_.awbMode);
                 changed = true;
                 break;
             }

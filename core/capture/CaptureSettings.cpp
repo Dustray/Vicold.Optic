@@ -18,9 +18,15 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_LOCK, 1, &ael);
     ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &evSteps);
 
+    // AE 手动：写死 ISO/曝光。**两个值必须 > 0** —— 写 0 等于让 HAL 按「ISO 0 /
+    // 曝光 0ns」成像，画面全黑（2026-10-04 真机实测：面板关自动曝光但状态机未补值时）。
+    // 这里做最后一道兜底：任何路径漏出非正值都退回 100（ISO）/ 33ms（1/30s），
+    // 宁可曝光不准也不能给黑图 —— 正确性优先于精度。
     if (!aeOn) {
-        ACaptureRequest_setEntry_i32(req, ACAMERA_SENSOR_SENSITIVITY, 1, &iso);
-        ACaptureRequest_setEntry_i64(req, ACAMERA_SENSOR_EXPOSURE_TIME, 1, &exposureNs);
+        const int32_t isoV = iso > 0 ? iso : 100;
+        const int64_t expV = exposureNs > 0 ? exposureNs : 33000000ll;
+        ACaptureRequest_setEntry_i32(req, ACAMERA_SENSOR_SENSITIVITY, 1, &isoV);
+        ACaptureRequest_setEntry_i64(req, ACAMERA_SENSOR_EXPOSURE_TIME, 1, &expV);
     }
 
     // CAF vs 单次 AF-S：见 CaptureSettings.h 注释（点按走 AF-S 以避免 CAF 的 full sweep）
@@ -49,7 +55,9 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
         ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AF_TRIGGER, 1, &trg);
     }
 
-    uint8_t awb = static_cast<uint8_t>(awbOn ? ACAMERA_CONTROL_AWB_MODE_AUTO : ACAMERA_CONTROL_AWB_MODE_OFF);
+    // 白平衡：awbOn=false → OFF；否则用用户选中的预设（awbMode，默认 AUTO=1）
+    uint8_t awb = static_cast<uint8_t>(awbOn ? (awbMode >= 1 ? awbMode : ACAMERA_CONTROL_AWB_MODE_AUTO)
+                                             : ACAMERA_CONTROL_AWB_MODE_OFF);
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
 
     // 超广角直连物理摄像头时不写 ZOOM_RATIO：物理镜头本身就是最宽 FOV，写 <1.0 反而会让 HAL

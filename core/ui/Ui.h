@@ -6,6 +6,7 @@
 
 #include <android/input.h>
 #include <android/native_window.h>
+#include <android/sensor.h>
 #include <jni.h>
 
 #include <atomic>
@@ -30,11 +31,24 @@ class Ui {
 public:
     struct Cmd {
         enum Type { SET_ISO, SET_EXP_US, SET_ZOOM, SET_EV, SET_AE, SET_ISO_AUTO,
-                    SET_SS_AUTO, SET_AE_LOCK, SET_FMT, SHOT, TAP_FOCUS } type = SET_ISO;
+                    SET_SS_AUTO, SET_AE_LOCK, SET_FMT, SHOT, TAP_FOCUS,
+                    WAKE,            // 休眠态触摸，仅唤醒不执行动作
+                    SET_AWB,         // 白平衡开关（v>0.5 = on）
+                    SET_WB_PRESET,   // 白平衡预设（v = 预设下标，映射见 CameraEngine::drainUiCmds 的 kEnum）
+                    SET_RAW_MODE,    // RAW 模式（v>0.5 = 环形 ZSL，否则单次）
+                    SET_SAVE_QUOTA   // 连拍/保存配额（v = 整数，0 = 不限）
+                    } type = SET_ISO;
         float v = 0;
         float v2 = 0;    // TAP_FOCUS：预览区内归一化坐标 (fx, fy) ∈ [0,1]²
         float v3 = 0;    // TAP_FOCUS：点按模式（见 TapMode）
     };
+
+    // AF/AE 区域（触摸 ROI）边长 = 可见画面宽的该比例 —— **UI 画的框与引擎下发的
+    // metering rectangle 必须同口径**（CameraEngine::roiRectFrom 也读这个值，故放在
+    // public）。此前框画 92px（≈9.6% 预览宽）而下发 15%，看到的框比实际统计窗口小一截。
+    static constexpr float kRoiFrac = 0.15f;
+    // 触摸 ROI 的视觉边长（设计 px）：预览宽 960 × kRoiFrac = 144
+    static constexpr float kAfBoxSide = kRoiFrac * 960.f;
 
     // 点按预览的语义（右上角按钮三态循环切换）：
     //   Focus     = 点击即对焦（对焦框动画后消失）
@@ -42,6 +56,11 @@ public:
     //   FocusShot = 点击即对焦，合焦后自动拍一张
     enum class TapMode { Focus, LockPos, FocusShot };
     TapMode tapMode() const { return tapMode_; }
+
+    // 弹出面板：无 / 设置（左上）/ 曝光白平衡（右上）。面板打开时所有触摸由面板消费，
+    // 面板外区域点按 = 关闭面板（见 onDown / handlePanelTap）。
+    enum class Panel { NONE, SETTINGS, EXPOSURE };
+    Panel panel() const { return panel_; }
 
     ~Ui();                               // 析构出线（Gl::Impl 完整性在 Ui.cpp）
     bool attach(ANativeWindow* win);     // EGL + 字体（幂等）
@@ -153,9 +172,17 @@ public:
     // AE 实时回传（自动参数的当前生效值，UI 数值行显示用；引擎每帧从结果更新）
     void setAutoIso(int iso) { autoIso_.store(iso, std::memory_order_relaxed); markDirty(); }
     void setAutoSsUs(int64_t us) { autoSsUs_.store(us, std::memory_order_relaxed); markDirty(); }
+    // 曝光自动态回推（引擎是 isoAuto_/ssAuto_ 的真值源，面板「自动曝光」开关会改它们）。
+    // 不同步的话：面板关掉自动曝光后，UI 仍显示 ISO/SS 处于 A（自动），滚轮可点、读数
+    // 取 autoIso_ —— 呈现「已关自动」但界面还显示自动的矛盾状态（2026-10-04 真机发现）。
+    // iso/ss 给当前手动值，用于把滚轮指针落到实际生效档位。
+    void setExpAuto(bool isoAuto, bool ssAuto, int iso, int64_t expNs);
     // AF 状态回显（CONTROL_AF_STATE，-1 = 未知）：决定对焦框配色，
     // 让用户在取景里直接看出"点的地方有没有合上焦"（不看日志也知道 AF 是否在工作）。
-    void setAfState(int s);   // 实现在 .cpp：合焦时可能顺带触发"对焦并拍照"
+    // roiLive = 本帧 result 回显的 AF_REGIONS 已与新下发区域对齐；false 表示新 ROI 还没
+    // 生效，此时即便 state 报合焦也是**旧区域**的结论 —— "对焦并拍照"必须等它为真
+    //（否则 ROI 还没生效就把快门按了，审查 P2-8）。
+    void setAfState(int s, bool roiLive = true);   // 实现在 .cpp：合焦时可能顺带触发"对焦并拍照"
     // 命令即刻通知：由引擎线程注入（see CameraEngine::setUi），pushCmd 后调用，
     // 使一次性命令（点按对焦/格式切换）不必等主循环的 50ms 轮询边界。
     void setCmdNotify(std::function<void()> f) { cmdNotify_ = std::move(f); }
@@ -167,6 +194,10 @@ public:
 
     // 覆盖层脏标记（见 Gl.h 注释）：输入/状态变化时置位，frame() 据此重烤离屏覆盖层
     void markDirty() { dirty_ = true; }
+    // 自动休眠状态（引擎注入）：true 时 onDown 不执行任何操作、只发 WAKE 唤醒命令，
+    // frame() 在预览区绘制"已休眠，触摸唤醒"。休眠期间预览帧冻结（相机已停 repeating）。
+    void setSleeping(bool s) { sleeping_ = s; markDirty(); }
+    bool isSleeping() const { return sleeping_; }
 
     Haptics hap_;                        // 触感反馈（按钮点按 / 刻度落档）
     int hapStop_ = -1;                   // 本次拖拽上次落档的档位 id（跨档变化才震）
@@ -186,6 +217,7 @@ private:
     // 覆盖层脏标记：输入/状态变化/直方图刷新时置位，frame() 据此重烤离屏覆盖层。
     // 初始 true 保证首帧必定烘焙。
     bool dirty_ = true;
+    bool sleeping_ = false;       // 自动休眠（引擎 setSleeping 注入）
     // 左侧挖孔/避让几何来自机型层 UiLayoutPolicy（2026-10-01：pandora 三轮实测把
     // cutoutSafeX 定在 88；无左侧挖孔的机型回落到 10 的常规边距，不多留黑条）。
     const optic::device::UiLayoutPolicy uiPol_{optic::device::currentDevice().uiLayout()};
@@ -213,11 +245,64 @@ private:
     void draw();
     void drawTracks();
     void drawPreviewOverlay();
+    // 设置面板（左上「设置」按钮 / 右上「曝光白平衡」按钮）：
+    // 绘制在逐帧动态层（不进静态覆盖层缓存），避免常开面板把烘焙降频收益清零。
+    void drawPanel();
+    void drawSettingsButton();      // 左上、变焦滑块上方
+    void drawExposureButton();      // 右上、快门正上方
+    // 快速整数倍变焦：预览区内、变焦导轨右侧的竖排圆钮（0.7/1/2/5）。
+    // 走静态覆盖层（随 zoom_ 变化重烤），命中在 onDown 早期短路 —— 必须在
+    // 预览区触摸对焦判定之前，否则点按钮会同时触发一次对焦。
+    void drawQuickZoom();
+    int quickZoomHit(float x, float y) const;   // 命中返回 0..3，未命中 -1
+    void applyQuickZoom(int idx);
+    // 面板控件动作类型（doAction 分发；buildCtlRects / handlePanelTap 共用）
+    enum PAct { A_HEADER, A_FMT, A_RAW, A_QUOTA, A_GRID, A_LEVEL, A_SAFE,
+                A_PERSIST, A_AE, A_AWB, A_AWBPRESET };
+    // 面板控件命中（onDown 在 panel_!=NONE 时整体转发到这里）
+    void handlePanelTap(float x, float y);
+    void doAction(PAct act, int seg);            // 面板控件动作分发
+    void openPanel(Panel p);
+    void closePanel();
+    // 面板控件几何（每帧重建，draw 与命中复用同一份，避免坐标漂移）
+    struct PanelCtl {
+        float x = 0, y = 0, w = 0, h = 0;
+        int n = 0, sel = 0;        // 分段控件：n 个选项、当前选中 sel
+        int act = 0;               // 动作类型（见 PAct）
+        const char* label = "";
+        const char** opts = nullptr;
+    };
+    void buildCtlRects();          // 依据 panel_ 与当前状态填充 ctlRects_
+    std::vector<PanelCtl> ctlRects_;
+    // 应用某个设置项：更新 UI 状态 + 下发引擎命令 + （持久化开启时）写文件
+    void applyFmt(bool jpg);
+    void applyRawMode(bool ring);
+    void applyQuota(int n);        // 0 = 不限
+    void applyAe(bool on);
+    void applyAwb(bool on);
+    void applyAwbPreset(int idx);
+    void commitPersist();          // 若开启持久化则写 settings.txt
+    void loadPersistedSettings();  // 启动读 settings.txt 并应用
+    // 电子水平仪（加速度计；无传感器时 roll_ 恒 0 = 气泡居中，优雅降级）
+    void initLevel();
+    void pollLevel();
+    ASensorManager* snsMgr_ = nullptr;
+    ASensorEventQueue* snsQ_ = nullptr;
+    const ASensor* snsAcc_ = nullptr;
+    float roll_ = 0.f;             // 弧度，正=设备右倾
+    // 触摸对焦框：**逐帧直画**（不进静态覆盖层缓存）。仅选位置的常驻框会让静态层
+    // 永远处于"下一帧还得重烤"的状态，把 dcc7106 的烘焙降频收益清零（持续 GPU 负载
+    // 与发热，审查 P1-3）—— 冷却 Tradeoff: 多 2 个 draw call/帧，可接受。
+    void drawAfBox();
+    // "对焦并拍照"超时兜底（原在静态层里，不重烤就不执行 = 可能永远吊着）：每帧检查
+    void checkShotAfterFocus();
     // 静态覆盖层（轨道/刻度/文字/HUD/直方图框等）：仅在脏时重绘进离屏纹理，
     // 每帧由 drawOverlayFull() 合成（见 Gl.h 注释）。与预览/闪光/跨带淡化分离。
     void paintOverlay();
     void drawHistogram(float x, float y, float w, float h);
     void drawGrid(float x, float y, float w, float h);
+    void drawLevel(float x, float y, float w, float h);     // 电子水平仪（预览叠加）
+    void drawSafeFrame(float x, float y, float w, float h); // 安全框（构图参考）
     void drawVTicks(float tx, float ty, float tw, float th,
                     const std::vector<float>& fracs, const std::vector<char>& major);
     // ---- 中心确认点刻度盘（替代滑块）----
@@ -278,6 +363,18 @@ private:
     int zoomUnit_ = 0;                                  // 0=mm 1=×
     bool gridOn_ = true;
 
+    // 弹出面板状态
+    Panel panel_ = Panel::NONE;
+    // 设置面板状态（持久化开关决定是否写文件）
+    bool rawRing_ = true;          // RAW 模式：true=环形(ZSL) false=单次
+    int saveQuotaSel_ = 2;         // 连拍/保存配额下标 → {1,4,8,0(不限)}
+    bool aeOn_ = true;             // 自动曝光
+    bool awbOn_ = true;            // 自动白平衡
+    int awbPreset_ = 0;            // 白平衡预设下标（0=自动）
+    bool levelOn_ = false;         // 电子水平仪
+    bool safeFrameOn_ = false;     // 安全框
+    bool persist_ = false;         // 设置持久化开关
+
     int previewSlots_ = 1;      // 常驻预览源数（机型层 SessionPolicy.previewSlots）
 
     // 触摸
@@ -286,6 +383,9 @@ private:
     // 触摸对焦：onDown 落在预览区且未命中任何控件即触发（按下即下发，不等抬手）。
     // 保留按下坐标做位移判定（后续可能用于"按住锁焦"等手势）。
     float tapDownX_ = 0, tapDownY_ = 0;
+    // 预览区双击清 ROI（回默认评价测光）：与 EV 面板同一套判定（350ms + 近距离）
+    double lastPreviewTapMs_ = -1e3;
+    float lastPreviewTapX_ = 0, lastPreviewTapY_ = 0;
     // 对焦框动画（设计坐标，afBoxT0_ = 触发时刻；<0 无动画）
     float afBoxX_ = 0, afBoxY_ = 0;
     double afBoxT0_ = -1;
@@ -295,8 +395,10 @@ private:
     // "仅选位置"选中的框常驻（白色描边）：一旦选定就一直标在那，直到下一次点按
     // 换位置 —— 切模式也不清除（统计区域本来就还在生效，清掉反而丢失位置信息）。
     bool afBoxSticky_ = false;
-    bool shotAfterFocus_ = false;       // FocusShot：等待合焦后自动拍一张
-    double shotAfterFocusT0_ = -1;      // 超时兜底（HAL 迟迟不报合焦也不能卡住快门）
+    // "对焦并拍照"的等待状态：glue 线程（fireTapFocus/按钮）与引擎线程（setAfState）
+    // 都会读写 —— 必须原子，否则可能重复下发 SHOT 或永久卡住（审查 P2-7）。
+    std::atomic<bool> shotAfterFocus_{false};
+    std::atomic<double> shotAfterFocusT0_{-1};   // 超时兜底（HAL 迟迟不报合焦也不能卡住快门）
     static constexpr double kShotAfterFocusMaxS = 2.5;
     static constexpr double kAfBoxDur = 1.6;   // 动画基准时长（s）：0.18s 缩放落入 + 保持 + 0.35s 淡出
     static constexpr double kAfBoxHold = 6.0;  // 未合焦时的最长保持（扫描慢于动画时也能看到结果）
@@ -365,6 +467,8 @@ private:
     std::function<void()> cmdNotify_;
     // 触摸对焦：按下即触发（见 onDown 注释）
     void fireTapFocus(float x, float y);
+    // 双击预览区：清除 AF/AE 区域回到默认评价测光（区域粘滞时的唯一退路）
+    void clearTapFocus();
 };
 
 } // namespace optic::ui

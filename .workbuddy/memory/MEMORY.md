@@ -29,6 +29,10 @@
   focus_d 因值未变不再触发 → 镜头一直自动追焦、读数卡在 0.47m 永不跟随（曾据此误判镜头物理下限）
 - 息屏时启动报 `Camera "0" disabled by policy` 是**息屏导致**（先查 mWakefulness，keyevent 唤醒），
   不是权限问题，appops 怎么 set 都无效
+- 面板/弹层的坐标**直接从截图量再乘 2.4593(x)/2.526(y)** 换算真机值，别手推 design——
+  面板内容垂直居中，y 随行数变化，手推错过两次
+- **`MSYS_NO_PATHCONV=1` 只给 adb 用，package.sh 前必须 unset**：aapt2 是 Windows 程序，
+  需要 MSYS 把 `/d/...` 转成 `D:\...`，设了反而报「找不到 res 目录」（表现为装机后行为没变）
 - 三路 reader 每帧必须全部 drain
 - 会话重建走退役墓地（retired_，1.5s 延迟析构，防 C2N 回调线程 UAF SIGABRT）
 - 逐摄键 API：`ACaptureRequest_setEntry_physicalCamera_float(req, physicalId, tag, ...)`——physicalId 在 tag 前
@@ -62,6 +66,15 @@
 - **`dim()/screenX()/screenY()` 在 Ui 的 private 段** —— 文件级自由函数不能直接用。
   抽图标绘制这类自由函数时，只传**已换算好的屏幕像素**（+ 显式 `scale`），
   design→screen 换算留在 Ui 成员函数里（2026-10-04 编译 13 处 private 报错）
+- **AE 手动态的 ISO/SS 必须 >0**：关 AE 后 `CaptureSettings::apply` 会无条件写
+  SENSITIVITY/EXPOSURE_TIME，值为 0 就是「ISO 0/曝光 0ns」→ **预览全黑**（真机确诊）。
+  `SET_AE` 必须显式用冻结的 lastAeIso_/lastAeExpNs_ 补值，**`recomputeMixed()` 双手动时
+  不填值**（补偿分支都以 isoAuto_/ssAuto_ 为条件）。apply 里另有兜底（非正→100/33ms）
+- **isoAuto_/ssAuto_ 真值在引擎**，UI 侧同名成员靠 `Ui::setExpAuto()` 回推，
+  不同步会出现「面板显示已关自动、滚轮仍显示 A 且指针停在旧档」
+- 持久化：关开关必须 `std::remove` 删 settings.txt（只 return 不写的话旧值留在盘上，
+  下次启动照样恢复 = 开关形同虚设）；`loadPersistedSettings` 必须**先全量解析再按固定
+  顺序应用**（`applyAwbPreset` 会强制 awbOn=true，边解析边应用会有行序依赖）
 
 ## 触摸对焦（2026-10-02/03 定稿）
 - MeteringRectangle=int32×5 `(xmin,ymin,xmax,ymax,weight≤1000)`——写成 (x,y,w,h) 会退化成点

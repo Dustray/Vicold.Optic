@@ -264,6 +264,20 @@ bool Ui::attach(ANativeWindow* win) {
 
 void Ui::detach() { gl_.detach(); }
 
+void Ui::setExpAuto(bool isoAuto, bool ssAuto, int iso, int64_t expNs) {
+    isoAuto_ = isoAuto;
+    ssAuto_ = ssAuto;
+    // 手动侧：把滚轮指针落到实际生效档位（否则关自动曝光后指针还停在旧下标，
+    // 与真正下发的 ISO/SS 差好几档 —— 读数行显示值和实际拍出来的不一致）
+    if (!isoAuto && iso > 0) isoIdx_ = nearestStopIdx(kIsoStops, kIsoStopsN, float(iso));
+    if (!ssAuto && expNs > 0)
+        ssIdx_ = nearestStopIdx(kSsStops, kSsStopsN, float(double(expNs) * 1e-9));
+    // 自动侧的读数来源是 autoIso_/autoSsUs_，手动后不能再拿它俩当显示值
+    setAutoIso(iso);
+    setAutoSsUs(expNs / 1000);
+    markDirty();
+}
+
 // ---- 命令队列（glue 线程生产，引擎线程消费）----
 
 void Ui::pushCmd(Cmd::Type t, float v) {
@@ -1981,8 +1995,16 @@ void Ui::applyAwbPreset(int idx) {
 }
 
 void Ui::commitPersist() {
-    if (!persist_ || dataDir_.empty()) return;
-    std::ofstream f(dataDir_ + "/settings.txt");
+    if (dataDir_.empty()) return;
+    const std::string path = dataDir_ + "/settings.txt";
+    if (!persist_) {
+        // 关持久化 = 不记住任何设置，必须**删掉已落盘的文件**。只 "return 不写" 的话，
+        // 旧文件里的 persist=1 和全部旧值会留在盘上，下次启动原样恢复 ⇒ 开关形同虚设
+        // （2026-10-04 真机实测：关持久化后改网格，文件里 grid 照样被改写）。
+        std::remove(path.c_str());
+        return;
+    }
+    std::ofstream f(path);
     if (!f) return;
     f << "persist=1\n";
     f << "fmt=" << (fmtJpg_ ? "jpg" : "raw") << "\n";
@@ -2002,6 +2024,11 @@ void Ui::loadPersistedSettings() {
     if (!f) return;
     std::string line;
     bool persist = false;
+    // **先解析再应用**：applyAwbPreset() 会强制 awbOn_=true（选预设即开白平衡），
+    // 若边解析边应用，文件行序就决定最终 AWB 状态（awb=off 行在 awbpreset 行之前/之后
+    // 结果相反）——加载同一份配置得到两种状态。改为全量读完再按固定顺序应用。
+    bool hasAwb = false, awbOn = true;
+    int awbPresetIdx = 0;
     while (std::getline(f, line)) {
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -2011,12 +2038,16 @@ void Ui::loadPersistedSettings() {
         else if (k == "rawmode") { bool ring = (v == "ring"); if (ring != rawRing_) applyRawMode(ring); }
         else if (k == "quota") { int n = std::atoi(v.c_str()); if (n != kQuotaVals[saveQuotaSel_]) applyQuota(n); }
         else if (k == "ae") { bool on = (v == "on"); if (on != aeOn_) applyAe(on); }
-        else if (k == "awb") { bool on = (v == "on"); if (on != awbOn_) applyAwb(on); }
-        else if (k == "awbpreset") { int idx = std::atoi(v.c_str()); if (idx != awbPreset_) applyAwbPreset(idx); }
+        else if (k == "awb") { hasAwb = true; awbOn = (v == "on"); }
+        else if (k == "awbpreset") awbPresetIdx = std::atoi(v.c_str());
         else if (k == "grid") { bool on = (v == "1"); if (on != gridOn_) { gridOn_ = on; markDirty(); } }
         else if (k == "level") { bool on = (v == "1"); if (on != levelOn_) { levelOn_ = on; markDirty(); } }
         else if (k == "safe") { bool on = (v == "1"); if (on != safeFrameOn_) { safeFrameOn_ = on; markDirty(); } }
     }
+    // AWB：预设先落（可能顺带打开白平衡），再按文件里的 awb 开关收敛到最终态。
+    // 顺序固定 ⇒ 结果与文件行序无关。
+    applyAwbPreset(std::clamp(awbPresetIdx, 0, 7));
+    if (hasAwb && awbOn != awbOn_) applyAwb(awbOn);
     // 持久化开关本身：仅当文件标记为持久化时才恢复开启（否则默认关闭、不恢复旧值）
     persist_ = persist;
     markDirty();
