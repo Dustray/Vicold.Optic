@@ -192,10 +192,22 @@ paintOverlay:  … 导轨面板 → 导轨 → 快门 → 入口图标(齿轮/�
 
 | 档位 | `CONTROL_AE_MODE` | `FLASH_MODE` |
 |---|---|---|
-| 0 关 | `ON` | 不写 |
-| 1 自动 | `ON_AUTO_FLASH` | 不写 |
-| 2 开 | `ON_ALWAYS_FLASH` | 手动曝光时**仅单拍**写 `SINGLE` |
+| 0 关 | `ON` | `OFF`（显式写，见坑 3）|
+| 1 自动 | `ON_AUTO_FLASH` | `OFF`（显式写，见坑 3）|
+| 2 开 | `ON_ALWAYS_FLASH` | 手动曝光时**仅单拍**写 `SINGLE`；其余 `OFF` |
 | 3 常亮 | `ON` | `TORCH`（任何请求都写）|
+
+**闪光单拍必须先走 AE 预捕获序列**（2026-10-04 真机确诊）：单独下发
+`AE_MODE=ON_ALWAYS_FLASH` 的单拍请求，HAL 走完 `start mainflash` 流程**但灯不亮**
+（AE_STATE 4 FLASH_REQUIRED → 5 PRECAPTURE，flashState 恒 CHARGING，on/off 成片亮度无差）。
+修复：`triggerBurst` 在闪光单拍前先发一帧带 `AE_PRECAPTURE_TRIGGER=START` 的一次性请求
+（瞬态字段 `CaptureSettings::aePrecapture`，与 `afTrigger` 同模式），等 800ms 再出片。
+规范要求 precapture 与单拍请求之间 AE/flash 档位保持一致 —— 两者同源 `settings_` 天然满足。
+
+**USB 连接时 MIUI 限流 strobe 闪光（真机确诊）**：插着 USB 调试时主闪（SINGLE/charge
+pump 大电流放电）被系统层禁掉 —— precapture 照跑、cameraserver 记录 `start mainflash`、
+`flashState` 恒 CHARGING，但 LED 不亮；**torch 不受限**（LED 直驱小电流，正常亮）。
+拔线后强制闪光立即恢复。**结论：闪光功能验证必须拔线人工测试**，插线时永远验不出真闪。
 
 三条必须记住的坑：
 
@@ -204,7 +216,11 @@ paintOverlay:  … 导轨面板 → 导轨 → 快门 → 入口图标(齿轮/�
 2. **repeating 上绝不能写 `FLASH_MODE=SINGLE`** —— camera2 语义是「每个请求实例放一次电」，
    会让闪光灯每帧放电（费电伤灯）。手动曝光（AE_MODE=OFF）下需要靠 `forPreview=false`
    把 SINGLE 限定在单拍请求上（`captureOnce` 走 TEMPLATE_STILL_CAPTURE 且传 `forPreview=false`）。
-3. **档位 3（常亮）的 AE_MODE 必须保持 `ON`**，写成 `ALWAYS_FLASH` 会叠加「每次 capture 再放一次电」。
+3. **FLASH_MODE 是「指定才覆盖」语义，每个请求都必须显式写** —— 从常亮切到其它档位时，
+   新 repeating 不带 FLASH_MODE 的话 HAL 沿用残留的 TORCH，**LED 永不熄灭**
+   （2026-10-04 真机确诊）。因此 apply() 对非 torch 档显式写 `FLASH_MODE=OFF`
+   （写 OFF 不影响 AE_MODE 层面的 AUTO_FLASH/ALWAYS_FLASH 决策）。
+4. **档位 3（常亮）的 AE_MODE 必须保持 `ON`**，写成 `ALWAYS_FLASH` 会叠加「每次 capture 再放一次电」。
 
 **无闪光灯单元的设备必须清零**：`AE_MODE_ON_ALWAYS_FLASH` 会被 HAL 拒绝整包
 （连带同请求其它 entry 一起丢）。两道守卫：

@@ -38,6 +38,11 @@ struct CaptureSettings {
     // trigger 落在 repeating 请求里会被每个请求实例各执行一次（每帧重启扫描 ⇒ 永不结束），
     // 因此该字段恒由点按后的 captureTrigger 临时请求携带，settings_ 自身保持 0。
     int32_t afTrigger = 0;
+    // 一次性 AE 预捕获触发（CONTROL_AE_PRECAPTURE_TRIGGER，写入 = START）。与 afTrigger
+    // 同一约束：**只能出现在单帧请求上**。闪光/低光单拍前必须先走这个序列 —— HAL 靠它
+    // 启动「闪光预闪测光 → AE 收敛」流程，没有它 AE_MODE=ON_ALWAYS_FLASH 的单拍请求
+    // 会被 HAL 直接出帧、灯不亮（pandora 真机实测：亮度对照无差异，flash.state 不进 FIRED）。
+    int32_t aePrecapture = 0;
     // AWB
     bool awbOn = true;            // TODO(M2): CCT 手动（colorTemperature tag 需真机验证）
     int awbMode = 1;              // 白平衡预设（Android AWB_MODE 枚举值；1=AUTO）；awbOn=false 时下发 OFF

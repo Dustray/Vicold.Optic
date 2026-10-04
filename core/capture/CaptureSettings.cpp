@@ -27,17 +27,22 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
     // ALWAYS_FLASH 会叠加「每次 capture 再放一次电」，与「常亮」语义冲突。
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_MODE, 1, &ae);
 
-    // FLASH_MODE 只在这两种情形下写，其余交给 AE_MODE（写了反而覆盖 AE 的闪光决策）：
-    //   常亮 → TORCH，任何请求都要写（预览时就该亮着，这是手电筒的定义）
-    //   开（2）且手动曝光 → SINGLE，且**仅限单拍请求**（forPreview=false）。
-    //     repeating 上写 SINGLE 会让闪光灯每帧放电，既费电又伤灯。
+    // FLASH_MODE 语义：HAL 对「本请求未指定的 entry」**保留上一次的值**（"指定才覆盖"）。
+    // 由此必须**每个请求都显式写**：torch 之外的任何档位若不写 FLASH_MODE，从常亮切出后
+    // repeating 重发的新请求不带 TORCH，HAL 却沿用残留的 TORCH —— LED 永不熄灭
+    //（2026-10-04 真机确诊：常亮→关/自动/开 灯都关不掉）。显式 OFF 即为清除残留：
+    //   常亮 → TORCH（手电筒定义，预览时就该亮着）
+    //   开(2)+手动曝光 → SINGLE，且**仅限单拍请求**（repeating 上写 SINGLE 会每帧放电）
+    //   其余 → OFF（覆盖残留；不影响 AE_MODE 层面的 AUTO_FLASH/ALWAYS_FLASH 决策）
+    uint8_t fm;
     if (flashMode == 3) {
-        const uint8_t fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_TORCH);
-        ACaptureRequest_setEntry_u8(req, ACAMERA_FLASH_MODE, 1, &fm);
+        fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_TORCH);
     } else if (flashMode == 2 && !aeOn && !forPreview) {
-        const uint8_t fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_SINGLE);
-        ACaptureRequest_setEntry_u8(req, ACAMERA_FLASH_MODE, 1, &fm);
+        fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_SINGLE);
+    } else {
+        fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_OFF);
     }
+    ACaptureRequest_setEntry_u8(req, ACAMERA_FLASH_MODE, 1, &fm);
 
     uint8_t ael = static_cast<uint8_t>(aeLock ? 1 : 0);
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_LOCK, 1, &ael);
@@ -78,6 +83,12 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
     if (afTrigger > 0) {
         const uint8_t trg = static_cast<uint8_t>(ACAMERA_CONTROL_AF_TRIGGER_START);
         ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AF_TRIGGER, 1, &trg);
+    }
+    // AE 预捕获触发：闪光单拍的前置序列（预闪测光 → AE 收敛 → 才允许真出片）。
+    // 同 afTrigger 语义：每个请求实例执行一次，只能出现在单帧请求上。
+    if (aePrecapture > 0) {
+        const uint8_t pt = static_cast<uint8_t>(ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER_START);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, 1, &pt);
     }
 
     // 白平衡：awbOn=false → OFF；否则用用户选中的预设（awbMode，默认 AUTO=1）

@@ -64,6 +64,12 @@ FrameResult parseResult(const ACameraMetadata* result) {
     if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_STATE, &e) == ACAMERA_OK &&
         e.count > 0)
         out.afState = e.data.u8[0];
+    // AE/FLASH 状态（闪光 precapture 诊断：HAL 是否真跑了预闪序列）
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AE_STATE, &e) == ACAMERA_OK &&
+        e.count > 0)
+        out.aeState = e.data.u8[0];
+    if (ACameraMetadata_getConstEntry(result, ACAMERA_FLASH_STATE, &e) == ACAMERA_OK && e.count > 0)
+        out.flashState = e.data.u8[0];
     out.physicalId = parsePhysicalId(result);
     return out;
 }
@@ -420,8 +426,9 @@ bool CaptureSession::captureTrigger(const std::vector<ANativeWindow*>& targets,
         return false;
     }
     trigs_[seqId] = std::move(tr);
-    LOGI("af trigger sent (seq=%d targets=%zu region=[%d %d %d %d %d])", seqId, targets.size(),
-         s.afRegion[0], s.afRegion[1], s.afRegion[2], s.afRegion[3], s.afRegion[4]);
+    // 中性措辞：本函数同时服务 AF 触发与闪光 precapture 触发（用途看 s.afTrigger/aePrecapture）
+    LOGI("one-shot trigger sent (seq=%d targets=%zu af=%d aePre=%d)", seqId, targets.size(),
+         s.afTrigger, s.aePrecapture);
     return true;
 }
 

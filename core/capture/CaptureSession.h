@@ -37,6 +37,8 @@ struct FrameResult {
     int32_t cropRegion[4] = {};        // SCALER_CROP_REGION（activeArray 域；w/h=0 表示未取到）
     // AF 诊断回显（触摸对焦闭环确认：HAL 到底收没收区域、扫没扫）
     int32_t afState = -1;              // CONTROL_AF_STATE（-1 = 该帧没取到）
+    int32_t aeState = -1;              // CONTROL_AE_STATE（-1 = 该帧没取到）
+    int32_t flashState = -1;           // CONTROL_FLASH_STATE（-1 = 该帧没取到）
     int32_t afRegions[5] = {};         // result 回显的 CONTROL_AF_REGIONS（== 下发值才算被接受）
     int32_t aeRegions[5] = {};         // result 回显的 CONTROL_AE_REGIONS
     std::string physicalId;             // 当前主源物理摄像头（ACTIVE_PHYSICAL_ID，诊断用）

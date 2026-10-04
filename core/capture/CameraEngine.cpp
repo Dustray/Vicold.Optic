@@ -1443,6 +1443,29 @@ void CameraEngine::triggerBurst() {
         // WysiwygCropProcessor 中心裁切补齐 —— 全程统一 WYSIWYG。
         const bool uwShot = uwAllowed_ && stillUw_ && !uwPhysId_.empty() &&
                             activePhysId() == uwPhysId_;
+        // 闪光单拍（自动/强制，AE 开启时）必须先走 AE 预捕获序列：单独下发
+        // AE_MODE=ON_ALWAYS_FLASH 的单拍请求 HAL 会直接出帧、灯不亮（2026-10-04
+        // 真机实测：on/off 两张同场景照平均亮度 149.3 vs 147.7 无差异）。precapture
+        // trigger 让 HAL 执行「预闪 → AE 重新测光收敛 → 出片」标准序列。
+        //   - 触发请求挂全量 targets（与 repeating 一致，见 sendAfTrigger 注释）；
+        //   - trigger 语义同 AF：每个请求实例执行一次，绝不进 repeating；
+        //   - 延时取 800ms：等预闪+AE 收敛（CamX 实测量级），不做 AE_STATE 监听的
+        //     简化实现 —— 引擎线程内联等待，同线程无并发 retire 风险；
+        //   - auto 档场景够亮时 HAL 判定不闪属正确语义；常亮档 TORCH 已亮，无需序列；
+        //   - 手动曝光（!aeOn）无 AE 可收敛，FLASH_MODE=SINGLE 交给 HAL 直闪。
+        if (settings_.aeOn && (settings_.flashMode == 1 || settings_.flashMode == 2) &&
+            cam_.traits().flashAvailable) {
+            const std::string sig = sessionSig_.empty() ? std::string("ALL") : sessionSig_;
+            if (!bandTargets(sig).empty()) {
+                CaptureSettings pre = settings_;
+                pre.aePrecapture = 1;
+                if (session_->captureTrigger(bandTargets(sig), pre)) {
+                    LOGI("flash precapture trigger sent (mode=%d)", settings_.flashMode);
+                    flashDbgUntilMs_ = nowMs() + 2500;   // 诊断采窗：看 HAL 是否真走预闪序列
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+            }
+        }
         StillParams p = makeStillParams();
         CaptureSettings s = settings_;
         if (uwShot) {
@@ -1667,6 +1690,13 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
         const bool st = r.afState != lastAfState_;
         const bool rg = std::memcmp(r.afRegions, lastAfRegions_, sizeof(r.afRegions)) != 0;
         const bool fd = std::fabs(r.focusDistanceDiopters - lastAfFd_) > 0.02f;
+        // 闪光 precapture 诊断采窗：打印 AE/FLASH 状态（FLASH_STATE=1 UNAVAILABLE,2 CHARGING,
+        // 3 READY,4 FIRED；AE_STATE: 0 INACTIVE,1 SEARCHING,2 CONVERGED,3 LOCKED,4 FLASH_REQUIRED,5 PRECAPTURE）
+        if (t < flashDbgUntilMs_ && t - lastFlashDbgMs_ >= 150) {
+            lastFlashDbgMs_ = t;
+            LOGI("flash dbg: aeState=%d flashState=%d iso=%d exp=%.2fms",
+                 r.aeState, r.flashState, r.iso, r.exposureNs / 1e6);
+        }
         // 点按后的 2.5s 加密采窗内限流到 200ms 一条（30fps 全打会淹没 logcat）
         if (st || rg || fd || (inWindow && t - lastAfLogMs_ >= 200)) {
             LOGI("af: state=%d region=[%d %d %d %d w=%d] ae=[%d %d %d %d] fd=%.3f (%.2fm)",

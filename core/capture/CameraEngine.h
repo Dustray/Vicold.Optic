@@ -298,6 +298,9 @@ private:
     float lastAfFd_ = -1.f;
     int64_t afDbgUntilMs_ = 0;
     int64_t lastAfLogMs_ = 0;
+    // 闪光 precapture 诊断采窗（AE_STATE/FLASH_STATE 打印，见 onFrameResult）
+    int64_t flashDbgUntilMs_ = 0;
+    int64_t lastFlashDbgMs_ = 0;
     // UI 合焦判定的稳态跟踪（AF 报锁定时镜头常仍在移动，见 onFrameResult）
     float lastFdUi_ = -1.f;
     int fdSteadyCnt_ = 0;
