@@ -79,6 +79,7 @@ void CameraEngine::setUi(ui::Ui* u) {
 
 void CameraEngine::run(std::string dataDir) {
     dataDir_ = std::move(dataDir);
+    lastInteractionMs_ = nowMs();   // 启动起算：给一整段宽限期，不立刻休眠
     // 每轮运行复位看门狗/重连状态（成员跨引擎生命周期保留，残留会让新运行
     // 误报 preview stall 或开局就撞重连上限 —— 2026-09-30 真机复现）
     lastResultMs_ = 0;
@@ -130,7 +131,9 @@ void CameraEngine::run(std::string dataDir) {
 
         // 预览存活看门狗：repeating 被 HAL 静默丢弃（逻辑多摄切超广角时偶发，
         // setRepeatingRequest 返回成功却不再交付 result）时自动重发 setRepeating 恢复。
-        if (session_ && ui_ && ui_->attached()) {
+        // 休眠态跳过：停 repeating 后不再有 result 流入，否则会被误判 stall 自动重发
+        //（等于白睡，相机被偷偷唤醒）。
+        if (!sleeping_ && session_ && ui_ && ui_->attached()) {
             const int64_t since = lastResultMs_ == 0 ? 0 : nowMs() - lastResultMs_;
             if (lastResultMs_ != 0 && since > 1200) {
                 if (stallRetries_ < 12) {
@@ -168,6 +171,13 @@ void CameraEngine::run(std::string dataDir) {
             continue;
         }
 
+        // 自动休眠触发：长时间无操作则停 repeating（相机停跑，降功耗/发热）。
+        // 休眠中不跑看门狗（上方已用 !sleeping_ 排除），此处也只在未休眠时判定。
+        if (!sleeping_ && session_ && ui_ && ui_->attached() && lastInteractionMs_ > 0 &&
+            nowMs() - lastInteractionMs_ > kSleepMs) {
+            sleepCamera();
+        }
+
         // 近距状态翻转 → 分带可能变化（接管点 5x ↔ 20x），重发 repeating
         if (bandDirty_.exchange(false, std::memory_order_acq_rel)) commitSession(true);
 
@@ -182,13 +192,16 @@ void CameraEngine::run(std::string dataDir) {
         }
 
         // 只换 ROI（policy 0）的兜底：HAL 若完全没反应，补一次传统 AF_TRIGGER。
-        // afScanned_/afFocusLogged_ 保证"已经在收敛"的时候绝不打扰（打扰 = 重新甩到
-        // 无穷远再全扫，实测多花一倍时间）。
-        if (afTapPolicy_ == 0 && afTapT0Ms_ > 0 && !afScanned_ && !afFocusLogged_ &&
+        // 判据是"点按之后镜头有没有动过"（fdMovedSinceTap_）—— 镜头没动 = 新 ROI 没被
+        // 采纳；afFocusLogged_ 保证已经在收敛/已合焦的时候绝不打扰（打扰 = 重新甩到
+        // 无穷远再全扫，实测多花一倍时间）。旧判据用 afScanned_ 是错的：CAF 常态就在
+        // 1/2 之间周期跳变，点按后几百毫秒它必为真，兜底实际永不触发。
+        if (afTapPolicy_ == 0 && afTapT0Ms_ > 0 && !afFocusLogged_ && !fdMovedSinceTap_ &&
             nowMs() - afTapT0Ms_ >= kAfFallbackMs) {
-            LOGI("af: no ROI reaction in %lldms -> fallback trigger",
+            LOGI("af: lens did not move in %lldms -> fallback trigger",
                  (long long)kAfFallbackMs);
             afTapT0Ms_ = nowMs();   // 重新计时（测的是补触发后的合焦耗时）
+            fdMovedSinceTap_ = false;
             sendAfTrigger();
         }
 
@@ -318,6 +331,26 @@ void CameraEngine::closeSession() {
         stillUw_.reset();
     }
     cam_.close();
+}
+
+// 自动休眠：停 repeating（相机 ISP/传感器停跑），预览不再出帧；UI 显示"已休眠，触摸唤醒"。
+// 会话/纹理/输出目标全部保留，唤醒只需重发 repeating（见 wakeCamera），瞬启且无黑帧。
+void CameraEngine::sleepCamera() {
+    if (sleeping_ || !session_) return;
+    session_->stopRepeating();
+    sleeping_ = true;
+    if (ui_) ui_->setSleeping(true);
+    LOGI("camera sleep: repeating stopped (idle > %llds)", (long long)(kSleepMs / 1000));
+}
+
+// 唤醒：重发 repeating 恢复预览流，并复位空闲计时（避免唤醒瞬间又立刻入睡）。
+void CameraEngine::wakeCamera() {
+    if (!sleeping_) return;
+    sleeping_ = false;
+    lastInteractionMs_ = nowMs();
+    if (ui_) ui_->setSleeping(false);
+    commitSession(true);   // 按当前设置/带/RAW 状态重发 ALL 或单流 repeating
+    LOGI("camera wake: repeating resumed");
 }
 
 ANativeWindow* CameraEngine::stillWindow() const {
@@ -667,6 +700,9 @@ CaptureSettings CameraEngine::effSettings() const {
 
 void CameraEngine::commitSession(bool settingsChanged) {
     if (!session_) return;
+    // ROI 随 zoom 走：这是**唯一**的重算入口，覆盖所有会改变 zoom 的路径
+    //（UI 拖拽 / controls.txt / 近距接管点翻转后的 commit），区域变化必须重发 repeating。
+    if (refreshRoi()) settingsChanged = true;
     refreshPhysIds();
     const std::string phys = activePhysId();
     const bool rawRing = raw_ && raw_->ringMode();
@@ -737,7 +773,12 @@ void CameraEngine::pollControls() {
     bool changed = false;
     for (auto& [k, v] : *kv) applyControl(k, v, changed);
 
-    commitSession(changed);
+    // 调试键改动视为一次用户操作：休眠中直接唤醒并把新设置一起下发（避免改动被静默丢弃）。
+    if (sleeping_) {
+        if (changed) wakeCamera();
+    } else {
+        commitSession(changed);
+    }
 
     // 一次性命令自消费：处理后从文件剔除（防 FUSE mtime 抖动导致的重触发）
     bool hadOneShot = false;
@@ -895,11 +936,25 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGI("tele near-distance switch: %.1fx", f);
         }
     } else if (k == "near_m") {
-        // 近距判定阈值（米，0 = 关闭距离判定；退出阈值 = 1.5 倍）
+        // 近距判定阈值（米，0 = 关闭距离判定）。改动必须**同时清掉已锁存的
+        // nearSubject_**：否则诊断键「关掉判定」后状态仍留在 near，接管点继续
+        // 按 teleNearSwitch_ 生效，5x 卡在主摄出不来（2026-10-04 真机实测）。
         float f = std::atof(v.c_str());
         if (f != nearEnterM_) {
             nearEnterM_ = f;
             nearCnt_ = farCnt_ = 0;
+            // 两种情况必须立即释放已锁存的近距态：① 关掉判定（f<=0，状态机
+            // 不再运行，永远退不出）；② 新阈值已大于当前实测距离（状态机要重跑
+            // 十几帧才翻转，期间仍按旧接管点渲染）。lastFdUi_ 是最近一次 result
+            // 回读的屈光度（0 = 无效读数，此时不猜）。
+            const float lastFd = lastFdDiopters_.load(std::memory_order_acquire);
+            const float lastM = lastFd > 1e-3f ? 1.f / lastFd : -1.f;
+            if (nearSubject_ && (f <= 0.f || (lastM > 0.f && lastM >= f))) {
+                nearSubject_ = false;
+                LOGI("near-distance rule cleared (thr=%.2fm last=%.2fm) -> tele switch back at "
+                     "%.2fx",
+                     f, lastM, teleSwitch_);
+            }
             bandDirty_.store(true, std::memory_order_release);
             LOGI("near-distance threshold: %.2fm", f);
         }
@@ -980,13 +1035,11 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
 // 驱动测光，业界通行语义）；CamX SAT 把区域换算到当前 backing 物理摄，跨带通用。
 // 区域边长取可见宽的 15%（点按精度与统计窗口的折中），钳制进阵列。区域粘滞保留
 // （再次点按才更新）；手动对焦（focus_d）下点按 = 切回连续自动对焦。
-bool CameraEngine::onTapFocus(float fx, float fy, int mode) {
-    if (logAa_[2] <= 0 || logAa_[3] <= 0) {
-        LOGW("tap focus: active array unknown, skip");
-        return false;
-    }
+// 纯换算：预览归一化位置 (fx,fy) + 当前 zoom → active array 域 metering rectangle。
+// 副作用：（对不上焦 / 对框外的像素测光）—— 审查 P1-1 的根归类。
+void CameraEngine::roiRectFrom(float fx, float fy, int32_t out[5]) const {
     const float z = settings_.zoomRatio > 0.01f ? settings_.zoomRatio : 1.0f;
-    float side = 0.15f * float(logAa_[2]) / z;
+    float side = ui::Ui::kRoiFrac * float(logAa_[2]) / z;
     side = std::clamp(side, 64.f, std::min(float(logAa_[2]), float(logAa_[3])) * 0.5f);
     const float cx = float(logAa_[0]) + float(logAa_[2]) * 0.5f +
                      (fx - 0.5f) * float(logAa_[2]) / z;
@@ -998,17 +1051,66 @@ bool CameraEngine::onTapFocus(float fx, float fy, int mode) {
     const int32_t s32 = int32_t(side);
     const int32_t rx = std::clamp(int(cx - side / 2), logAa_[0], logAa_[0] + logAa_[2] - s32);
     const int32_t ry = std::clamp(int(cy - side / 2), logAa_[1], logAa_[1] + logAa_[3] - s32);
-    const int32_t reg[5] = {rx, ry, rx + s32, ry + s32, 1000};
-    bool changed = false;
-    if (std::memcmp(reg, settings_.afRegion, sizeof(reg)) != 0) {
-        std::memcpy(settings_.afRegion, reg, sizeof(reg));
-        std::memcpy(settings_.aeRegion, reg, sizeof(reg));
-        changed = true;
+    out[0] = rx; out[1] = ry; out[2] = rx + s32; out[3] = ry + s32; out[4] = 1000;
+}
+
+// 按当前 zoom 刷新 AF/AE 区域（每次下发前都调，便宜）：这是"区域随变焦走"的唯一入口。
+// 返回 true = 区域真的变了，调用方需重发 repeating。
+bool CameraEngine::refreshRoi() {
+    if (!roiOn_ || logAa_[2] <= 0 || logAa_[3] <= 0) {
+        if (settings_.afRegion[2] > 0 || settings_.aeRegion[2] > 0) {
+            std::memset(settings_.afRegion, 0, sizeof(settings_.afRegion));
+            std::memset(settings_.aeRegion, 0, sizeof(settings_.aeRegion));
+            roiPendingEcho_ = false;
+            return true;
+        }
+        return false;
     }
+    int32_t reg[5];
+    roiRectFrom(roiFx_, roiFy_, reg);
+    // 比较基准必须是 settings_ 本身而非单独的"已下发"镜像：清空路径只清 settings_
+    //（镜像若不同步清，"清空后同位置再点"会误判无变化、区域永远发不出去——
+    // 2026-10-03 全量测试真机确诊 rect=[0 0 0 0]）。
+    if (std::memcmp(reg, settings_.afRegion, sizeof(reg)) == 0) return false;
+    std::memcpy(settings_.afRegion, reg, sizeof(reg));
+    std::memcpy(settings_.aeRegion, reg, sizeof(reg));
+    return true;
+}
+
+bool CameraEngine::onTapFocus(float fx, float fy, int mode) {
+    if (logAa_[2] <= 0 || logAa_[3] <= 0) {
+        LOGW("tap focus: active array unknown, skip");
+        return false;
+    }
+    // mode 3 = 双击清除区域：回到默认评价测光 + 中央追焦（AF/AE 区域整组清空，
+    // camera2 语义下"不写区域键"即默认全画面评价）。
+    if (mode == 3) {
+        roiOn_ = false;
+        const bool ch = refreshRoi();
+        afTapT0Ms_ = 0;
+        afScanned_ = false;
+        afFocusLogged_ = false;
+        fdMovedSinceTap_ = false;
+        roiPendingEcho_ = false;
+        // 区域撤掉不一定让 3A 立刻回到画面全区評価 —— 显式扫一次，用户马上看得出来。
+        tapTriggerPending_ = true;
+        LOGI("tap focus: region cleared (default metering)");
+        return ch;
+    }
+    const float z = settings_.zoomRatio > 0.01f ? settings_.zoomRatio : 1.0f;
+    bool changed = false;
+    // 同位置再点 = 用户明确要求重新合焦。此时区域本身没变 ⇒ policy 0 下相机侧"零动作"
+    //（旧行为：除了动画和触感什么都不发生，视觉上像坏了）。视作显式重扫请求。
+    const bool sameSpot = roiOn_ && std::fabs(fx - roiFx_) < 0.005f &&
+                          std::fabs(fy - roiFy_) < 0.005f;
+    roiOn_ = true;
+    roiFx_ = fx;
+    roiFy_ = fy;
     if (!settings_.afOn) {
         settings_.afOn = true;   // 点按取消手动对焦，切回连续自动
         changed = true;
     }
+    if (refreshRoi()) changed = true;
     // 点按走单次 AF-S（AUTO 模式）：本机 CAF 下 trigger 会触发镜头退回无穷远后的
     // full sweep，起扫慢 1s 级；afs=0 可退回纯 CAF 行为（controls.txt）。
     const int32_t wantMode = afTapPolicy_ == 2 ? 1 : 0;
@@ -1019,15 +1121,21 @@ bool CameraEngine::onTapFocus(float fx, float fy, int mode) {
     afLockUntilMs_ = 0;   // 新一轮对焦：清掉上一轮的"锁定 → 回 CAF"计时
     afSLocked_ = false;
     fdSteadyCnt_ = 0;     // 旧 tracker 值会让新点按的首帧直接判成"已稳定"
+    fdAtTap_ = lastFdUi_;
+    fdMovedSinceTap_ = false;
+    roiPendingEcho_ = true;   // 回显匹配前，合焦判定与 FocusShot 门控都要等它落地
     // policy 0 只换统计区域，不打扰 AF 状态机（最接近系统相机的做法）；1/2 都显式触发。
-    tapTriggerPending_ = (afTapPolicy_ != 0);
+    // 例外：同位置重点是明确的重扫意图，任何策略都补一次 trigger。
+    tapTriggerPending_ = (afTapPolicy_ != 0) || sameSpot;
+    if (sameSpot) LOGI("tap focus: same spot -> explicit re-scan (trigger)");
     // "仅选择对焦位置"：用户只要把统计区挪过去、不希望相机主动重扫（afTapT0Ms_ = 0
     // 同时关掉合焦计时与 1.5s 兜底触发，见主循环）。区域本身照常下发。
     afTapT0Ms_ = (mode == 1) ? 0 : nowMs();
     afFocusLogged_ = false;
     afScanned_ = false;    // 新一轮：重新等 HAL 真的扫一轮（扫描未开始前不许报合焦）
-    LOGI("tap focus: fx=%.2f fy=%.2f z=%.2f rect=[%d %d %d %d] w=%d af=%d", fx, fy, z, reg[0],
-         reg[1], reg[2], reg[3], reg[4], static_cast<int>(settings_.afOn));
+    LOGI("tap focus: fx=%.2f fy=%.2f z=%.2f rect=[%d %d %d %d] w=%d af=%d", fx, fy, z,
+         settings_.afRegion[0], settings_.afRegion[1], settings_.afRegion[2],
+         settings_.afRegion[3], settings_.afRegion[4], static_cast<int>(settings_.afOn));
     return changed;
 }
 
@@ -1036,6 +1144,7 @@ bool CameraEngine::onTapFocus(float fx, float fy, int mode) {
 // 每帧重启扫描（镜头持续抽动、永远到不了 FOCUSED）。这也是本函数的唯一存在理由。
 void CameraEngine::sendAfTrigger() {
     if (!session_ || !session_->valid() || !ui_) return;
+    refreshRoi();   // trigger 请求自带区域：先按当前 zoom 落到最新再说（幂等）
     // 挂全量 targets（与 repeating 完全一致）：trigger 请求的目标集若与 repeating 不同，
     // 本机 CamX 会按"目标集变化"处理，实测中断预览 ~500ms（2026-10-02）。
     const std::string sig = sessionSig_.empty() ? std::string("ALL") : sessionSig_;
@@ -1053,7 +1162,13 @@ void CameraEngine::drainUiCmds() {
     // repeating（本机 HAL 对高频 setRepeating 敏感，会静默掐断预览流）。
     bool changed = false;
     while (ui_ && ui_->popCmd(&cmd)) {
+        // 休眠中：任意命令视为唤醒（UI 仅在休眠时推送 WAKE，但其它命令理论上也该唤醒）。
+        // 先唤醒再处理，确保后续命令（如变焦/对焦）能作用在已恢复的预览流上。
+        if (sleeping_) wakeCamera();
+        lastInteractionMs_ = nowMs();   // 任意 UI 交互都刷新空闲计时
         switch (cmd.type) {
+            case ui::Ui::Cmd::WAKE:
+                break;                  // 仅唤醒，不执行任何动作
             case ui::Ui::Cmd::SET_ISO:
                 isoAuto_ = false;                       // 拖 ISO 滚轮 = 该参数转手动
                 settings_.iso = std::clamp(int(cmd.v), t.isoMin, t.isoMax);
@@ -1102,13 +1217,40 @@ void CameraEngine::drainUiCmds() {
                 settings_.aeOn = cmd.v > 0.5f;
                 changed = true;
                 break;
+            case ui::Ui::Cmd::SET_AWB:
+                settings_.awbOn = cmd.v > 0.5f;
+                changed = true;
+                break;
+            case ui::Ui::Cmd::SET_WB_PRESET: {
+                // 预设下标 → Android AWB_MODE 枚举（见 Ui.cpp kAwbEnum）
+                static const int kEnum[8] = {1, 5, 6, 2, 3, 4, 7, 8};
+                int idx = int(cmd.v + 0.5f);
+                settings_.awbMode = (idx >= 0 && idx < 8) ? kEnum[idx] : 1;
+                settings_.awbOn = true;   // 选预设即开启白平衡
+                changed = true;
+                break;
+            }
+            case ui::Ui::Cmd::SET_RAW_MODE:
+                // RAW 模式：true=环形(ZSL) false=单次。变更会改变 RAW 在 repeating 中的组成，
+                // 由 commitSession 的会话签名检测统一重建（见 applyControl 的 raw_mode 分支）。
+                if (raw_) {
+                    raw_->setRingMode(cmd.v > 0.5f);
+                    changed = true;
+                }
+                break;
+            case ui::Ui::Cmd::SET_SAVE_QUOTA:
+                saveQuota_ = int(cmd.v);
+                if (ui_) ui_->setShotQuota(saveQuota_);
+                break;
             case ui::Ui::Cmd::SHOT:
                 triggerBurst();
                 break;
             case ui::Ui::Cmd::SET_FMT:
-                // 拍摄格式切换：会话输出目标变化（RAW↔JPEG），必须重建会话（~300ms）
-                jpgMode_ = !jpgMode_;
+                // 拍摄格式切换：会话输出目标变化（RAW↔JPEG），必须重建会话（~300ms）。
+                // 绝对语义（v>0.5=JPEG）：UI 与持久化都按目标值下发，避免反复切换累积漂移。
+                jpgMode_ = cmd.v > 0.5f;
                 LOGI("still format -> %s (rebuilding session)", jpgMode_ ? "JPEG" : "RAW");
+                if (ui_) ui_->setFmtJpg(jpgMode_);
                 if (!rebuildSession())
                     LOGE("rebuild after fmt switch failed");
                 break;
@@ -1386,6 +1528,9 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
     // 0.61m）。所以要求 [state 为合焦态] 且 [屈光度连续 3 帧稳定] 才向 UI 报绿，
     // 不做 colleges immediate green —— 这与画面清晰度无关。
     if (r.focusDistanceDiopters > 0.f) {
+        // 原子快照：给引擎线程的 near_m 热更新判断「当前距离是否已在新阈值之外」
+        // （见 applyControl）。回调线程写、引擎线程读，必须走原子。
+        lastFdDiopters_.store(r.focusDistanceDiopters, std::memory_order_release);
         const float tol = 0.02f * std::max(1.f, r.focusDistanceDiopters);
         if (std::fabs(r.focusDistanceDiopters - lastFdUi_) <= tol) {
             if (fdSteadyCnt_ < 8) ++fdSteadyCnt_;
@@ -1403,12 +1548,26 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
     // 只靠前两道会在手指按下 100ms 就报绿（2026-10-02 三策略对照全部测出 ~90ms 假绿）。
     // kAfGreenMinMs 兜底的是"点按前本来就合焦、全程无需移动"的情况。
     if (r.afState == 1 || r.afState == 3 || r.afState == 4 || r.afState == 5) afScanned_ = true;
+    // 点按后镜头有没有真的在走（policy 0 兜底判据 + ROI 是否被采纳的旁证）
+    if (afTapT0Ms_ > 0 && fdAtTap_ > 0.f && r.focusDistanceDiopters > 0.f &&
+        std::fabs(r.focusDistanceDiopters - fdAtTap_) > kFdMoveTol * std::max(1.f, fdAtTap_)) {
+        fdMovedSinceTap_ = true;
+    }
+    // ROI 回显滞后：result 的 AF_REGIONS 与新下发值对齐之前，任何"合焦"都是旧区域的
+    // 结论 —— FocusShot 会拿着它直接按快门（区域还没生效就拍了，审查 P2-8）。
+    if (roiPendingEcho_ && r.afRegions[4] > 0 &&
+        std::memcmp(r.afRegions, settings_.afRegion, sizeof(settings_.afRegion)) == 0) {
+        roiPendingEcho_ = false;
+        LOGI("af: ROI accepted by HAL in %lldms", (long long)(afTapT0Ms_ > 0 ? nowMs() - afTapT0Ms_ : 0));
+    }
     const bool focusedState = (r.afState == 2 || r.afState == 4) ||
                               (afSLocked_ && r.afState == 0);
     const int64_t el = afTapT0Ms_ > 0 ? nowMs() - afTapT0Ms_ : 0;
     const bool scannedOk = afScanned_ || (afTapT0Ms_ > 0 && el >= kAfGreenMinMs);
     const bool reallyFocused = focusedState && fdSteadyCnt_ >= 3 && scannedOk;
-    ui_->setAfState(reallyFocused ? 4 : r.afState);
+    // roiLive = 新 ROI 已被 HAL 采纳（回显匹配）。为 false 时即便 state 报合焦也只是
+    // 旧区域的结论：UI 侧据此推迟"合焦"的上报时机（FocusShot 不会提前按快门）。
+    ui_->setAfState(reallyFocused ? 4 : r.afState, !roiPendingEcho_);
     // 端到端合焦耗时：点按后首次达到"合焦态 + 镜头稳定"的时刻（= 用户看到对焦框变绿）
     if (reallyFocused && !afFocusLogged_ && afTapT0Ms_ > 0) {
         afFocusLogged_ = true;

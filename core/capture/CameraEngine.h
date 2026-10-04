@@ -89,7 +89,18 @@ private:
     // 触摸对焦：UI 点按预览（预览区内占比 fx/fy）→ 用户 FOV → 逻辑 active array
     // 坐标 → settings 的 AF/AE 区域。返回 true = 设置有变化需重发 repeating。
     // mode：0=点击即对焦 1=仅选择对焦位置（不重扫、不兜底） 2=点击即对焦并拍照
+    //       3=清除区域回到默认评价测光/连续追焦（UI 双击预览区）
     bool onTapFocus(float fx, float fy, int mode);
+    // ---- 触摸 ROI 的"活"存储：归一化预览坐标 ----
+    // 区域不能直接存 active array 矩形：STATIC_AF/AE_REGIONS 是**阵列域绝对值**，
+    // 而用户视场随 zoom 收缩（可见宽 = 1/z），点按时换算的矩形在变焦后相对可见画面
+    // 越来越粗、甚至整块落到画面外（拿画面外的像素去测光/但对不上焦，2026-10-03
+    // 审查 P1-1）。故只存"点的是画面哪个位置"，每次下发前按当前 zoom 重新换算。
+    bool roiOn_ = false;
+    float roiFx_ = 0.5f, roiFy_ = 0.5f;
+    bool roiPendingEcho_ = false;       // 已下发但 HAL 还没回显同值（此时不能算"针对新区域合焦"）
+    void roiRectFrom(float fx, float fy, int32_t out[5]) const;   // 纯换算（无副作用）
+    bool refreshRoi();                  // 按当前 zoom 重算并写回 settings_（变则返回 true）
     // 点按后发一次 AF_TRIGGER_START（单帧请求，与 repeating 分离）。改区域本身在多数
     // 3A 实现里只更新统计窗口，未必立刻重扫 —— 必须显式触发才能"点哪合哪"。
     void sendAfTrigger();
@@ -106,9 +117,14 @@ private:
     //   窗口自然收敛，这也是系统相机快的做法。
     int afTapPolicy_ = 0;
     bool afSingleMode_ = false;             // controls.txt: afs=1 切回 AF-S + trigger（对照用）
-    // 兜底：只换 ROI 之后若 HAL 长时间没有任何 AF 动作，补一次传统 trigger（防个别固件
-    // 不按新 ROI 重扫）。短于它就能正常合焦的场景不会走到这里。
+    // 兜底：只换 ROI 之后若 HAL 长时间没动镜头，补一次传统 trigger（防个别固件
+    // 不按新 ROI 重扫）。**判据是"屈光度有没有变"，不是"是否出现过扫描态"** ——
+    // CAF 常态就在 PASSIVE_SCAN/PASSIVE_FOCUSED 之间周期性跳变，afScanned_ 在点按后
+    // 几百毫秒内几乎必然为真，用它会让兜底形同虚设（旧实现实际从不触发）。
     static constexpr int64_t kAfFallbackMs = 1500;
+    bool fdMovedSinceTap_ = false;      // 点按后镜头有没有真的走过（>kFdMoveTol）
+    float fdAtTap_ = -1.f;              // 点按瞬间的屈光度（判移动基准）
+    static constexpr float kFdMoveTol = 0.04f;
     // 点按到"用户可以认为合上了"的端到端耗时：首次满足 UI 合焦判据时打一条日志，
     // 用来横向比较三种策略（只看 afState 变化会被镜头仍在移动误导）。
     int64_t afTapT0Ms_ = 0;
@@ -281,6 +297,10 @@ private:
     // UI 合焦判定的稳态跟踪（AF 报锁定时镜头常仍在移动，见 onFrameResult）
     float lastFdUi_ = -1.f;
     int fdSteadyCnt_ = 0;
+    // 最近一次 result 回读的屈光度（米换算前的原始屈光度，<=0 = 无有效读数）。
+    // 供引擎线程（applyControl 改 near_m 时）判断「当前主体是否已在新阈值之外」——
+    // lastFdUi_ 是回调线程写、UI 路径读，跨线程直接读它是数据竞争，故单独用原子快照。
+    std::atomic<float> lastFdDiopters_{0.f};
 
     // 退役会话墓地：重建时旧会话立即 close（停止回调流），但对象延迟 1.5s 才析构。
     // 框架回调线程（C2N-dev-looper）在 close 返回后仍可能携 in-flight 回调访问
@@ -304,6 +324,16 @@ private:
     int frameGaps_ = 0;
     int64_t maxGapMs_ = 0;
     int64_t lastFrameMs_ = 0;
+
+    // ---- 自动休眠（省功耗/降发热）----
+    // 任意操作（UI 命令、controls.txt 改动）后若在 kSleepMs 内无任何交互，停掉 repeating
+    // 请求 —— 相机 ISP/传感器停跑（预览帧不再产生）。唤醒时重发 repeating 即可恢复。
+    // 休眠时预览区显示"已休眠，触摸唤醒"（Ui 侧绘制）；任意触摸被 Ui 拦截为 WAKE 命令。
+    static constexpr int64_t kSleepMs = 60000;   // 1 分钟无操作
+    bool sleeping_ = false;
+    int64_t lastInteractionMs_ = 0;              // 最近一次操作的时刻（nowMs 基准）
+    void sleepCamera();
+    void wakeCamera();
 };
 
 } // namespace optic::capture

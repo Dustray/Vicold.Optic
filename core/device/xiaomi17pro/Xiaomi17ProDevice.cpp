@@ -68,9 +68,16 @@ ZoomProfile Xiaomi17ProDevice::zoomProfile() const {
 
 NearTakeoverRule Xiaomi17ProDevice::nearTakeover() const {
     NearTakeoverRule r;
-    r.enabled = true;              // 对齐系统相机：近距时 1–20x 恒主摄
-    r.enterM = 0.9f;
-    r.exitM = 1.4f;
+    // 2026-10-04 真机标定（focus_d 逐档扫描 + display slot 观测）：
+    // 系统相机在约 20cm 内才用主摄、超过就用长焦。此前取 0.9m/1.4m 是拍脑袋的
+    // 猜测值，比实测口径宽 4.5 倍 —— 1m 内的主体全被判近距，接管点被推到 20x，
+    // 于是 5x 永远显示主摄（用户报告「隔一米还是主摄」的根因）。
+    // 0.18m 进 / 0.30m 出：与系统相机 20cm 口径一致，且滞回带收窄到 0.12m ——
+    // 旧配对 0.9/1.4 的 0.5m 记忆区会把 1m 主体永久锁死在近距态（两计数器清零，
+    // 状态既不进也不退）。
+    r.enabled = true;
+    r.enterM = 0.18f;
+    r.exitM = 0.30f;
     r.deferredSwitch = 20.f;
     r.debounceFrames = 12;         // ~0.4s @30fps
     return r;
