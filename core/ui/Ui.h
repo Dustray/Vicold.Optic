@@ -37,7 +37,8 @@ public:
                     SET_WB_PRESET,   // 白平衡预设（v = 预设下标，映射见 CameraEngine::drainUiCmds 的 kEnum）
                     SET_RAW_MODE,    // RAW 模式（v>0.5 = 环形 ZSL，否则单次）
                     SET_SAVE_QUOTA,  // 连拍/保存配额（v = 整数，0 = 不限）
-                    SET_FLASH        // 闪光灯档位（v = 整数：0关 1自动 2开 3常亮手电筒）
+                    SET_FLASH,       // 闪光灯档位（v = 整数：0关 1自动 2开 3常亮手电筒）
+                    SET_SLEEP        // 自动休眠超时（v = 秒；0 = 永不休眠）
                     } type = SET_ISO;
         float v = 0;
         float v2 = 0;    // TAP_FOCUS：预览区内归一化坐标 (fx, fy) ∈ [0,1]²
@@ -271,7 +272,7 @@ private:
     void applyQuickZoom(int idx);
     // 面板控件动作类型（doAction 分发；buildCtlRects / handlePanelTap 共用）
     enum PAct { A_HEADER, A_FMT, A_RAW, A_QUOTA, A_GRID, A_LEVEL, A_SAFE,
-                A_PERSIST, A_AE, A_AWB, A_AWBPRESET };
+                A_SLEEP, A_PERSIST, A_AE, A_AWB, A_AWBPRESET };
     // 面板控件命中（onDown 在 panel_!=NONE 时整体转发到这里）
     void handlePanelTap(float x, float y);
     void doAction(PAct act, int seg);            // 面板控件动作分发
@@ -295,6 +296,7 @@ private:
     void applyAwb(bool on);
     void applyAwbPreset(int idx);
     void applyFlash(int mode);     // 闪光灯档位 0关 1自动 2开 3常亮
+    void applySleep(int sel);      // 自动休眠档位（kSleepVals 下标；0 = 永不）
     void commitPersist();          // 若开启持久化则写 settings.txt
     void loadPersistedSettings();  // 启动读 settings.txt 并应用
     // 电子水平仪（加速度计；无传感器时 roll_ 恒 0 = 气泡居中，优雅降级）
@@ -395,6 +397,7 @@ private:
     // 设置面板状态（持久化开关决定是否写文件）
     bool rawRing_ = true;          // RAW 模式：true=环形(ZSL) false=单次
     int saveQuotaSel_ = 2;         // 连拍/保存配额下标 → {1,4,8,0(不限)}
+    int sleepSel_ = 2;             // 自动休眠下标 → kSleepVals{0,30,60,120} 秒（默认 60s）
     bool aeOn_ = true;             // 自动曝光
     bool awbOn_ = true;            // 自动白平衡
     int awbPreset_ = 0;            // 白平衡预设下标（0=自动）

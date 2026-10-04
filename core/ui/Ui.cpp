@@ -169,11 +169,18 @@ constexpr float kQzX = 234, kQzD = 60, kQzY0 = 180, kQzGap = 22;
 constexpr float kPanelPadL  = 150;    // 行标签左缘
 constexpr float kPanelCtlR  = 1410;   // 分段控件右缘
 constexpr float kPanelCtlW  = 720;    // 分段控件宽（右对齐到 kPanelCtlR）
-constexpr float kPanelCtlH  = 48;     // 控件高
-constexpr float kPanelHeadH = 44;     // 分组标题行高
-constexpr float kPanelRowH  = 64;     // 普通行高（控件上下各留 8px）
-constexpr float kPanelTopY  = 104;    // 内容区顶（让开标题带）
-constexpr float kPanelBotY  = 690;    // 内容区底
+constexpr float kPanelCtlH  = 44;     // 控件高
+constexpr float kPanelHeadH = 40;     // 分组标题行高
+constexpr float kPanelRowH  = 56;     // 普通行高（控件上下各留 6px）
+// 内容块**顶对齐**（2026-10-04 用户要求「标题上方留的空太大」）：原为在
+// kPanelTopY..kPanelBotY 内垂直居中，行数不同 ⇒ 顶部留白忽大忽小（设置面板 139px、
+// 曝光面板 257px，后者近 1/3 屏高是空的）。现在首行恒从 kPanelTopY 起，
+// 两面板顶部留白一致 = kPanelTopY - 面板标题底（≈11px）。
+// 行高同步收窄（64→56、标题 44→40、控件 48→44）：设置面板加「自动休眠」行后
+// 共 3 标题 + 8 行 = 568px，从 96 起到 664，仍在内容区底 690 之内。
+constexpr float kPanelTopY  = 96;     // 首行顶（面板标题底 85 之下 11px）
+// 不再有 kPanelBotY：顶对齐后底部留白由行数自然决定。设置面板当前 3 标题 + 8 行
+// = 568px → 96..664，离屏幕底 720 仍有余量；加行时须复核这个下界。
 
 
 // 白平衡预设标签（下标 → 显示名）；下标→Android AWB_MODE 枚举值的映射在
@@ -190,6 +197,9 @@ static const char* kOnOff[2] = {"关", "开"};
 static const char* kRingOpts[2] = {"环形", "单次"};
 static const char* kQuotaOpts[4] = {"1", "4", "8", "不限"};
 static const int kQuotaVals[4] = {1, 4, 8, 0};
+// 自动休眠（无操作多久后停 repeating 省电）：秒；0 = 永不休眠
+static const char* kSleepOpts[4] = {"关", "30秒", "1分钟", "2分钟"};
+static const int kSleepVals[4] = {0, 30, 60, 120};
 } // namespace layout
 
 using namespace layout;
@@ -1962,12 +1972,11 @@ void Ui::closePanel() {
 void Ui::buildCtlRects() {
     ctlRects_.clear();
     if (panel_ == Panel::NONE) return;
-    // 内容块在全屏内容区里垂直居中：设置面板 9 行（3 标题+6 控件）占 516px，
-    // 曝光面板 5 行只占 280px —— 顶对齐会让后者下半屏空着。
-    const int nHead = (panel_ == Panel::SETTINGS) ? 3 : 2;
-    const int nRow  = (panel_ == Panel::SETTINGS) ? 6 : 3;
-    const float totalH = nHead * kPanelHeadH + nRow * kPanelRowH;
-    float y = kPanelTopY + (kPanelBotY - kPanelTopY - totalH) / 2;
+    // 先按 **y 从 0 起**收集全部行，收完再统一加 kPanelTopY 偏移（顶对齐）。
+    // 早先写法是先按 nHead/nRow 两个常量算出总高再居中，常量与实际行数一不一致
+    // 就悄悄错位（设置面板实际 7 行却按 6 行算 ⇒ 整块下移、底部溢出）——
+    // 行数由下面的 header/row 调用决定，总高只能事后得知。
+    float y = 0;
     const float ctlX = kPanelCtlR - kPanelCtlW;
     auto header = [&](const char* t) {
         ctlRects_.push_back({kPanelPadL, y, 0, kPanelHeadH, 0, 0, int(A_HEADER), t, nullptr});
@@ -1988,6 +1997,7 @@ void Ui::buildCtlRects() {
         row("水平仪", kOnOff, 2, levelOn_ ? 1 : 0, A_LEVEL);
         row("安全框", kOnOff, 2, safeFrameOn_ ? 1 : 0, A_SAFE);
         header("其他");
+        row("自动休眠", kSleepOpts, 4, sleepSel_, A_SLEEP);
         row("持久化", kOnOff, 2, persist_ ? 1 : 0, A_PERSIST);
     } else {
         header("曝光");
@@ -1996,6 +2006,8 @@ void Ui::buildCtlRects() {
         row("自动白平衡", kOnOff, 2, awbOn_ ? 1 : 0, A_AWB);
         row("白平衡预设", kAwbLabels, 8, awbPreset_, A_AWBPRESET);
     }
+    // 统一偏移到 kPanelTopY（顶对齐）
+    for (auto& c : ctlRects_) c.y += kPanelTopY;
 }
 
 void Ui::drawPanel() {
@@ -2084,6 +2096,7 @@ void Ui::doAction(PAct act, int seg) {
         case A_GRID:      gridOn_ = (seg == 1); markDirty(); commitPersist(); break;
         case A_LEVEL:     levelOn_ = (seg == 1); markDirty(); commitPersist(); break;
         case A_SAFE:      safeFrameOn_ = (seg == 1); markDirty(); commitPersist(); break;
+        case A_SLEEP:     applySleep(seg); break;
         case A_PERSIST:   persist_ = (seg == 1); markDirty(); commitPersist(); break;
         case A_AE:        applyAe(seg == 1); break;
         case A_AWB:       applyAwb(seg == 1); break;
@@ -2159,6 +2172,17 @@ void Ui::applyFlash(int mode) {
     commitPersist();
 }
 
+void Ui::applySleep(int sel) {
+    if (sel < 0 || sel > 3) sel = 2;
+    if (sel == sleepSel_) return;
+    sleepSel_ = sel;
+    markDirty();     // 面板画在逐帧动态层，选中态必须显式置脏才重画
+    // 下发给引擎的**秒数**（引擎只认秒，不认档位下标）—— UI 与引擎共用一份真值，
+    // 避免两边各存一套口径（参照 isoAuto_/ssAuto_ 不同步踩过的坑）。
+    pushCmd(Cmd::SET_SLEEP, float(kSleepVals[sel]));
+    commitPersist();
+}
+
 void Ui::commitPersist() {
     if (dataDir_.empty()) return;
     const std::string path = dataDir_ + "/settings.txt";
@@ -2182,6 +2206,8 @@ void Ui::commitPersist() {
     f << "grid=" << (gridOn_ ? 1 : 0) << "\n";
     f << "level=" << (levelOn_ ? 1 : 0) << "\n";
     f << "safe=" << (safeFrameOn_ ? 1 : 0) << "\n";
+    // 落**秒数**而非下标：档位表日后增删选项，旧文件里的下标会指到别的档。
+    f << "sleep=" << kSleepVals[sleepSel_] << "\n";
 }
 
 void Ui::loadPersistedSettings() {
@@ -2217,6 +2243,16 @@ void Ui::loadPersistedSettings() {
         else if (k == "grid") { bool on = (v == "1"); if (on != gridOn_) { gridOn_ = on; markDirty(); } }
         else if (k == "level") { bool on = (v == "1"); if (on != levelOn_) { levelOn_ = on; markDirty(); } }
         else if (k == "safe") { bool on = (v == "1"); if (on != safeFrameOn_) { safeFrameOn_ = on; markDirty(); } }
+        else if (k == "sleep") {
+            const int sec = std::atoi(v.c_str());
+            int sel = 2;   // 文件里的秒数可能不在档位表上（旧版本/手改）：取最接近的档
+            int best = INT_MAX;
+            for (int i = 0; i < 4; ++i) {
+                const int d = std::abs(sec - kSleepVals[i]);
+                if (d < best) { best = d; sel = i; }
+            }
+            if (sel != sleepSel_) applySleep(sel);
+        }
     }
     // AWB：预设先落（可能顺带打开白平衡），再按文件里的 awb 开关收敛到最终态。
     // 顺序固定 ⇒ 结果与文件行序无关。

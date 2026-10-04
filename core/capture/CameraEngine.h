@@ -336,7 +336,10 @@ private:
     // 任意操作（UI 命令、controls.txt 改动）后若在 kSleepMs 内无任何交互，停掉 repeating
     // 请求 —— 相机 ISP/传感器停跑（预览帧不再产生）。唤醒时重发 repeating 即可恢复。
     // 休眠时预览区显示"已休眠，触摸唤醒"（Ui 侧绘制）；任意触摸被 Ui 拦截为 WAKE 命令。
-    static constexpr int64_t kSleepMs = 60000;   // 1 分钟无操作
+    static constexpr int64_t kSleepMs = 60000;   // 默认 1 分钟无操作（UI「自动休眠」可改）
+    // 运行时超时（ms）：由 Cmd::SET_SLEEP 下发（秒）。0 = 永不休眠。
+    // 原子：引擎主循环读、drainUiCmds 写（同线程，但保持与其它可下发参数一致的口径）。
+    std::atomic<int64_t> sleepMs_{kSleepMs};
     bool sleeping_ = false;
     int64_t lastInteractionMs_ = 0;              // 最近一次操作的时刻（nowMs 基准）
     void sleepCamera();

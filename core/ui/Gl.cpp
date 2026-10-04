@@ -576,7 +576,8 @@ bool Gl::bakeFont(float bakedPx, const std::vector<std::string>& fonts) {
         "点击即仅选位置并拍照×·"
         "休眠触摸唤醒，设置平衡照片质量辅助构图网格线水平仪安全框持久化格式模单次连拍开关自动日光阴天白炽荧光钨丝测预限暖暮影其他外部闭"
         // 2026-10-04 补闪光灯档位 toast 文案用字：闪光灯常亮（关/自动/开 已在上串）
-        "闪光灯常亮";
+        // 2026-10-04 补设置面板「自动休眠」档位用字：秒分钟
+        "闪光灯常亮秒分钟";
     for (size_t i = 0; i < extra.size();) {
         uint32_t cp = uint8_t(extra[i]);
         int n = 1;

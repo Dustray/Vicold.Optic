@@ -68,8 +68,8 @@ pandora 返回：竖屏顶中 `Rect(573,0-647,150)`、`cutoutSpec="M 0,0 H -37 V
 | 曝光白平衡入口 | `kExpIconX/Y` / `kIconD` | **1330** / 48 / 60（SS 滑轨正上方，x 与滑轨中线 1330 对齐）|
 | 闪光灯入口 | `kFlashIconX/Y` / `kIconD` | **1216** / 48 / 60（ISO 滑轨正上方，x 与滑轨中线 1216 对齐）|
 | 快速变焦圆钮 | `kQzX` / `kQzD` / `kQzY0` / `kQzGap` | 234 / 60 / 180 / 22（自上而下 5·2·1·0.7）|
-| 面板内容区 | `kPanelTopY` / `kPanelBotY` | 104 / 690（全屏面板内内容块的垂直居中区间）|
-| 面板行 | `kPanelRowH` / `kPanelHeadH` / `kPanelCtlH` | 64 / 44 / 48 |
+| 面板内容区顶 | `kPanelTopY` | **96**（顶对齐：首行顶；面板标题底 85 之下 11px）|
+| 面板行 | `kPanelRowH` / `kPanelHeadH` / `kPanelCtlH` | 56 / 40 / 44 |
 | 面板标签左缘 / 控件右缘 / 控件宽 | `kPanelPadL` / `kPanelCtlR` / `kPanelCtlW` | 150 / 1410 / 720 |
 | UI 整体放大 | `kUiZoom` | 1.5 |
 
@@ -105,8 +105,15 @@ paintOverlay:  … 导轨面板 → 导轨 → 快门 → 入口图标(齿轮/�
 2026-10-04 起两个面板为**全屏**（原 760×~600 小盒控件仅 336 宽，8 段白平衡预设每段
 42px，文字挤成一团）。全屏实底 `{0.055,0.055,0.065,1.0}`。
 
-- 内容块在 `kPanelTopY..kPanelBotY` 内**按实际行数垂直居中** —— 设置 9 行（3 标题+6 控件）
-  占 516px，曝光 5 行只占 280px，顶对齐会让后者下半屏空着。
+- 内容块**顶对齐**（2026-10-04 用户反馈「标题上方留的空太大」）：首行恒从 `kPanelTopY=96`
+  起（面板标题底 85 之下 11px）。原为垂直居中，行数不同 ⇒ 顶部留白忽大忽小
+  （设置面板 139px、曝光面板 257px）。
+  - **`buildCtlRects()` 先按 y=0 收集全部行，收完再统一加 `kPanelTopY`**：原来先按
+    `nHead/nRow` 两个常量算总高再居中，常量与实际行数不符就悄悄错位（设置面板实际
+    7 行却按 6 行算 ⇒ 整块下移、底行溢出到 719/720）。行数由 header/row 调用决定，
+    总高只能事后得知 —— 别再引入行数常量。
+  - 行高同步收窄（行 64→56、标题 44→40、控件 48→44）：设置面板加「自动休眠」后
+    3 标题 + 8 行 = 568px，96..664，仍在 720 之内（加行时须复核这个下界）。
 - 绘制与命中共用同一份 `ctlRects_`（`buildCtlRects()` 产出，`drawPanel` 与
   `handlePanelTap` 都用它），**不存在两套坐标**。
 - **关闭按钮 = 入口图标位**：设置面板左上、曝光面板右上，复用圆形底衬 + `closeIcon()`。
@@ -155,7 +162,13 @@ paintOverlay:  … 导轨面板 → 导轨 → 快门 → 入口图标(齿轮/�
 - **`zoom` 输入**：刻度盘用相对位移驱动，`onMove`/`onUp` 都从按下基准重算（快速甩动时输入管线会丢末尾 MOVE，实测曾停在 8.76 而非 10.0）。
 - **电池**：JNI `registerReceiver(null, ACTION_BATTERY_CHANGED)` 读 sticky，`Ui::frame` 里 30s 刷新。充电=绿 `#4ADE80`，≤20%=强调橙，正常=白。
 - **拍照反馈**：只用 HUD 角标（保存中显橙色 `SAVING`），预览区不再有浮层。
-- **自动休眠**：60s 无操作 → `CaptureSession::stopRepeating()`（**仅停 repeating**，保留会话/纹理/输出目标）。
+- **自动休眠**（默认 60s，设置面板「其他 → 自动休眠」可改 `关 / 30秒 / 1分钟 / 2分钟`）：
+  无操作超时 → `CaptureSession::stopRepeating()`（**仅停 repeating**，保留会话/纹理/输出目标）。
+  - 真值在引擎：`CameraEngine::sleepMs_`（原子，ms；**0 = 永不休眠**，判定处 `> 0` 短路），
+    由 `Cmd::SET_SLEEP` 下发**秒数**（UI 只存档位下标 `sleepSel_`，下发时换算 → 两边同口径）；
+    `controls.txt` 也支持 `sleep=<秒>`（调试）。
+  - 持久化落**秒数**而非下标（档位表日后增删选项，旧文件里的下标会指到别的档）；
+    加载时按"最接近的档"匹配。
   唤醒 = `commitSession(true)` 重发 repeating，瞬启无黑帧（对比 close 重建 ~290ms + 纹理失效）。
   - **预览看门狗必须 `!sleeping_` 短路** —— 停 repeating 后没有 capture result，会被误判 stall 自动重发（= 白睡）。
   - 交互刷新点：`drainUiCmds` 每条命令、`pollControls` 有 changed（休眠中直接唤醒并带新设置下发）。

@@ -173,8 +173,9 @@ void CameraEngine::run(std::string dataDir) {
 
         // 自动休眠触发：长时间无操作则停 repeating（相机停跑，降功耗/发热）。
         // 休眠中不跑看门狗（上方已用 !sleeping_ 排除），此处也只在未休眠时判定。
-        if (!sleeping_ && session_ && ui_ && ui_->attached() && lastInteractionMs_ > 0 &&
-            nowMs() - lastInteractionMs_ > kSleepMs) {
+        const int64_t sleepMs = sleepMs_.load(std::memory_order_relaxed);
+        if (sleepMs > 0 && !sleeping_ && session_ && ui_ && ui_->attached() &&
+            lastInteractionMs_ > 0 && nowMs() - lastInteractionMs_ > sleepMs) {
             sleepCamera();
         }
 
@@ -350,7 +351,8 @@ void CameraEngine::sleepCamera() {
     session_->stopRepeating();
     sleeping_ = true;
     if (ui_) ui_->setSleeping(true);
-    LOGI("camera sleep: repeating stopped (idle > %llds)", (long long)(kSleepMs / 1000));
+    LOGI("camera sleep: repeating stopped (idle > %llds)",
+         (long long)(sleepMs_.load(std::memory_order_relaxed) / 1000));
 }
 
 // 唤醒：重发 repeating 恢复预览流，并复位空闲计时（避免唤醒瞬间又立刻入睡）。
@@ -900,6 +902,13 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             LOGI("flash -> %s", kName[m]);
             changed = true;
         }
+    } else if (k == "sleep") {
+        // 自动休眠超时（秒，0 = 永不）；调试用，与 UI 面板同一语义。
+        const int64_t ms = int64_t(std::max(0, std::atoi(v.c_str()))) * 1000;
+        if (ms != sleepMs_.load(std::memory_order_relaxed)) {
+            sleepMs_.store(ms, std::memory_order_relaxed);
+            LOGI("auto sleep -> %llds", (long long)(ms / 1000));
+        }
     } else if (k == "disp") {
         // 诊断：手动切显示源（0=逻辑 1=超广 2=长焦；纯 GL 层，不动请求）。
         // manualDisp_ 期间自动判定不覆盖手动值，直到分带真的变化才交还自动。
@@ -1326,6 +1335,18 @@ void CameraEngine::drainUiCmds() {
                     LOGI("flash -> %s", kName[m]);
                     changed = true;
                 }
+                break;
+            }
+            case ui::Ui::Cmd::SET_SLEEP: {
+                // 自动休眠超时（秒）。0 = 永不休眠（判定处用 >0 短路）。
+                const int sec = std::max(0, int(cmd.v + 0.5f));
+                const int64_t ms = int64_t(sec) * 1000;
+                if (ms != sleepMs_.load(std::memory_order_relaxed)) {
+                    sleepMs_.store(ms, std::memory_order_relaxed);
+                    LOGI("auto sleep -> %ds%s", sec, sec == 0 ? " (disabled)" : "");
+                }
+                // 改设置本身就是一次交互：lastInteractionMs_ 由 drainUiCmds 末尾统一刷新，
+                // 这里不重复刷新（否则改完立刻又从 0 起算，行为与"刚操作过"一致）。
                 break;
             }
             case ui::Ui::Cmd::SHOT:
