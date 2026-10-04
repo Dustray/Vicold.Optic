@@ -579,7 +579,9 @@ bool Gl::bakeFont(float bakedPx, const std::vector<std::string>& fonts) {
         // 2026-10-04 补设置面板「自动休眠」档位用字：秒分钟
         "闪光灯常亮秒分钟"
         // 2026-10-04 补白平衡手动 2D 坐标板文案：手动偏移 / 色温·色调轴名 / 冷暖品绿轴端标签
-        "手动偏移色温控冷品绿调";
+        "手动偏移色温控冷品绿调"
+        // 2026-10-04 补坐标板拖动预览提示文案：拖动调色 松手应用
+        "拖动松手应用";
     for (size_t i = 0; i < extra.size();) {
         uint32_t cp = uint8_t(extra[i]);
         int n = 1;

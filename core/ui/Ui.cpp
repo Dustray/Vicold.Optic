@@ -1575,9 +1575,14 @@ void Ui::frame() {
 
     // ---- 逐帧动态层（不进缓存）：对焦框 + FocusShot 超时兜底 ----
     checkShotAfterFocus();
-    drawAfBox();
-    // 设置 / 曝光白平衡 面板（动态层逐帧直画，常开也不摧毁静态层缓存收益）
-    if (panel_ != Panel::NONE) drawPanel();
+    if (drag_ == Drag::WBPAD) {
+        // 拖动坐标板：动态层只画极简底部提示（当前偏移值 + 松手确认），其余全隐，露出预览
+        drawWbDragHint();
+    } else {
+        drawAfBox();
+        // 设置 / 曝光白平衡 面板（动态层逐帧直画，常开也不摧毁静态层缓存收益）
+        if (panel_ != Panel::NONE) drawPanel();
+    }
 
     // ---- 自动休眠遮罩：预览区压暗 + 居中提示（覆盖在预览/AF 框之上）----
     // 相机已停 repeating（见 CameraEngine::sleepCamera），预览帧冻结，只画最后一张 + 提示。
@@ -1608,6 +1613,9 @@ void Ui::frame() {
 }
 
 void Ui::paintOverlay() {
+    // 拖动白平衡坐标板时：跳过全部 UI 覆盖层，让底层相机预览全屏露出，
+    // 实时预览调色结果（白平衡偏移已即时下发到相机 session，预览随手指偏色）。
+    if (drag_ == Drag::WBPAD) return;
     drawPreviewOverlay();
 
     // ---- 左侧：摄像头避让区（真机只留黑，虚线为设计标注不绘制）----
@@ -1954,6 +1962,29 @@ void Ui::showToast(const char* s) {
 
 // 底部居中 toast：逐帧直画在最顶层（白闪之后、swap 之前调用）。
 // 底衬一律近黑实底（浮层铁律：浅色半透明会随预览背景一起消失）。
+void Ui::drawWbDragHint() {
+    // 拖动白平衡坐标板时显示的底部极简提示：实时色温/色调偏移值 +「松手应用」确认。
+    // 其余 UI（导轨/快门/按钮/面板/AF 框）已全部隐藏，预览全屏露出看调色结果。
+    const float fs = 26 * kUiZoom * scale_;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "色温 %+.2f   色调 %+.2f", wbTemp_, wbTint_);
+    const float w = gl_.textWidth(buf, fs);
+    const float padX = dim(28), padY = dim(14);
+    const float boxW = w + padX * 2;
+    const float boxH = fs + padY * 2;
+    const float cx = screenX(kPreviewX + kPreviewW / 2);
+    const float by = screenY(kPreviewY + kPreviewH) - boxH - dim(44);   // 预览底上方 44
+    gl_.roundedRect(cx - boxW / 2, by, boxW, boxH, dim(16), {0, 0, 0, 0.55f}, kNone, 0);
+    gl_.text(buf, cx - w / 2, gl_.textCenterTop(buf, fs, by + boxH / 2), fs, kT1);
+
+    // 副提示：拖动调色 · 松手应用
+    const float fs2 = 16 * kUiZoom * scale_;
+    const char* sub = "拖动调色 松手应用";
+    const float sw = gl_.textWidth(sub, fs2);
+    const float sy = by - dim(10) - fs2;
+    gl_.text(sub, cx - sw / 2, gl_.textCenterTop(sub, fs2, sy + fs2 / 2), fs2, kT3);
+}
+
 void Ui::drawToast() {
     if (toast_.empty()) return;
     const double left = toastUntil_ - nowSec();

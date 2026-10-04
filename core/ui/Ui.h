@@ -393,6 +393,7 @@ private:
     static constexpr float kToastH = 54.f;
     void showToast(const char* s);
     void drawToast();
+    void drawWbDragHint();   // 拖动白平衡坐标板时的底部提示（当前偏移值 + 松手确认），其余 UI 全隐
 
     // 弹出面板状态
     Panel panel_ = Panel::NONE;
