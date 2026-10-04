@@ -66,6 +66,7 @@ pandora 返回：竖屏顶中 `Rect(573,0-647,150)`、`cutoutSpec="M 0,0 H -37 V
 | 测光锁 | `kAeLockY/D` | 238 / 54 |
 | 设置入口（齿轮） | `kSetIconX/Y` / `kIconD` | **128** / 48 / 60（左变焦导轨正上方，x 与导轨中线对齐）|
 | 曝光白平衡入口 | `kExpIconX/Y` / `kIconD` | 1456 / 80 / 60（右导轨顶部、快门正上方）|
+| 闪光灯入口 | `kFlashIconX/Y` / `kIconD` | 1376 / 80 / 60（曝光图标**左侧**同排，圆心间距 80，边缘留 20）|
 | 快速变焦圆钮 | `kQzX` / `kQzD` / `kQzY0` / `kQzGap` | 234 / 60 / 180 / 22（自上而下 5·2·1·0.7）|
 | 面板内容区 | `kPanelTopY` / `kPanelBotY` | 104 / 690（全屏面板内内容块的垂直居中区间）|
 | 面板行 | `kPanelRowH` / `kPanelHeadH` / `kPanelCtlH` | 64 / 44 / 48 |
@@ -181,6 +182,38 @@ paintOverlay:  … 导轨面板 → 导轨 → 快门 → 入口图标(齿轮/�
 注意 `recomputeMixed()` 在双手动时**不填值**（补偿分支都以 `isoAuto_`/`ssAuto_` 为条件），必须显式补。
 
 `CaptureSettings::apply` 另有最后兜底：非正值退回 ISO 100 / 33ms —— 宁可曝光不准也不能给黑图。
+
+## 5.2 闪光灯（camera2 语义，容易踩坑）
+
+入口：右导轨顶部曝光图标左侧，点击循环 **关 → 自动 → 开 → 常亮 → 关**。
+档位是自定义枚举 `CaptureSettings::flashMode`（0/1/2/3），**不是** camera2 的 `FLASH_MODE` 枚举。
+
+**主语义落在 `CONTROL_AE_MODE` 上，不能只写 `FLASH_MODE`**：
+
+| 档位 | `CONTROL_AE_MODE` | `FLASH_MODE` |
+|---|---|---|
+| 0 关 | `ON` | 不写 |
+| 1 自动 | `ON_AUTO_FLASH` | 不写 |
+| 2 开 | `ON_ALWAYS_FLASH` | 手动曝光时**仅单拍**写 `SINGLE` |
+| 3 常亮 | `ON` | `TORCH`（任何请求都写）|
+
+三条必须记住的坑：
+
+1. **多数 HAL 在 `AE_MODE=ON` 时忽略 `FLASH_MODE=SINGLE`** —— 只写 FLASH_MODE 不改 AE_MODE，
+   表现就是「开关切了但灯不闪」。
+2. **repeating 上绝不能写 `FLASH_MODE=SINGLE`** —— camera2 语义是「每个请求实例放一次电」，
+   会让闪光灯每帧放电（费电伤灯）。手动曝光（AE_MODE=OFF）下需要靠 `forPreview=false`
+   把 SINGLE 限定在单拍请求上（`captureOnce` 走 TEMPLATE_STILL_CAPTURE 且传 `forPreview=false`）。
+3. **档位 3（常亮）的 AE_MODE 必须保持 `ON`**，写成 `ALWAYS_FLASH` 会叠加「每次 capture 再放一次电」。
+
+**无闪光灯单元的设备必须清零**：`AE_MODE_ON_ALWAYS_FLASH` 会被 HAL 拒绝整包
+（连带同请求其它 entry 一起丢）。两道守卫：
+- `openCamera` 按 `traits.flashAvailable` 校正（含把持久化残留的旧档位清零）
+- `SET_FLASH` 在**相机已打开**（traits 可信）时才按能力拒绝并回推 `Ui::setFlash(0)`；
+  未打开时不拒，否则 UI attach 阶段恢复出的档位会被空 traits 误清（glue 线程与引擎线程并发）
+
+UI 侧 `setFlashAvail(false)` 时**不画入口**（与其下发失败不如不显示）。
+图标档位靠**附加符号**区分而非颜色：关 = 深色斜杠划断；自动 = 右下 "A"；开 = 纯闪电；常亮 = 四向短芒。
 
 ## 6. 真机验证方法（截图 + 像素采样）
 

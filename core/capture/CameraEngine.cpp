@@ -292,6 +292,16 @@ bool CameraEngine::openSession() {
     }
     if (ui_) ui_->setShotQuota(saveQuota_);   // 常显「已拍 n/N」角标（controls.txt 可调）
     if (ui_) ui_->setFmtJpg(jpgMode_);   // 引擎是格式真值源（冷启动读 controls.txt 后校正 UI）
+    if (ui_) {
+        ui_->setFlashAvail(t.flashAvailable);   // 无闪光灯单元 → UI 隐藏闪光灯入口
+        if (!t.flashAvailable && settings_.flashMode != 0) {
+            // 无闪光灯设备上却残留非 0 档位（典型来源：持久化 settings.txt 从别的设备
+            // 拷来，或 UI 在 attach 阶段先于 openCamera 恢复出了旧值）→ 一律清零。
+            // 否则每个请求都带 AE_MODE_ON_ALWAYS_FLASH，会被 HAL 拒绝整包。
+            settings_.flashMode = 0;
+            ui_->setFlash(0);
+        }
+    }
     // 会话按当前模式（逻辑广角 / 超广角物理直连）创建
     if (!rebuildSession()) return false;
 
@@ -872,6 +882,24 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
             settings_.awbOn = on;
             changed = true;
         }
+    } else if (k == "flash") {
+        // 闪光灯档位：off / auto / on / torch（也接受数字 0..3）。
+        // 无闪光灯单元的设备一律拒绝（写 AE_MODE_ON_ALWAYS_FLASH 会被 HAL 拒整包）。
+        int m = 0;
+        if (v == "auto") m = 1;
+        else if (v == "on") m = 2;
+        else if (v == "torch") m = 3;
+        else m = std::clamp(std::atoi(v.c_str()), 0, 3);
+        if (m != 0 && !t.flashAvailable) {
+            LOGW("flash unavailable on %s", t.id.c_str());
+            return;
+        }
+        if (m != settings_.flashMode) {
+            settings_.flashMode = m;
+            static const char* kName[4] = {"off", "auto", "on", "torch"};
+            LOGI("flash -> %s", kName[m]);
+            changed = true;
+        }
     } else if (k == "disp") {
         // 诊断：手动切显示源（0=逻辑 1=超广 2=长焦；纯 GL 层，不动请求）。
         // manualDisp_ 期间自动判定不覆盖手动值，直到分带真的变化才交还自动。
@@ -1280,6 +1308,26 @@ void CameraEngine::drainUiCmds() {
                 saveQuota_ = int(cmd.v);
                 if (ui_) ui_->setShotQuota(saveQuota_);
                 break;
+            case ui::Ui::Cmd::SET_FLASH: {
+                // 无闪光灯单元的设备不下发：AE_MODE_ON_ALWAYS_FLASH 会被 HAL 拒绝整包
+                //（连带同请求其它 entry 一起丢）。UI 侧入口按 traits 隐藏，这里做第二道守卫。
+                int m = std::clamp(int(cmd.v + 0.5f), 0, 3);
+                // 只在**相机已打开**（traits 可信）时才按能力拒绝：UI 的 attach/持久化
+                // 恢复跑在 glue 线程，可能早于 openCamera，此时 traits 还是空的，
+                // 误判会把启动恢复出来的档位清掉（无闪光灯设备由 openCamera 统一清零）。
+                if (m != 0 && cam_.opened() && !cam_.traits().flashAvailable) {
+                    LOGW("flash unavailable on %s", cam_.traits().id.c_str());
+                    if (ui_) ui_->setFlash(0);   // 回推纠正，避免 UI 停在无效档
+                    break;
+                }
+                if (m != settings_.flashMode) {
+                    settings_.flashMode = m;
+                    static const char* kName[4] = {"off", "auto", "on", "torch"};
+                    LOGI("flash -> %s", kName[m]);
+                    changed = true;
+                }
+                break;
+            }
             case ui::Ui::Cmd::SHOT:
                 triggerBurst();
                 break;

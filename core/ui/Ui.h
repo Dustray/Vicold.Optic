@@ -36,7 +36,8 @@ public:
                     SET_AWB,         // 白平衡开关（v>0.5 = on）
                     SET_WB_PRESET,   // 白平衡预设（v = 预设下标，映射见 CameraEngine::drainUiCmds 的 kEnum）
                     SET_RAW_MODE,    // RAW 模式（v>0.5 = 环形 ZSL，否则单次）
-                    SET_SAVE_QUOTA   // 连拍/保存配额（v = 整数，0 = 不限）
+                    SET_SAVE_QUOTA,  // 连拍/保存配额（v = 整数，0 = 不限）
+                    SET_FLASH        // 闪光灯档位（v = 整数：0关 1自动 2开 3常亮手电筒）
                     } type = SET_ISO;
         float v = 0;
         float v2 = 0;    // TAP_FOCUS：预览区内归一化坐标 (fx, fy) ∈ [0,1]²
@@ -83,6 +84,17 @@ public:
     void setStaticText(int32_t rawW, int32_t rawH) { rawW_ = rawW; rawH_ = rawH; }
     // 拍摄格式真值同步（引擎冷启动读 controls.txt 后校正；UI 点按角标时乐观翻转）
     void setFmtJpg(bool j) { fmtJpg_ = j; markDirty(); }
+    // 闪光灯能力（机型 traits.flashAvailable，引擎开相机时注入）：false 时**隐藏入口**，
+    // 因为无闪光灯单元写 AE_MODE_ON_ALWAYS_FLASH 会被 HAL 拒绝整包（连带丢掉同请求
+    // 其它 entry），与其下发失败不如不显示。
+    void setFlashAvail(bool a) {
+        if (a != flashAvail_) { flashAvail_ = a; markDirty(); }
+    }
+    // 闪光灯档位真值同步（引擎拒绝无效档时回推纠正 / 冷启动恢复）
+    void setFlash(int mode) {
+        int m = mode < 0 ? 0 : (mode > 3 ? 3 : mode);
+        if (m != flashMode_) { flashMode_ = m; markDirty(); }
+    }
     void setUvRot(int rot) { uvRotOverride_ = rot; }
     // 定向的两个真值输入（比"猜方向"可靠）：
     //   sensorDeg  = ACAMERA_SENSOR_ORIENTATION（缓冲需顺时针转多少度才在"本机自然方向"下正立）
@@ -250,6 +262,7 @@ private:
     void drawPanel();
     void drawSettingsButton();      // 左上、变焦滑块上方
     void drawExposureButton();      // 右上、快门正上方
+    void drawFlashButton();         // 右导轨顶部、曝光图标左侧（无闪光灯时不画）
     // 快速整数倍变焦：预览区内、变焦导轨右侧的竖排圆钮（0.7/1/2/5）。
     // 走静态覆盖层（随 zoom_ 变化重烤），命中在 onDown 早期短路 —— 必须在
     // 预览区触摸对焦判定之前，否则点按钮会同时触发一次对焦。
@@ -281,6 +294,7 @@ private:
     void applyAe(bool on);
     void applyAwb(bool on);
     void applyAwbPreset(int idx);
+    void applyFlash(int mode);     // 闪光灯档位 0关 1自动 2开 3常亮
     void commitPersist();          // 若开启持久化则写 settings.txt
     void loadPersistedSettings();  // 启动读 settings.txt 并应用
     // 电子水平仪（加速度计；无传感器时 roll_ 恒 0 = 气泡居中，优雅降级）
@@ -458,6 +472,10 @@ private:
     // 校正回 true ⇒ 持久化的 RAW 被静默吞掉（2026-10-04 审出）。
     bool fmtJpg_ = true;
     float chipFmtL_ = -1, chipFmtR_ = -1;   // RAW/JPG 角标热区（绘制时记录，设计坐标）
+    // 闪光灯档位（0关 1自动 2开 3常亮）+ 本机是否有闪光灯单元（机型 traits 注入）。
+    // 引擎才是下发真值源：无效档（无闪光灯设备）会被拒绝并回推纠正。
+    int flashMode_ = 0;
+    bool flashAvail_ = false;
 
     // EV 双击归零判定（onDown 传事件时间，350ms 内同位置二击 = 双击）
     double lastEvTapMs_ = -1e3;

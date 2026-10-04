@@ -305,6 +305,24 @@ struct IOpticDevice {
 > **同时完成**：屏幕触摸对焦三态模式（点击即对焦 / 仅选位置 / 对焦并拍照）；
 > 近距接管阈值按系统相机口径重标定（`0.9/1.4m → 0.18/0.30m`，`DEVICE_ABSTRACTION.md` §1/§6）。
 
+### M-FLASH — 闪光灯 【P1，2026-10-04】
+
+> 入口：右导轨顶部、曝光图标左侧（`(1376,80)`，直径 60），点击循环
+> **关 → 自动 → 开 → 常亮 → 关**。档位随设置持久化（`settings.txt` 的 `flash=`）。
+>
+> **camera2 语义（关键）**：主语义落在 `CONTROL_AE_MODE`（ON / ON_AUTO_FLASH /
+> ON_ALWAYS_FLASH），**不能只写 `FLASH_MODE`** —— 多数 HAL 在 AE_MODE=ON 时忽略
+> `FLASH_MODE=SINGLE`，表现为「开关切了但灯不闪」。只有「常亮」需要 `FLASH_MODE=TORCH`。
+> 手动曝光（AE_MODE=OFF）下「开」档改在**单拍请求**写 SINGLE：repeating 上写 SINGLE
+> 会让闪光灯每帧放电。详见 `doc/UI_LAYOUT.md` §5.2。
+>
+> **无闪光灯设备的两道守卫**：`openCamera` 按 `traits.flashAvailable` 清零（含持久化残留），
+> `SET_FLASH` 仅在相机已打开（traits 可信）时才拒绝并回推；UI 侧能力为 false 时**不画入口**。
+>
+> **待真机验证**：4 档 AE_MODE/FLASH_MODE 下发是否正确、常亮是否可见、拍照是否真闪、
+> 自动档在未跑 precapture 序列时的表现（可能需要补 `AE_PRECAPTURE_TRIGGER`）。
+> 调试键 `controls.txt: flash=off|auto|on|torch`（也接受 0..3）。
+
 ### M3 — 极速体验打磨 【P0/P1，2 周】
 
 | # | 任务 | 优先级 |

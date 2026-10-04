@@ -12,8 +12,33 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
 
     // 注意：AE_MODE / AF_MODE / AWB_MODE 在 camera2 里是 TYPE_BYTE，必须用 setEntry_u8，
     // 用 i32 写会被框架报 "Mismatched tag type" 并丢弃该 entry（切到超广角物理镜头时尤其致命）。
-    uint8_t ae = static_cast<uint8_t>(aeOn ? ACAMERA_CONTROL_AE_MODE_ON : ACAMERA_CONTROL_AE_MODE_OFF);
+    // 闪光灯：主语义走 CONTROL_AE_MODE（camera2 规定），**不能只写 FLASH_MODE** ——
+    // 多数 HAL 在 AE_MODE=ON 时会忽略 FLASH_MODE=SINGLE，表现为「开关切了但灯不闪」。
+    // 档位：0=关(ON) 1=自动(ON_AUTO_FLASH) 2=开(ON_ALWAYS_FLASH) 3=常亮(ON + TORCH)。
+    uint8_t ae = static_cast<uint8_t>(ACAMERA_CONTROL_AE_MODE_ON);
+    if (!aeOn) {
+        ae = static_cast<uint8_t>(ACAMERA_CONTROL_AE_MODE_OFF);
+    } else if (flashMode == 1) {
+        ae = static_cast<uint8_t>(ACAMERA_CONTROL_AE_MODE_ON_AUTO_FLASH);
+    } else if (flashMode == 2) {
+        ae = static_cast<uint8_t>(ACAMERA_CONTROL_AE_MODE_ON_ALWAYS_FLASH);
+    }
+    // 档位 3（常亮）保持 AE_MODE_ON：TORCH 交给下面的 FLASH_MODE 承担。写成
+    // ALWAYS_FLASH 会叠加「每次 capture 再放一次电」，与「常亮」语义冲突。
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_MODE, 1, &ae);
+
+    // FLASH_MODE 只在这两种情形下写，其余交给 AE_MODE（写了反而覆盖 AE 的闪光决策）：
+    //   常亮 → TORCH，任何请求都要写（预览时就该亮着，这是手电筒的定义）
+    //   开（2）且手动曝光 → SINGLE，且**仅限单拍请求**（forPreview=false）。
+    //     repeating 上写 SINGLE 会让闪光灯每帧放电，既费电又伤灯。
+    if (flashMode == 3) {
+        const uint8_t fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_TORCH);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_FLASH_MODE, 1, &fm);
+    } else if (flashMode == 2 && !aeOn && !forPreview) {
+        const uint8_t fm = static_cast<uint8_t>(ACAMERA_FLASH_MODE_SINGLE);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_FLASH_MODE, 1, &fm);
+    }
+
     uint8_t ael = static_cast<uint8_t>(aeLock ? 1 : 0);
     ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_LOCK, 1, &ael);
     ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &evSteps);

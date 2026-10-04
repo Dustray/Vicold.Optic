@@ -135,8 +135,13 @@ constexpr float kIconD = 60;                                    // 图标按钮�
 constexpr float kSetIconX = 128, kSetIconY = 48;
 // 曝光：右导轨顶部、快门（kShutterY=318）正上方，与 AE 锁（kAeLockY=238）无冲突。
 constexpr float kExpIconX = 1456, kExpIconY = 80;
+// 闪光灯（2026-10-04）：曝光图标**左侧**同排同尺寸，圆心间距 80（两圆边缘留 20px）。
+// 左缘 1346 仍在右导轨内（kRailRX=1156），不与 ISO/SS 滚轮读数行冲突。
+constexpr float kFlashIconX = 1376, kFlashIconY = 80;
 // 命中热区在图标外扩 8px（与快门/AE 锁同口径：视觉边缘点按常差几像素落空）
 constexpr float kIconHitPad = 8.f;
+// 闪光灯档位名（settings.txt 落盘用；解析时同时接受数字 0..3，便于手写调试）
+constexpr const char* kFlashNames[4] = {"off", "auto", "on", "torch"};
 
 // ---- 快速整数倍变焦按钮（2026-10-03 用户要求）----
 // 竖排 4 枚圆形按钮，铺在**预览区内**、左变焦导轨右缘（kRailREnd=168）之外 ——
@@ -398,6 +403,14 @@ void Ui::onDown(float x, float y, double tMs) {
     }
     if (std::hypot(x - kExpIconX, y - kExpIconY) <= kIconD / 2 + kIconHitPad) {
         openPanel(Panel::EXPOSURE); hap_.click(); return;
+    }
+    // 闪光灯：点按循环 关 → 自动 → 开 → 常亮 → 关（档位直接由图标符号表达，
+    // 不需要进面板；相机类应用的闪光灯都是这种单击切换）。
+    if (flashAvail_ &&
+        std::hypot(x - kFlashIconX, y - kFlashIconY) <= kIconD / 2 + kIconHitPad) {
+        applyFlash((flashMode_ + 1) % 4);
+        hap_.click();
+        return;
     }
     // RAW/JPG 格式角标（预览左上第一枚）：点按切换拍摄格式（引擎重建会话 ~300ms）。
     // 热区存设计坐标（onDown 的 x/y 已是 toDesign 反变换后的设计值），上下各放宽 6px 好按
@@ -1658,6 +1671,7 @@ void Ui::paintOverlay() {
     // （真机验证踩过：点 150,72 能开面板，但屏幕上找不到按钮）。
     drawSettingsButton();
     drawExposureButton();
+    drawFlashButton();
 }
 
 // =================== 设置 / 曝光白平衡 面板（2026-10-03）===================
@@ -1776,7 +1790,81 @@ void closeIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& c) 
     }
 }
 
+// 粗线段 → 两个三角形（笔画基元；本文件多个图标共用）。w 为线宽（屏幕像素）。
+void strokeSeg(std::vector<float>& v, float x0, float y0, float x1, float y1, float w) {
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = std::hypot(dx, dy);
+    if (len < 1e-3f) return;
+    const float nx = -dy / len * w * 0.5f, ny = dx / len * w * 0.5f;
+    const float p[12] = {
+        x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny,
+        x0 + nx, y0 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny,
+    };
+    v.insert(v.end(), std::begin(p), std::end(p));
+}
+
+// 闪光灯：Z 形闪电（两段斜笔 + 中间横笔，接缝用小方块缝合）+ 档位附加符号。
+// 档位（0 关 / 1 自动 / 2 开 / 3 常亮）靠**附加符号**区分，不靠颜色单独表意
+// —— 单靠颜色在强光下读不出，且色弱用户分不开：
+//   关 = 闪电被深色斜杠划断；自动 = 右下角 "A"；开 = 纯闪电；常亮 = 闪电 + 四向短芒。
+void flashIcon(Gl& gl, float cx, float cy, float r, float scale, int mode, const Rgba& c) {
+    const float w = r * 0.34f;                 // 笔画宽
+    // Z 形闪电的四个骨架点（y 向上为正，与 roundedRect 同一坐标系）
+    const float xTop = cx + 0.16f * r, yTop = cy + 0.55f * r;
+    const float xML = cx - 0.20f * r, yMid = cy + 0.02f * r;
+    const float xMR = cx + 0.20f * r;
+    const float xBot = cx - 0.16f * r, yBot = cy - 0.55f * r;
+
+    std::vector<float> v;
+    strokeSeg(v, xTop, yTop, xML, yMid, w);      // 上斜笔
+    strokeSeg(v, xML, yMid, xMR, yMid, w);      // 中横笔
+    strokeSeg(v, xMR, yMid, xBot, yBot, w);     // 下斜笔
+    gl.triangles(v.data(), int(v.size() / 2), c);
+    // 接缝补齐：斜笔端点落在横笔中线，笔宽方向垂直 ⇒ 转折处会缺一个小三角。
+    // 用同宽方块盖住两个转折点（roundedRect 不能旋转，方块无需旋转）。
+    gl.roundedRect(xML - w / 2, yMid - w / 2, w, w, 0, c, kNone, 0);
+    gl.roundedRect(xMR - w / 2, yMid - w / 2, w, w, 0, c, kNone, 0);
+
+    if (mode == 0) {
+        // 关：一道深色斜杠划断闪电（比"灰掉"更易读，且与自动档的 A 明确区分）
+        std::vector<float> s;
+        strokeSeg(s, cx - r * 0.80f, cy + r * 0.80f, cx + r * 0.80f, cy - r * 0.80f,
+                  w * 0.85f);
+        gl.triangles(s.data(), int(s.size() / 2), {0, 0, 0, 0.92f});
+    } else if (mode == 1) {
+        // 自动：右下角小 "A"（相机界通用：闪电 + A = 自动闪光）
+        const float fs = r * 0.78f;
+        const std::string t = "A";
+        const float tw = gl.textWidth(t, fs);
+        gl.text(t, cx + r * 0.42f - tw / 2, cy - r * 0.92f, fs, c);
+    } else if (mode == 3) {
+        // 常亮：四向短芒（手电筒持续发光的表意符号）
+        std::vector<float> s;
+        const float r0 = r * 0.72f, r1 = r * 1.00f;
+        for (int i = 0; i < 4; ++i) {
+            const float a = 0.7853982f + float(i) * 1.5707963f;   // 45°/135°/225°/315°
+            const float ca = std::cos(a), sa = std::sin(a);
+            strokeSeg(s, cx + ca * r0, cy + sa * r0, cx + ca * r1, cy + sa * r1, w * 0.42f);
+        }
+        gl.triangles(s.data(), int(s.size() / 2), c);
+    }
+    (void)scale;
+}
+
 }  // namespace
+
+void Ui::drawFlashButton() {
+    if (!flashAvail_) return;      // 无闪光灯单元：干脆不显示入口（下发会被 HAL 拒整包）
+    const float d = kIconD;
+    const float x = screenX(kFlashIconX - d / 2), y = screenY(kFlashIconY - d / 2);
+    gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
+                    {0, 0, 0, 0.80f}, {1, 1, 1, 0.55f}, dim(1.5f));
+    // 颜色只做辅助：关=灰、自动=白、开/常亮=强调橙。档位本身靠图标附加符号区分，
+    // 单靠颜色在强光下读不出，色弱用户也分不开。
+    const Rgba c = (flashMode_ == 0) ? kT3 : (flashMode_ == 1) ? kT1 : kAccent;
+    flashIcon(gl_, screenX(kFlashIconX), screenY(kFlashIconY), dim(d) * 0.30f, scale_,
+              flashMode_, c);
+}
 
 void Ui::drawSettingsButton() {
     const float d = kIconD;
@@ -2011,6 +2099,15 @@ void Ui::applyAwbPreset(int idx) {
     commitPersist();
 }
 
+void Ui::applyFlash(int mode) {
+    if (mode < 0 || mode > 3) mode = 0;
+    if (mode == flashMode_) return;
+    flashMode_ = mode;
+    markDirty();          // 入口图标画在静态覆盖层，不置脏就停在旧档位符号
+    pushCmd(Cmd::SET_FLASH, float(mode));
+    commitPersist();
+}
+
 void Ui::commitPersist() {
     if (dataDir_.empty()) return;
     const std::string path = dataDir_ + "/settings.txt";
@@ -2030,6 +2127,7 @@ void Ui::commitPersist() {
     f << "ae=" << (aeOn_ ? "on" : "off") << "\n";
     f << "awb=" << (awbOn_ ? "on" : "off") << "\n";
     f << "awbpreset=" << awbPreset_ << "\n";
+    f << "flash=" << kFlashNames[flashMode_] << "\n";
     f << "grid=" << (gridOn_ ? 1 : 0) << "\n";
     f << "level=" << (levelOn_ ? 1 : 0) << "\n";
     f << "safe=" << (safeFrameOn_ ? 1 : 0) << "\n";
@@ -2057,6 +2155,14 @@ void Ui::loadPersistedSettings() {
         else if (k == "ae") { bool on = (v == "on"); if (on != aeOn_) applyAe(on); }
         else if (k == "awb") { hasAwb = true; awbOn = (v == "on"); }
         else if (k == "awbpreset") awbPresetIdx = std::atoi(v.c_str());
+        else if (k == "flash") {
+            int m = 0;
+            if (v == "auto") m = 1;
+            else if (v == "on") m = 2;
+            else if (v == "torch") m = 3;
+            else m = std::clamp(std::atoi(v.c_str()), 0, 3);
+            if (m != flashMode_) applyFlash(m);
+        }
         else if (k == "grid") { bool on = (v == "1"); if (on != gridOn_) { gridOn_ = on; markDirty(); } }
         else if (k == "level") { bool on = (v == "1"); if (on != levelOn_) { levelOn_ = on; markDirty(); } }
         else if (k == "safe") { bool on = (v == "1"); if (on != safeFrameOn_) { safeFrameOn_ = on; markDirty(); } }

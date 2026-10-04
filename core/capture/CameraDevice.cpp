@@ -71,6 +71,11 @@ bool CameraDevice::readTraits(const char* id) {
         for (uint32_t i = 0; i < e.count; ++i)
             if (e.data.u8[i] == 1) traits_.lscOn = true;
 
+    // 闪光灯单元（byte 型，与 hardwareLevel 同一读法）
+    int32_t flashAvail = 0;
+    byte0(ACAMERA_FLASH_INFO_AVAILABLE, &flashAvail);
+    traits_.flashAvailable = flashAvail != 0;
+
     if (ACameraMetadata_getConstEntry(chars, ACAMERA_SENSOR_INFO_COLOR_FILTER_ARRANGEMENT, &e) == ACAMERA_OK && e.count > 0) {
         // CFA 枚举 → 2×2 图案（DNG CFAPattern 值：R=0, G=1, B=2）
         static const uint8_t kCfa[4][4] = {

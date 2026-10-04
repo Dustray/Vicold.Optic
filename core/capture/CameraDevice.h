@@ -37,6 +37,10 @@ struct CameraTraits {
     int32_t blackLevel[4] = {0, 0, 0, 0};   // DNG 写入用（V3，运行时从 characteristics 填充）
     uint8_t cfaPattern[4] = {0, 1, 1, 2};   // CFA 图案（默认 RGGB，运行时按枚举映射）
     bool lscOn = false;                     // per-frame LSC map 可用（V4）
+    // 机身有闪光灯单元（ACAMERA_FLASH_INFO_AVAILABLE）。false 时 UI 隐藏闪光灯入口、
+    // 引擎拒绝下发 flash 相关 tag —— 无闪光灯设备写 AE_MODE_ON_ALWAYS_FLASH 会被
+    // HAL 拒绝整包（连带把同请求的其它 entry 一起丢掉）。pandora: true
+    bool flashAvailable = false;
     int32_t evMin = 0, evMax = 0;           // AE 补偿范围（步数）
     float evStep = 1.f / 3;                 // AE 补偿步长（EV）
     bool physPerKeyZoom = true;             // per-physical 变焦键被 HAL 真实执行（机型 quirk，

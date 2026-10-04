@@ -41,6 +41,12 @@ struct CaptureSettings {
     // AWB
     bool awbOn = true;            // TODO(M2): CCT 手动（colorTemperature tag 需真机验证）
     int awbMode = 1;              // 白平衡预设（Android AWB_MODE 枚举值；1=AUTO）；awbOn=false 时下发 OFF
+    // 闪光灯（自定义档位，不是 camera2 枚举）：0=关 1=自动 2=开（强制） 3=常亮手电筒。
+    // **语义落在 CONTROL_AE_MODE 上**（camera2 规矩）：自动=ON_AUTO_FLASH、开=ON_ALWAYS_FLASH，
+    // 直接写 FLASH_MODE=SINGLE 而不改 AE_MODE 在多数 HAL 上不会闪。只有「常亮」需要
+    // 额外写 FLASH_MODE=TORCH（AE_MODE 没有对应枚举）。详见 CaptureSettings.cpp。
+    // 引擎侧会按 traits.flashAvailable 守卫：无闪光灯单元时不该出现非 0 值。
+    int flashMode = 0;
     // 变焦（逻辑摄 zoomRatio，HAL 自动做物理摄切换）
     float zoomRatio = 0.f;        // 0 = 不设置（保持默认）
 
@@ -58,7 +64,7 @@ inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
            a.exposureNs != b.exposureNs ||
            a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
            a.afMode != b.afMode || a.awbOn != b.awbOn || a.awbMode != b.awbMode ||
-           a.zoomRatio != b.zoomRatio ||
+           a.flashMode != b.flashMode || a.zoomRatio != b.zoomRatio ||
            std::memcmp(a.afRegion, b.afRegion, sizeof(a.afRegion)) != 0 ||
            std::memcmp(a.aeRegion, b.aeRegion, sizeof(a.aeRegion)) != 0;
 }
