@@ -40,6 +40,7 @@ struct CaptureSettings {
     int32_t afTrigger = 0;
     // AWB
     bool awbOn = true;            // TODO(M2): CCT 手动（colorTemperature tag 需真机验证）
+    int awbMode = 1;              // 白平衡预设（Android AWB_MODE 枚举值；1=AUTO）；awbOn=false 时下发 OFF
     // 变焦（逻辑摄 zoomRatio，HAL 自动做物理摄切换）
     float zoomRatio = 0.f;        // 0 = 不设置（保持默认）
 
@@ -56,7 +57,8 @@ inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
     return a.aeOn != b.aeOn || a.aeLock != b.aeLock || a.iso != b.iso ||
            a.exposureNs != b.exposureNs ||
            a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
-           a.afMode != b.afMode || a.awbOn != b.awbOn || a.zoomRatio != b.zoomRatio ||
+           a.afMode != b.afMode || a.awbOn != b.awbOn || a.awbMode != b.awbMode ||
+           a.zoomRatio != b.zoomRatio ||
            std::memcmp(a.afRegion, b.afRegion, sizeof(a.afRegion)) != 0 ||
            std::memcmp(a.aeRegion, b.aeRegion, sizeof(a.aeRegion)) != 0;
 }

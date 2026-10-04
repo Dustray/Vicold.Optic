@@ -105,7 +105,8 @@ class StillProcessor { virtual bool process(StillFrame&) = 0; };   // false = �
 - `GalleryWriter`：JNI → MediaStore 两段提交（`IS_PENDING=1` → 写流 → `IS_PENDING=0`），无需存储权限，系统相册可见。失败降级到应用私有 `jpg/` 目录。
 - `ContentValues.put()` 返回 `void`，JNI 签名是 `)V` 不是 `)I`（曾静默失败）。
 - **UI 反馈一律走 HUD 角标**：保存中 → 橙色 `SAVING`，写完即消失；只有失败（配额用尽）才短暂显示提示。预览区**不允许**再有浮层 toast。
-- 每启动配额 `saveQuota_ = 8`，`controls.txt: save_quota=N` 可调。
+- 每启动配额默认 `saveQuota_ = 8`（设置面板「照片质量 → 连拍配额」可改为 1/4/8/不限；
+  `controls.txt: save_quota=N` 同样可调，面板与配置文件都是绝对值语义）。
 
 ## 7. 遗留
 

@@ -88,6 +88,11 @@ public:
                          const std::vector<PhysZoom>& phys);
     bool captureOnce(const std::vector<ANativeWindow*>& targets, const CaptureSettings& s);
 
+    // 自动休眠：仅停止 repeating 请求（保留会话、纹理、输出目标），不 close。
+    // 唤醒时由调用方重新 setRepeating 即可恢复预览流；比 close 重建（~290ms 冻结 +
+    // 纹理失效）省电且瞬启。stopRepeating 后不再有 capture result 流入（相机 ISP 停跑）。
+    void stopRepeating();
+
     // 一次性 AF 触发请求（触摸对焦专用）：带 AF_REGIONS + AF_TRIGGER_START。
     // 必须与 repeating 分开提交 —— camera2 里 trigger 是"每个请求实例执行一次"的语义，
     // 写在 repeating 上会让 HAL 每帧重启一次扫描，镜头永远合不上焦。

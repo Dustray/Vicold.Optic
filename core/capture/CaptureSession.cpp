@@ -124,6 +124,11 @@ void CaptureSession::close() {
     closeLocked();
 }
 
+void CaptureSession::stopRepeating() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (session_) ACameraCaptureSession_stopRepeating(session_);
+}
+
 void CaptureSession::closeLocked() {
     if (session_) {
         ACameraCaptureSession_stopRepeating(session_);
