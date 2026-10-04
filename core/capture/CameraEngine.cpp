@@ -1288,6 +1288,8 @@ void CameraEngine::drainUiCmds() {
             }
             case ui::Ui::Cmd::SET_AWB:
                 settings_.awbOn = cmd.v > 0.5f;
+                // 开 AWB 即退出手动偏移（两者互斥；手动只能由坐标板进入）
+                if (settings_.awbOn) settings_.wbManual = false;
                 LOGI("awb -> %s (mode=%d)", settings_.awbOn ? "on" : "off", settings_.awbMode);
                 changed = true;
                 break;
@@ -1297,10 +1299,20 @@ void CameraEngine::drainUiCmds() {
                 int idx = int(cmd.v + 0.5f);
                 settings_.awbMode = (idx >= 0 && idx < 8) ? kEnum[idx] : 1;
                 settings_.awbOn = true;   // 选预设即开启白平衡
+                settings_.wbManual = false;   // 选预设退出手动偏移（互斥）
                 LOGI("awb preset[%d] -> AWB_MODE=%d", idx, settings_.awbMode);
                 changed = true;
                 break;
             }
+            case ui::Ui::Cmd::SET_WB_MANUAL:
+                // 白平衡手动 2D 坐标板：v=色温(temp) v2=色调(tint)。进入手动即关 AWB，
+                // 由 CaptureSettings::apply 据此写 COLOR_CORRECTION 增益接管色彩。
+                settings_.wbManual = true;
+                settings_.wbTemp = cmd.v;
+                settings_.wbTint = cmd.v2;
+                LOGI("wb manual temp=%.2f tint=%.2f", settings_.wbTemp, settings_.wbTint);
+                changed = true;
+                break;
             case ui::Ui::Cmd::SET_RAW_MODE:
                 // RAW 模式：true=环形(ZSL) false=单次。变更会改变 RAW 在 repeating 中的组成，
                 // 由 commitSession 的会话签名检测统一重建（见 applyControl 的 raw_mode 分支）。

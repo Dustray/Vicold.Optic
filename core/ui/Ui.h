@@ -35,6 +35,7 @@ public:
                     WAKE,            // 休眠态触摸，仅唤醒不执行动作
                     SET_AWB,         // 白平衡开关（v>0.5 = on）
                     SET_WB_PRESET,   // 白平衡预设（v = 预设下标，映射见 CameraEngine::drainUiCmds 的 kEnum）
+                    SET_WB_MANUAL,   // 白平衡手动 2D 坐标板（v=色温 temp，v2=色调 tint，范围 [-1,1]）
                     SET_RAW_MODE,    // RAW 模式（v>0.5 = 环形 ZSL，否则单次）
                     SET_SAVE_QUOTA,  // 连拍/保存配额（v = 整数，0 = 不限）
                     SET_FLASH,       // 闪光灯档位（v = 整数：0关 1自动 2开 3常亮手电筒）
@@ -272,7 +273,7 @@ private:
     void applyQuickZoom(int idx);
     // 面板控件动作类型（doAction 分发；buildCtlRects / handlePanelTap 共用）
     enum PAct { A_HEADER, A_FMT, A_RAW, A_QUOTA, A_GRID, A_LEVEL, A_SAFE,
-                A_SLEEP, A_PERSIST, A_AE, A_AWB, A_AWBPRESET };
+                A_SLEEP, A_PERSIST, A_AE, A_AWB, A_AWBPRESET, A_WBPAD };
     // 面板控件命中（onDown 在 panel_!=NONE 时整体转发到这里）
     void handlePanelTap(float x, float y);
     void doAction(PAct act, int seg);            // 面板控件动作分发
@@ -295,6 +296,7 @@ private:
     void applyAe(bool on);
     void applyAwb(bool on);
     void applyAwbPreset(int idx);
+    void applyWbManual(float temp, float tint);   // 白平衡手动 2D 坐标板：temp=色温 tint=色调，[-1,1]
     void applyFlash(int mode);     // 闪光灯档位 0关 1自动 2开 3常亮
     void applySleep(int sel);      // 自动休眠档位（kSleepVals 下标；0 = 永不）
     void commitPersist();          // 若开启持久化则写 settings.txt
@@ -401,6 +403,10 @@ private:
     bool aeOn_ = true;             // 自动曝光
     bool awbOn_ = true;            // 自动白平衡
     int awbPreset_ = 0;            // 白平衡预设下标（0=自动）
+    // 白平衡手动偏移（2D 坐标板）：与 AWB 预设互斥，进入手动即关 AWB。默认 (0,0)=中性。
+    bool wbManual_ = false;
+    float wbTemp_ = 0.f;           // 色温（X 轴）[-1,1]：+暖/琥珀 -冷/蓝
+    float wbTint_ = 0.f;           // 色调（Y 轴）[-1,1]：+品红 -绿
     bool levelOn_ = false;         // 电子水平仪
     bool safeFrameOn_ = false;     // 安全框
     bool persist_ = false;         // 设置持久化开关

@@ -170,6 +170,7 @@ constexpr float kPanelPadL  = 150;    // 行标签左缘
 constexpr float kPanelCtlR  = 1410;   // 分段控件右缘
 constexpr float kPanelCtlW  = 720;    // 分段控件宽（右对齐到 kPanelCtlR）
 constexpr float kPanelCtlH  = 44;     // 控件高
+constexpr float kPadH       = 240;    // 白平衡 2D 坐标板高（宽取 kPanelCtlW，近正方形便于双轴选取）
 constexpr float kPanelHeadH = 40;     // 分组标题行高
 constexpr float kPanelRowH  = 56;     // 普通行高（控件上下各留 6px）
 // 内容块**顶对齐**（2026-10-04 用户要求「标题上方留的空太大」）：原为在
@@ -1988,6 +1989,12 @@ void Ui::buildCtlRects() {
                              n, sel, int(act), label, opts});
         y += kPanelRowH;
     };
+    // 2D 坐标板（白平衡手动偏移）：画在面板动态层，命中/绘制共用同一份几何。
+    // 当前值从 wbTemp_/wbTint_ 读（不在 PanelCtl 里存），只存占位几何。
+    auto pad = [&](const char* label) {
+        ctlRects_.push_back({ctlX, y, kPanelCtlW, kPadH, 0, 0, int(A_WBPAD), label, nullptr});
+        y += kPadH + 12;
+    };
     if (panel_ == Panel::SETTINGS) {
         header("照片质量");
         row("格式", kFmtOpts, 2, fmtJpg_ ? 1 : 0, A_FMT);
@@ -2004,8 +2011,11 @@ void Ui::buildCtlRects() {
         header("曝光");
         row("自动曝光", kOnOff, 2, aeOn_ ? 1 : 0, A_AE);
         header("白平衡");
-        row("自动白平衡", kOnOff, 2, awbOn_ ? 1 : 0, A_AWB);
-        row("白平衡预设", kAwbLabels, 8, awbPreset_, A_AWBPRESET);
+        // 手动偏移开启时 AWB 被接管：自动白平衡开关显示关、预设显示 AUTO（互斥）
+        row("自动白平衡", kOnOff, 2, (awbOn_ && !wbManual_) ? 1 : 0, A_AWB);
+        row("白平衡预设", kAwbLabels, 8, wbManual_ ? 0 : awbPreset_, A_AWBPRESET);
+        header("手动偏移");
+        pad("");   // 2D 坐标板：色温(X) × 色调(Y)，默认 (0,0)
     }
     // 统一偏移到 kPanelTopY（顶对齐）
     for (auto& c : ctlRects_) c.y += kPanelTopY;
@@ -2034,6 +2044,42 @@ void Ui::drawPanel() {
             const float ly = c.y + c.h - 2;
             gl_.roundedRect(screenX(kPanelPadL), screenY(ly), dim(kStageW - 2 * kPanelPadL),
                             std::max(1.f, dim(1)), 0, {1, 1, 1, 0.10f}, kNone, 0);
+            continue;
+        }
+        if (c.act == int(A_WBPAD)) {
+            // 白平衡 2D 坐标板：底色 + 双轴 + 中心十字 + 当前选取点 + 轴端标签
+            const float sx = screenX(c.x), sy = screenY(c.y), sw = dim(c.w), sh = dim(c.h);
+            const float ccx = sx + sw / 2, ccy = sy + sh / 2;
+            gl_.roundedRect(sx, sy, sw, sh, dim(12), {1, 1, 1, 0.06f}, kLine, 1);
+            // 双轴（横=色温 X，纵=色调 Y）
+            gl_.roundedRect(ccx - 1, sy + dim(8), std::max(1.f, dim(2)), sh - dim(16), 0,
+                            {1, 1, 1, 0.18f}, kNone, 0);
+            gl_.roundedRect(sx + dim(8), ccy - 1, sw - dim(16), std::max(1.f, dim(2)), 0,
+                            {1, 1, 1, 0.18f}, kNone, 0);
+            // 中心十字（标识 (0,0) 中性点）
+            gl_.roundedRect(ccx - dim(7), ccy - std::max(1.f, dim(1.2f)), dim(14),
+                            std::max(1.f, dim(2.4f)), 0, {1, 1, 1, 0.30f}, kNone, 0);
+            gl_.roundedRect(ccx - std::max(1.f, dim(1.2f)), ccy - dim(7), std::max(1.f, dim(2.4f)),
+                            dim(14), 0, {1, 1, 1, 0.30f}, kNone, 0);
+            // 当前选取点（accent 实心圆 + 白芯）
+            const float px = sx + sw * (0.5f + 0.5f * wbTemp_);
+            const float py = sy + sh * (0.5f - 0.5f * wbTint_);   // 上 = +tint（品红）
+            gl_.roundedRect(px - dim(9), py - dim(9), dim(18), dim(18), dim(9), kAccent, kNone, 0);
+            gl_.roundedRect(px - dim(5), py - dim(5), dim(10), dim(10), dim(5), {1, 1, 1, 0.92f}, kNone, 0);
+            // 轴端标签（冷/暖 = 色温；品/绿 = 色调）
+            const float lfs = 14 * kUiZoom * scale_;
+            auto lbl = [&](const char* s, float x, float y) {
+                const float w = gl_.textWidth(s, lfs);
+                gl_.text(s, x - w / 2, gl_.textCenterTop(s, lfs, y), lfs, kT2);
+            };
+            lbl("冷", sx + dim(26), ccy);
+            lbl("暖", sx + sw - dim(26), ccy);
+            lbl("品", ccx, sy + dim(24));
+            lbl("绿", ccx, sy + sh - dim(24));
+            // 轴名（角落，避免与轴端标签挤在一起）
+            const float nfs = 13 * kUiZoom * scale_;
+            gl_.text("色温", sx + dim(8), sy + sh - dim(26), nfs, kT3);
+            gl_.text("色调", sx + sw - dim(8) - gl_.textWidth("色调", nfs), sy + dim(8), nfs, kT3);
             continue;
         }
         gl_.text(c.label, screenX(c.x - 24) - gl_.textWidth(c.label, fs),
@@ -2081,6 +2127,15 @@ void Ui::handlePanelTap(float x, float y) {
     for (auto& c : ctlRects_) {
         if (c.act == int(A_HEADER)) continue;
         if (inR(x, y, c.x, c.y, c.w, c.h)) {
+            if (c.act == int(A_WBPAD)) {
+                // 把面板坐标映射到 [-1,1] 双轴：左=冷/蓝、右=暖/琥珀（色温 X）；
+                // 上=品红、下=绿（色调 Y）。点哪选哪（无拖拽也成立）。
+                const float temp = std::clamp((x - c.x) / c.w * 2.f - 1.f, -1.f, 1.f);
+                const float tint = std::clamp((0.5f - (y - c.y) / c.h) * 2.f, -1.f, 1.f);
+                applyWbManual(temp, tint);
+                hap_.click();
+                return;
+            }
             const int seg = int(std::clamp((x - c.x) / (c.w / c.n), 0.f, float(c.n - 1)));
             doAction(PAct(c.act), seg);
             return;
@@ -2106,6 +2161,19 @@ void Ui::doAction(PAct act, int seg) {
     }
     hap_.click();
     buildCtlRects();   // 刷新选中态显示
+}
+
+void Ui::applyWbManual(float temp, float tint) {
+    // 进入手动偏移：接管 AWB（关闭），预设回落 AUTO。点选坐标板即时生效，
+    // 与「自动白平衡 / 白平衡预设」互斥 —— 选预设或开 AWB 会清掉本标志（见 applyAwb/applyAwbPreset）。
+    wbManual_ = true;
+    awbOn_ = false;
+    awbPreset_ = 0;   // 手动接管，预设显示回到 AUTO
+    wbTemp_ = temp;
+    wbTint_ = tint;
+    markDirty();          // 坐标板与上方开关的选中态都在动态层，不置脏不重画
+    pushCmd(Cmd::SET_WB_MANUAL, temp, tint);   // v=色温 temp, v2=色调 tint
+    commitPersist();
 }
 
 void Ui::applyFmt(bool jpg) {
@@ -2143,6 +2211,7 @@ void Ui::applyAe(bool on) {
 void Ui::applyAwb(bool on) {
     if (on == awbOn_) return;
     awbOn_ = on;
+    wbManual_ = false;   // 开 AWB 即退出手动偏移（互斥）
     markDirty();
     pushCmd(Cmd::SET_AWB, on ? 1.f : 0.f);
     commitPersist();
@@ -2150,6 +2219,7 @@ void Ui::applyAwb(bool on) {
 
 void Ui::applyAwbPreset(int idx) {
     if (idx < 0 || idx > 7) idx = 0;
+    wbManual_ = false;   // 选预设退出手动偏移（互斥）；幂等守卫在下方
     // markDirty 不可省：面板画在逐帧动态层，选中态不回写就不会重画 ⇒ 高亮停在旧档
     // （2026-10-03 真机：点「阴天」无反应，日志证明命中与分段都对，就是缺重画）。
     // 幂等守卫：**必须带上 awbOn_**。本函数有副作用（awbOn_ = true），守卫若只看档位，
@@ -2203,6 +2273,10 @@ void Ui::commitPersist() {
     f << "ae=" << (aeOn_ ? "on" : "off") << "\n";
     f << "awb=" << (awbOn_ ? "on" : "off") << "\n";
     f << "awbpreset=" << awbPreset_ << "\n";
+    // 手动白平衡偏移（2D 坐标板）：仅手动模式时记有意义的值；拔线重启后保留色偏。
+    f << "wbman=" << (wbManual_ ? 1 : 0) << "\n";
+    f << "wbtemp=" << std::to_string(wbTemp_) << "\n";
+    f << "wbtint=" << std::to_string(wbTint_) << "\n";
     f << "flash=" << kFlashNames[flashMode_] << "\n";
     f << "grid=" << (gridOn_ ? 1 : 0) << "\n";
     f << "level=" << (levelOn_ ? 1 : 0) << "\n";
@@ -2222,6 +2296,8 @@ void Ui::loadPersistedSettings() {
     // 结果相反）——加载同一份配置得到两种状态。改为全量读完再按固定顺序应用。
     bool hasAwb = false, awbOn = true;
     int awbPresetIdx = 0;
+    bool hasWbMan = false, wbMan = false;
+    float wbTemp = 0.f, wbTint = 0.f;
     while (std::getline(f, line)) {
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -2233,6 +2309,9 @@ void Ui::loadPersistedSettings() {
         else if (k == "ae") { bool on = (v == "on"); if (on != aeOn_) applyAe(on); }
         else if (k == "awb") { hasAwb = true; awbOn = (v == "on"); }
         else if (k == "awbpreset") awbPresetIdx = std::atoi(v.c_str());
+        else if (k == "wbman") { hasWbMan = true; wbMan = (v == "1"); }
+        else if (k == "wbtemp") wbTemp = std::atof(v.c_str());
+        else if (k == "wbtint") wbTint = std::atof(v.c_str());
         else if (k == "flash") {
             int m = 0;
             if (v == "auto") m = 1;
@@ -2259,6 +2338,8 @@ void Ui::loadPersistedSettings() {
     // 顺序固定 ⇒ 结果与文件行序无关。
     applyAwbPreset(std::clamp(awbPresetIdx, 0, 7));
     if (hasAwb && awbOn != awbOn_) applyAwb(awbOn);
+    // 手动偏移最后应用（与 AWB 预设互斥，手动优先接管）：坐标板存档恢复色偏。
+    if (hasWbMan && wbMan) applyWbManual(wbTemp, wbTint);
     // 持久化开关本身：仅当文件标记为持久化时才恢复开启（否则默认关闭、不恢复旧值）
     persist_ = persist;
     markDirty();

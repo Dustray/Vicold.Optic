@@ -44,8 +44,15 @@ struct CaptureSettings {
     // 会被 HAL 直接出帧、灯不亮（pandora 真机实测：亮度对照无差异，flash.state 不进 FIRED）。
     int32_t aePrecapture = 0;
     // AWB
-    bool awbOn = true;            // TODO(M2): CCT 手动（colorTemperature tag 需真机验证）
+    bool awbOn = true;            // 自动白平衡开关（与 wbManual 互斥：手动偏移开启时恒为 false）
     int awbMode = 1;              // 白平衡预设（Android AWB_MODE 枚举值；1=AUTO）；awbOn=false 时下发 OFF
+    // 手动白平衡偏移（2D 坐标板）：进入手动后接管色彩校正，与 AWB 预设互斥。
+    // wbTemp = 色温（X 轴）：+ = 暖/琥珀(增 R 减 B)，- = 冷/蓝(增 B 减 R)，范围 [-1,1]
+    // wbTint = 色调（Y 轴）：+ = 品红(减 G 增 R/B)，- = 绿(增 G 减 R/B)，范围 [-1,1]
+    // 默认 (0,0) = 中性。映射为 COLOR_CORRECTION 增益（见 CaptureSettings.cpp::apply）。
+    bool wbManual = false;
+    float wbTemp = 0.f;
+    float wbTint = 0.f;
     // 闪光灯（自定义档位，不是 camera2 枚举）：0=关 1=自动 2=开（强制） 3=常亮手电筒。
     // **语义落在 CONTROL_AE_MODE 上**（camera2 规矩）：自动=ON_AUTO_FLASH、开=ON_ALWAYS_FLASH，
     // 直接写 FLASH_MODE=SINGLE 而不改 AE_MODE 在多数 HAL 上不会闪。只有「常亮」需要
@@ -69,6 +76,7 @@ inline bool operator!=(const CaptureSettings& a, const CaptureSettings& b) {
            a.exposureNs != b.exposureNs ||
            a.evSteps != b.evSteps || a.afOn != b.afOn || a.focusDistance != b.focusDistance ||
            a.afMode != b.afMode || a.awbOn != b.awbOn || a.awbMode != b.awbMode ||
+           a.wbManual != b.wbManual || a.wbTemp != b.wbTemp || a.wbTint != b.wbTint ||
            a.flashMode != b.flashMode || a.zoomRatio != b.zoomRatio ||
            std::memcmp(a.afRegion, b.afRegion, sizeof(a.afRegion)) != 0 ||
            std::memcmp(a.aeRegion, b.aeRegion, sizeof(a.aeRegion)) != 0;

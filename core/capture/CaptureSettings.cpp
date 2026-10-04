@@ -1,5 +1,7 @@
 #include "core/capture/CaptureSettings.h"
 
+#include <algorithm>
+
 namespace optic::capture {
 
 void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview) const {
@@ -91,10 +93,32 @@ void CaptureSettings::apply(ACaptureRequest* req, bool skipZoom, bool forPreview
         ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER, 1, &pt);
     }
 
-    // 白平衡：awbOn=false → OFF；否则用用户选中的预设（awbMode，默认 AUTO=1）
-    uint8_t awb = static_cast<uint8_t>(awbOn ? (awbMode >= 1 ? awbMode : ACAMERA_CONTROL_AWB_MODE_AUTO)
-                                             : ACAMERA_CONTROL_AWB_MODE_OFF);
-    ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
+    // 白平衡：wbManual（2D 坐标板）优先 —— 接管色彩校正，AWB 必须关掉，否则 HAL 会
+    // 用 AWB 结果覆盖我们写的增益。映射为 COLOR_CORRECTION 的每通道增益（对角变换）：
+    //   色温 temp>0(暖) → 增 R 减 B；temp<0(冷) → 增 B 减 R
+    //   色调 tint>0(品红) → 减 G、略增 R/B；tint<0(绿) → 增 G、略减 R/B
+    // 与「AWB 预设」互斥：二者只能有一个生效（见 Ui 的 applyAwb/applyAwbPreset/applyWbManual）。
+    if (wbManual) {
+        uint8_t awbOff = static_cast<uint8_t>(ACAMERA_CONTROL_AWB_MODE_OFF);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AWB_MODE, 1, &awbOff);
+        uint8_t ccm = static_cast<uint8_t>(ACAMERA_COLOR_CORRECTION_MODE_TRANSFORM_MATRIX);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_COLOR_CORRECTION_MODE, 1, &ccm);
+        // 单位变换矩阵（9 个有理分数，对角 1/1、其余 0/1）—— 只靠下面的增益做白平衡
+        const int32_t ident[18] = {1,1, 0,1, 0,1,  0,1, 1,1, 0,1,  0,1, 0,1, 1,1};
+        ACaptureRequest_setEntry_i32(req, ACAMERA_COLOR_CORRECTION_TRANSFORM, 18, ident);
+        const float kT = 0.5f, kTt = 0.25f, kG = 0.4f;   // 色温/色调强度系数
+        const auto cl = [](float v) { return std::clamp(v, 0.2f, 4.0f); };
+        const float r = cl(1.f + wbTemp * kT + wbTint * kTt);
+        const float b = cl(1.f - wbTemp * kT + wbTint * kTt);
+        const float g = cl(1.f - wbTint * kG);
+        const float gains[4] = {r, g, g, b};   // {R, G_even, G_odd, B}
+        ACaptureRequest_setEntry_float(req, ACAMERA_COLOR_CORRECTION_GAINS, 4, gains);
+    } else {
+        // 非手动：awbOn=false → OFF；否则用用户选中的预设（awbMode，默认 AUTO=1）
+        uint8_t awb = static_cast<uint8_t>(awbOn ? (awbMode >= 1 ? awbMode : ACAMERA_CONTROL_AWB_MODE_AUTO)
+                                                 : ACAMERA_CONTROL_AWB_MODE_OFF);
+        ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AWB_MODE, 1, &awb);
+    }
 
     // 超广角直连物理摄像头时不写 ZOOM_RATIO：物理镜头本身就是最宽 FOV，写 <1.0 反而会让 HAL
     // 试图在物理请求上套用逻辑缩放、重新触发已损坏的融合管线；裁剪区默认取物理传感器全幅即可。
