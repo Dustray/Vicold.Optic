@@ -451,7 +451,12 @@ private:
     // 直方图
     int32_t histR_[64] = {}, histG_[64] = {}, histB_[64] = {};
     int32_t rawW_ = 4096, rawH_ = 3072;
-    bool fmtJpg_ = false;        // 拍摄格式：false=RAW/DNG true=JPEG（HUD 角标点按切换）
+    // 拍摄格式：false=RAW/DNG true=JPEG（HUD 角标点按切换）
+    // **默认必须是 true**：与 CameraEngine::jpgMode_ 的默认一致，也符合「默认出普通 JPG」。
+    // 曾为 false，导致 attach() 里 loadPersistedSettings() 解析到 fmt=raw 时 applyFmt(false)
+    // 撞上幂等守卫（false==false）不下发，随后又被 openCamera 的 setFmtJpg(jpgMode_=true)
+    // 校正回 true ⇒ 持久化的 RAW 被静默吞掉（2026-10-04 审出）。
+    bool fmtJpg_ = true;
     float chipFmtL_ = -1, chipFmtR_ = -1;   // RAW/JPG 角标热区（绘制时记录，设计坐标）
 
     // EV 双击归零判定（onDown 传事件时间，350ms 内同位置二击 = 双击）

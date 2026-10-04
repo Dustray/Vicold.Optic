@@ -262,7 +262,19 @@ bool Ui::attach(ANativeWindow* win) {
     return true;
 }
 
-void Ui::detach() { gl_.detach(); }
+void Ui::detach() {
+    gl_.detach();
+    // 传感器事件队列必须成对销毁：initLevel() 在**每次 attach()** 里 createEventQueue，
+    // detach 若不管，前后台/旋转反复切换会每轮泄漏一个队列——加速度计持续回调不仅
+    // 泄漏句柄，还会一直唤醒 CPU 白白耗电（2026-10-04 审出）。
+    if (snsQ_) {
+        if (snsAcc_) ASensorEventQueue_disableSensor(snsQ_, snsAcc_);
+        ASensorManager_destroyEventQueue(snsMgr_, snsQ_);
+    }
+    snsQ_ = nullptr;
+    snsAcc_ = nullptr;
+    snsMgr_ = nullptr;
+}
 
 void Ui::setExpAuto(bool isoAuto, bool ssAuto, int iso, int64_t expNs) {
     isoAuto_ = isoAuto;
@@ -372,7 +384,8 @@ void Ui::onDown(float x, float y, double tMs) {
     }
     markDirty();     // 任何触摸都改变覆盖层（格式/快门/AE 锁/拖拽起点），重烤
     hapStop_ = -1;   // 新触摸重置落档触感跟踪
-    // 面板打开：所有触摸由面板消费（命中控件→执行动作；命中面板外→关闭面板）。
+    // 面板打开：所有触摸由面板消费（命中关闭钮→关面板；命中控件→执行动作）。
+    // 面板已是全屏，没有「面板外」可点，落在空白处一律忽略（不再有点击外部关闭）。
     // 必须在其它控件命中之前短路，避免面板后面藏着的快门/对焦等被误触。
     if (panel_ != Panel::NONE) {
         handlePanelTap(x, y);
@@ -390,9 +403,9 @@ void Ui::onDown(float x, float y, double tMs) {
     // 热区存设计坐标（onDown 的 x/y 已是 toDesign 反变换后的设计值），上下各放宽 6px 好按
     if (chipFmtL_ > 0 && x >= chipFmtL_ && x <= chipFmtR_ &&
         y >= kHudY - 6 && y <= kHudY + kChipH + 6) {
-        bool nj = !fmtJpg_;
-        fmtJpg_ = nj;
-        pushCmd(Cmd::SET_FMT, nj ? 1.f : 0.f);   // 绝对语义（v>0.5=JPEG）
+        // 必须走 applyFmt()，不能直接改成员 + pushCmd：面板路径有幂等守卫与
+        // commitPersist，角标若绕开，开着持久化时从角标切的格式重启就丢（2026-10-04 审出）。
+        applyFmt(!fmtJpg_);
         hap_.click();
         return;
     }
@@ -1945,7 +1958,8 @@ void Ui::doAction(PAct act, int seg) {
 void Ui::applyFmt(bool jpg) {
     if (jpg == fmtJpg_) return;       // SET_FMT 绝对语义：仅值变化时下发
     fmtJpg_ = jpg;
-    pushCmd(Cmd::SET_FMT, jpg ? 1.f : 0.f);
+    markDirty();   // HUD 的 RAW/JPG 角标画在静态覆盖层里，不置脏就停在旧字样
+    pushCmd(Cmd::SET_FMT, jpg ? 1.f : 0.f);   // 绝对语义（v>0.5=JPEG）
     commitPersist();
 }
 
@@ -1985,8 +1999,11 @@ void Ui::applyAwbPreset(int idx) {
     if (idx < 0 || idx > 7) idx = 0;
     // markDirty 不可省：面板画在逐帧动态层，选中态不回写就不会重画 ⇒ 高亮停在旧档
     // （2026-10-03 真机：点「阴天」无反应，日志证明命中与分段都对，就是缺重画）。
-    // 幂等守卫同 applyAe/applyAwb：重复点同一档不重复下发。
-    if (idx == awbPreset_) return;
+    // 幂等守卫：**必须带上 awbOn_**。本函数有副作用（awbOn_ = true），守卫若只看档位，
+    // 关掉白平衡后再点**当前高亮那档**会被直接 return，白平衡仍是关的 ⇒ 用户视角
+    // 「点了没反应」（2026-10-04 审出）。档位没变但白平衡关着时，必须放行以重开。
+    // 通用教训：有副作用的 apply*，幂等守卫不能放在副作用之前。
+    if (idx == awbPreset_ && awbOn_) return;
     awbPreset_ = idx;
     awbOn_ = true;   // 选预设即打开白平衡
     pushCmd(Cmd::SET_WB_PRESET, float(idx));

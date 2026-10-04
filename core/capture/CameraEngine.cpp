@@ -942,11 +942,12 @@ void CameraEngine::applyControl(const std::string& k, const std::string& v, bool
         float f = std::atof(v.c_str());
         if (f != nearEnterM_) {
             nearEnterM_ = f;
-            nearCnt_ = farCnt_ = 0;
+            nearCnt_ = 0;
+            farCnt_ = 0;
             // 两种情况必须立即释放已锁存的近距态：① 关掉判定（f<=0，状态机
             // 不再运行，永远退不出）；② 新阈值已大于当前实测距离（状态机要重跑
-            // 十几帧才翻转，期间仍按旧接管点渲染）。lastFdUi_ 是最近一次 result
-            // 回读的屈光度（0 = 无效读数，此时不猜）。
+            // 十几帧才翻转，期间仍按旧接管点渲染）。lastFdDiopters_ 是最近一次
+            // result 回读的屈光度原子快照（0 = 无效读数，此时不猜）。
             const float lastFd = lastFdDiopters_.load(std::memory_order_acquire);
             const float lastM = lastFd > 1e-3f ? 1.f / lastFd : -1.f;
             if (nearSubject_ && (f <= 0.f || (lastM > 0.f && lastM >= f))) {
@@ -1221,7 +1222,8 @@ void CameraEngine::drainUiCmds() {
                 // 关 AE = 全手动（与滚轮拖到两端同义）：两侧都退出自动，用 AE on 期间冻结的
                 // lastAeIso_/lastAeExpNs_ 补成有效值 —— 曝光守恒，关 AE 前后亮度不变。
                 // 注意 recomputeMixed() 在双手动时**不填值**（它的补偿分支都以 isoAuto_/
-                // ssAuto_ 为条件），故这里显式补齐后再让它重算 EV 增益。开 AE 侧对称还原。
+                // ssAuto_ 为条件），故关 AE 分支显式补齐即可，不必再调它（EV 也已清零，
+                // 无增益可重算）。开 AE 侧才需要调：双自动分支会清零 iso/exp 交回硬件 AE。
                 const auto& tr = cam_.traits();
                 if (cmd.v > 0.5f) {
                     isoAuto_ = ssAuto_ = true;
@@ -1268,6 +1270,10 @@ void CameraEngine::drainUiCmds() {
                 if (raw_) {
                     raw_->setRingMode(cmd.v > 0.5f);
                     changed = true;
+                } else {
+                    // RAW 不可用时不能静默吞掉：UI 选中态已经变了，实际却没有对象承载，
+                    // 既无日志也无回推 ⇒ 表现为「面板能点、行为没变」且无从诊断。
+                    LOGW("raw unavailable, ring mode ignored (device=%s)", cam_.traits().id.c_str());
                 }
                 break;
             case ui::Ui::Cmd::SET_SAVE_QUOTA:
@@ -1516,7 +1522,8 @@ void CameraEngine::onFrameResult(const FrameResult& r) {
                 LOGI("subject far (%.2fm) -> tele switch back at %.2fx", distM, teleSwitch_);
             }
         } else {
-            nearCnt_ = farCnt_ = 0;
+            nearCnt_ = 0;
+            farCnt_ = 0;
         }
     }
 

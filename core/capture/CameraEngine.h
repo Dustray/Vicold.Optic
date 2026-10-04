@@ -253,8 +253,12 @@ private:
     int lastDispSlot_ = -1;     // 上次下发的 GL 显示 slot（变化才打日志）
     bool manualDisp_ = false;   // disp 诊断键手动锁定显示源（分带变化时才交还自动）
     // 近距状态机（onFrameResult 回调线程更新；翻转时置 bandDirty_ 让引擎线程重发请求）
-    bool nearSubject_ = false;
-    int nearCnt_ = 0, farCnt_ = 0;
+    // **三个状态都必须是 atomic**：写方是 NDK capture 回调线程，读方是引擎线程的
+    // applyControl / teleSwitchEff —— 普通 bool/int 跨线程读写是数据竞争（UB），
+    // 编译器优化下可能读到过期值，而它决定的正是分带接管点（2026-10-04 审出）。
+    // 与上一轮 lastFdDiopters_ 的处理保持一致。
+    std::atomic<bool> nearSubject_{false};
+    std::atomic<int> nearCnt_{0}, farCnt_{0};
     std::atomic<bool> bandDirty_{false};
 
     // 当前生效的长焦接管点：近距时推迟（长焦模组最小对焦距离之外，与系统相机一致）
