@@ -98,7 +98,11 @@ public:
     // 圆角矩形：填充 + 描边（borderA.a<=0 跳过描边）
     void roundedRect(float cx, float cy, float w, float h, float radius,
                      const Rgba& fill, const Rgba& border, float borderW);
-    // 批量纯色三角形（像素坐标）：网格线/直方图柱等，单次 draw 出一批，避免逐图元开销
+    // 批量纯色三角形（像素坐标）：网格线/直方图柱等，单次 draw 出一批，避免逐图元开销。
+    // **vertexCount 是顶点数，不是 float 个数**：内部直接喂给
+    // glDrawArrays(GL_TRIANGLES, 0, vertexCount)，传成 float 数会越界读到数组后面的
+    // 栈内存，画出来源不明的细长三角形（表现为屏幕上莫名多一条斜线）。
+    // 用 std::vector 攒点时统一写 `int(v.size() / 2)`；写死数组时数顶点个数。
     void triangles(const float* xy, int vertexCount, const Rgba& c);
     // 预览数字变焦（≥1）：与 cover 裁切同域相乘，中心放大取样。拖拽平滑变焦用 ——
     // 相机侧追赶期间由 GL 补齐 FOV 差值，收敛后恒回 1（无跳变）。

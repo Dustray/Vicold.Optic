@@ -1778,7 +1778,7 @@ void exposureIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& 
     const float R = r - bw * 0.5f;               // 内缩到描边内侧
     const int N = 14;
     float xy[14 * 2 * 3];
-    int n = 0;
+    int nv = 0;              // **顶点数**（不是 float 个数：triangles 第二参数是顶点数）
     for (int i = 0; i < N; ++i) {
         const float a0 = 3.14159265f + float(i) * 3.14159265f / float(N);
         const float a1 = 3.14159265f + float(i + 1) * 3.14159265f / float(N);
@@ -1786,10 +1786,10 @@ void exposureIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& 
         const float p[6] = {cx, cy,
                             cx + std::cos(a0) * R, cy + std::sin(a0) * R,
                             cx + std::cos(a1) * R, cy + std::sin(a1) * R};
-        std::memcpy(xy + n, p, sizeof(p));
-        n += 6;
+        std::memcpy(xy + nv * 2, p, sizeof(p));
+        nv += 3;
     }
-    gl.triangles(xy, n, c);
+    gl.triangles(xy, nv, c);
 }
 
 // 关闭图标：圆底 + 两根 ±45° 交叉条（画笔无法旋转，斜条用细长三角形拼）。
@@ -1810,7 +1810,7 @@ void closeIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& c) 
             cx + ca * L - sa * t, cy + sa * L + ca * t,      // C
             cx - ca * L - sa * t, cy - sa * L + ca * t,      // D
         };
-        gl.triangles(p, 12, c);
+        gl.triangles(p, 6, c);      // 6 顶点（2 个三角形）—— 不是 12 个 float
     }
 }
 
@@ -1832,29 +1832,30 @@ void strokeSeg(std::vector<float>& v, float x0, float y0, float x1, float y1, fl
 // —— 单靠颜色在强光下读不出，且色弱用户分不开：
 //   关 = 闪电被斜杠划断；自动 = 右下角 "A"；开 = 纯闪电；常亮 = 闪电 + 四向短芒。
 // 2026-10-04 重画：原实现是「三段笔画 + 转折处补方块」，横摆只有 ±0.2r、笔画细，
-// 缩到 60px 圆钮里读作一条细长的裂纹/Z，不像闪电。改成一整块填充多边形
-//（横摆 ±0.52r、纵跨 ±1.0r），轮廓连续、无拼接缝，才是通用的闪电符号。
+// 缩到 60px 圆钮里读作一条细长的裂纹/Z，不像闪电。改成一条闭合轮廓（横摆 ±0.50r、
+// 纵跨 ±0.95r）内部分块填充，轮廓连续、无拼接缝，才是通用的闪电符号。
 // 坐标：与 roundedRect / text 同一套（**y 向下为正**，shader 负责 Y 翻转）。
 void flashIcon(Gl& gl, float cx, float cy, float r, float scale, int mode, const Rgba& c) {
-    // 闪电轮廓 6 顶点（y 向下为正）：顶尖 → 左腰尖 → 腰内角 → 底尖 → 右下尖 → 右腰内角
-    const float P[12] = {
-        cx + 0.30f * r, cy - 1.00f * r,     // 0 顶尖（略偏右）
-        cx - 0.52f * r, cy - 0.10f * r,     // 1 左腰尖
-        cx + 0.02f * r, cy - 0.10f * r,     // 2 腰内角
-        cx - 0.30f * r, cy + 1.00f * r,     // 3 底尖（略偏左）
-        cx + 0.52f * r, cy + 0.10f * r,     // 4 右下尖
-        cx + 0.02f * r, cy + 0.10f * r,     // 5 右腰内角
+    // 闪电 6 个轮廓点（y 向下为正）：A 顶尖 / B 左腰尖 / C 上段内凹角（右） /
+    // D 底尖 / E 右腰尖 / F 下段内凹角（左）。
+    // **绕行顺序必须是 A→B→F→D→E→C**：C 和 F 是两个内凹点，若按 A→B→C→D→E→F
+    // 连接（C、F 相邻）多边形会自交成蝴蝶结 —— 上一版就是这么错的，看起来"怪怪的"。
+    const float AX = cx + 0.32f * r, AY = cy - 0.88f * r;
+    const float BX = cx - 0.58f * r, BY = cy - 0.10f * r;
+    const float CX = cx + 0.02f * r, CY = cy - 0.10f * r;
+    const float DX = cx - 0.32f * r, DY = cy + 0.88f * r;
+    const float EX = cx + 0.58f * r, EY = cy + 0.10f * r;
+    const float FX = cx + 0.02f * r, FY = cy + 0.10f * r;
+    // 固定剖分（多边形非凸，**不能**用扇形三角化：扇心取 A 时对角线 A→D 会跑到
+    // 轮廓外，多画出一块）：上段三角(A,B,C) + 中段斜四边形(B,C,E,F) + 下段三角(D,E,F)，
+    // 四边形本身是凸的，拆 (B,C,E),(B,E,F) 安全。相邻块共边（B-C / E-F）不留缝。
+    const float tri[24] = {
+        AX, AY, BX, BY, CX, CY,
+        BX, BY, CX, CY, EX, EY,
+        BX, BY, EX, EY, FX, FY,
+        DX, DY, EX, EY, FX, FY,
     };
-    // 扇形三角化：以顶点 0 为扇心，(0,1,2) (0,2,3) (0,3,4) (0,4,5)
-    float tri[24];
-    for (int t = 0; t < 4; ++t) {
-        const int idx[3] = {0, t + 1, t + 2};
-        for (int k = 0; k < 3; ++k) {
-            tri[t * 6 + k * 2] = P[idx[k] * 2];
-            tri[t * 6 + k * 2 + 1] = P[idx[k] * 2 + 1];
-        }
-    }
-    gl.triangles(tri, 24, c);
+    gl.triangles(tri, 12, c);      // 12 顶点（4 个三角形）—— 不是 24 个 float
 
     if (mode == 0) {
         // 关：一道斜杠划断闪电。双层描边（近黑粗底 + 亮色细芯），与构图辅助线同一
