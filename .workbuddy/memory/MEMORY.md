@@ -98,7 +98,8 @@
 ## 真机调试铁律（血泪）
 - **绝不 force-stop/-S 本 app**：MIUI 把 component 置 disabled（无 root 无解）；恢复链见 2026-10-01.md
 - 杀后台可靠组合：`am stack remove <tid>` → `am kill`（单用常静默不杀）；冷重启=HOME→等 8-12s→am kill→am start
-- **`input tap` 可靠、`input swipe` 不派发**（吞零位移）；双击必须单 shell `input tap A; sleep 0.15; input tap A`；
+- **`input tap` 可靠；`input swipe` 吞零位移，但有位移+duration 的 swipe 会正常派发**
+  （2026-10-05 真机证实可用于拖拽自动化验证，15-20ms 连续 MOVE 流）；双击必须单 shell `input tap A; sleep 0.15; input tap A`；
   design→screen 换算读启动日志 `ui attached: win=WxH scale=S off=(ox,oy)`
 - 截图：`MSYS_NO_PATHCONV=1; screencap -p`（不带 -d）；截图可远程诊断 UI
 - **adb daemon 会被反复杀**：日志与 tap 事件大量丢失，误判成"功能失效"。

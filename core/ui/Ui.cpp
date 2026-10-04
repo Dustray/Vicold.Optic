@@ -747,6 +747,18 @@ void Ui::onMove(float x, float y) {
             hapticTickStop(int(std::lround((ev_ - evMinEv_) / evStepEv_)));   // 跨步触感
             break;   // 命令延到 onUp 下发
         }
+        case Drag::WBPAD: {
+            // 坐标板拖动：绝对映射，手指在哪选哪，拖出矩形外 clamp 到边缘（最大偏移）。
+            // 实时跟手，但不每帧写盘（落盘交给 onUp）。
+            for (auto& c : ctlRects_) {
+                if (c.act != int(A_WBPAD)) continue;
+                const float temp = std::clamp((x - c.x) / c.w * 2.f - 1.f, -1.f, 1.f);
+                const float tint = std::clamp((0.5f - (y - c.y) / c.h) * 2.f, -1.f, 1.f);
+                applyWbManual(temp, tint, /*persist=*/false);
+                break;
+            }
+            break;
+        }
         default: break;
     }
     markDirty();     // 拖拽中 zoom/iso/ss/ev 实时变化，覆盖层需重烤
@@ -796,6 +808,11 @@ void Ui::onUp(float x, float y) {
             ev_ = std::clamp(std::round(ev_ / st) * st, evMinEv_, evMaxEv_);
             if (std::fabs(ev_) < st * 0.5f) ev_ = 0;
             pushCmd(Cmd::SET_EV, ev_);
+            break;
+        }
+        case Drag::WBPAD: {
+            // 拖动结束：落盘持久化（拖拽中的实时更新未写盘，见 onMove）。
+            commitPersist();
             break;
         }
         default: break;
@@ -2129,7 +2146,9 @@ void Ui::handlePanelTap(float x, float y) {
         if (inR(x, y, c.x, c.y, c.w, c.h)) {
             if (c.act == int(A_WBPAD)) {
                 // 把面板坐标映射到 [-1,1] 双轴：左=冷/蓝、右=暖/琥珀（色温 X）；
-                // 上=品红、下=绿（色调 Y）。点哪选哪（无拖拽也成立）。
+                // 上=品红、下=绿（色调 Y）。按下即进入拖动模式：定位到按下点并开始
+                // 跟手滑动（onMove 实时更新，onUp 落盘）；未移动则等价于点选定位。
+                drag_ = Drag::WBPAD;
                 const float temp = std::clamp((x - c.x) / c.w * 2.f - 1.f, -1.f, 1.f);
                 const float tint = std::clamp((0.5f - (y - c.y) / c.h) * 2.f, -1.f, 1.f);
                 applyWbManual(temp, tint);
@@ -2163,8 +2182,8 @@ void Ui::doAction(PAct act, int seg) {
     buildCtlRects();   // 刷新选中态显示
 }
 
-void Ui::applyWbManual(float temp, float tint) {
-    // 进入手动偏移：接管 AWB（关闭），预设回落 AUTO。点选坐标板即时生效，
+void Ui::applyWbManual(float temp, float tint, bool persist) {
+    // 进入手动偏移：接管 AWB（关闭），预设回落 AUTO。点选/拖动坐标板即时生效，
     // 与「自动白平衡 / 白平衡预设」互斥 —— 选预设或开 AWB 会清掉本标志（见 applyAwb/applyAwbPreset）。
     wbManual_ = true;
     awbOn_ = false;
@@ -2173,7 +2192,7 @@ void Ui::applyWbManual(float temp, float tint) {
     wbTint_ = tint;
     markDirty();          // 坐标板与上方开关的选中态都在动态层，不置脏不重画
     pushCmd(Cmd::SET_WB_MANUAL, temp, tint);   // v=色温 temp, v2=色调 tint
-    commitPersist();
+    if (persist) commitPersist();   // 拖动中由 onMove 高频调用，落盘延到 onUp 统一做
 }
 
 void Ui::applyFmt(bool jpg) {

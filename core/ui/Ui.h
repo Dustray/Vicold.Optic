@@ -296,7 +296,7 @@ private:
     void applyAe(bool on);
     void applyAwb(bool on);
     void applyAwbPreset(int idx);
-    void applyWbManual(float temp, float tint);   // 白平衡手动 2D 坐标板：temp=色温 tint=色调，[-1,1]
+    void applyWbManual(float temp, float tint, bool persist = true);   // 白平衡手动 2D 坐标板：temp=色温 tint=色调，[-1,1]；persist=false 时仅实时更新不下盘（拖拽中用）
     void applyFlash(int mode);     // 闪光灯档位 0关 1自动 2开 3常亮
     void applySleep(int sel);      // 自动休眠档位（kSleepVals 下标；0 = 永不）
     void commitPersist();          // 若开启持久化则写 settings.txt
@@ -414,7 +414,7 @@ private:
     int previewSlots_ = 1;      // 常驻预览源数（机型层 SessionPolicy.previewSlots）
 
     // 触摸
-    enum class Drag { NONE, ZOOM, ISO, SS, EV } drag_ = Drag::NONE;
+    enum class Drag { NONE, ZOOM, ISO, SS, EV, WBPAD } drag_ = Drag::NONE;
     bool shutterDown_ = false;
     // 触摸对焦：onDown 落在预览区且未命中任何控件即触发（按下即下发，不等抬手）。
     // 保留按下坐标做位移判定（后续可能用于"按住锁焦"等手势）。
