@@ -133,11 +133,16 @@ constexpr float kIconD = 60;                                    // 图标按钮�
 // 设置：左侧变焦导轨顶部（轨道 kZoomTrackY=130 / 读数行 kReadoutY=100 之上），
 // 圆心 x=128 与导轨中线 (88+168)/2 对齐；cy=48 使图标占 y 18..78，与读数行留 22px。
 constexpr float kSetIconX = 128, kSetIconY = 48;
-// 曝光：右导轨顶部、快门（kShutterY=318）正上方，与 AE 锁（kAeLockY=238）无冲突。
-constexpr float kExpIconX = 1456, kExpIconY = 80;
-// 闪光灯（2026-10-04）：曝光图标**左侧**同排同尺寸，圆心间距 80（两圆边缘留 20px）。
-// 左缘 1346 仍在右导轨内（kRailRX=1156），不与 ISO/SS 滚轮读数行冲突。
-constexpr float kFlashIconX = 1376, kFlashIconY = 80;
+// 曝光白平衡 / 闪光灯（2026-10-04 用户要求改位）：**分别放到右侧两条滑轨的正上方**，
+// 圆心 x 与各自滑轨中线对齐 ——
+//   闪光灯 → ISO 滑轨（kIsoTrackX=1166 宽 100 → 中线 1216）
+//   曝光白平衡 → SS 滑轨（kSsTrackX=1280 宽 100 → 中线 1330）
+// 原位于快门上方同排（x1376/1456）挤在导轨偏右且与快门区视觉粘连，改到滑轨上方后
+// 「哪个按钮管哪条滑轨」一眼可读，也更靠近它调节的对象。
+// cy=48 使图标占 y 18..78：在滑轨读数行（kReadoutY=100）之上留 22px，
+// 与左侧设置图标（kSetIconY=48）同排——顶部三个入口视觉基线一致。
+constexpr float kExpIconX = 1330, kExpIconY = 48;
+constexpr float kFlashIconX = 1216, kFlashIconY = 48;
 // 命中热区在图标外扩 8px（与快门/AE 锁同口径：视觉边缘点按常差几像素落空）
 constexpr float kIconHitPad = 8.f;
 // 闪光灯档位名（settings.txt 落盘用；解析时同时接受数字 0..3，便于手写调试）

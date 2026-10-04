@@ -65,8 +65,8 @@ pandora 返回：竖屏顶中 `Rect(573,0-647,150)`、`cutoutSpec="M 0,0 H -37 V
 | 快门 | `kShutterX/Y/D` | 1410 / 318 / 106 |
 | 测光锁 | `kAeLockY/D` | 238 / 54 |
 | 设置入口（齿轮） | `kSetIconX/Y` / `kIconD` | **128** / 48 / 60（左变焦导轨正上方，x 与导轨中线对齐）|
-| 曝光白平衡入口 | `kExpIconX/Y` / `kIconD` | 1456 / 80 / 60（右导轨顶部、快门正上方）|
-| 闪光灯入口 | `kFlashIconX/Y` / `kIconD` | 1376 / 80 / 60（曝光图标**左侧**同排，圆心间距 80，边缘留 20）|
+| 曝光白平衡入口 | `kExpIconX/Y` / `kIconD` | **1330** / 48 / 60（SS 滑轨正上方，x 与滑轨中线 1330 对齐）|
+| 闪光灯入口 | `kFlashIconX/Y` / `kIconD` | **1216** / 48 / 60（ISO 滑轨正上方，x 与滑轨中线 1216 对齐）|
 | 快速变焦圆钮 | `kQzX` / `kQzD` / `kQzY0` / `kQzGap` | 234 / 60 / 180 / 22（自上而下 5·2·1·0.7）|
 | 面板内容区 | `kPanelTopY` / `kPanelBotY` | 104 / 690（全屏面板内内容块的垂直居中区间）|
 | 面板行 | `kPanelRowH` / `kPanelHeadH` / `kPanelCtlH` | 64 / 44 / 48 |
