@@ -10,6 +10,9 @@
 #include <fstream>
 #include <vector>
 
+#include <android/looper.h>
+#include <android/sensor.h>
+
 namespace optic::ui {
 
 // ISO：2026-09-30 用户指定 23 档（50–12800，含非整档 1200、跳过 5000）
@@ -64,7 +67,13 @@ constexpr Rgba kTrack{1, 1, 1, 0.08f};
 constexpr Rgba kTrackLine{1, 1, 1, 0.35f};
 constexpr Rgba kTickMajor{1, 1, 1, 0.55f};
 constexpr Rgba kTickMinor{1, 1, 1, 0.30f};
-constexpr Rgba kGrid{1, 1, 1, 0.12f};
+// 构图辅助线（网格 / 安全框 / 水平仪中心十字）统一走「近黑描边 + 亮白芯线」双层。
+// **不要退回单层低 alpha 白**：预览画面明暗跨度极大，12% 白在亮场景（白墙/天空/
+// 高光桌面）上完全不可见——用户会报「开关网格线都没反应」，实际是画了但看不见
+// （2026-10-04 真机截图确诊：预览是亮桌面，kGrid 0.12 白完全隐没）。
+// 近黑描边在暗背景上给对比、亮白芯线在暗背景上给亮度 ⇒ 明暗双向可读。
+constexpr Rgba kGridEdge{0, 0, 0, 0.55f};
+constexpr Rgba kGridCore{1, 1, 1, 0.85f};
 constexpr Rgba kPanel{0, 0, 0, 0.45f};
 constexpr Rgba kWhite{1, 1, 1, 1};
 constexpr Rgba kNone{0, 0, 0, 0};
@@ -112,6 +121,61 @@ constexpr float kShutterX = 1410, kShutterY = 318, kShutterD = 106;
 constexpr float kAeLockD = 54;                // 测光锁定按钮（快门上方圆形）
 constexpr float kAeLockY = 238;               // 圆顶（与快门间距 26）
 constexpr float kUiZoom = 1.5f;               // UI 整体放大系数：文字 / 按钮 / 滑块统一放大
+
+// ---- 两个入口按钮（2026-10-03：设置 / 曝光白平衡；2026-10-04 改图标）----
+// 均为**纯图标**圆形按钮（无文字），直径 kIconD，靠画几何图形表意：
+//   设置 = 齿轮；曝光白平衡 = 半黑半白圆（曝光/白平衡的通用符号）。
+// 尺寸与位置（2026-10-04 用户要求）：
+//   设置：移到**左侧变焦导轨正上方**（导轨 x 88..168，顶 y=0），圆心 x 与导轨中线对齐；
+//         不再压在预览画面上（原先落在预览内 x190，被背景干扰且挡画面）。
+//   曝光白平衡：右导轨顶部、快门正上方，圆形，直径与设置一致（原 246×54 太大）。
+constexpr float kIconD = 60;                                    // 图标按钮直径
+// 设置：左侧变焦导轨顶部（轨道 kZoomTrackY=130 / 读数行 kReadoutY=100 之上），
+// 圆心 x=128 与导轨中线 (88+168)/2 对齐；cy=48 使图标占 y 18..78，与读数行留 22px。
+constexpr float kSetIconX = 128, kSetIconY = 48;
+// 曝光：右导轨顶部、快门（kShutterY=318）正上方，与 AE 锁（kAeLockY=238）无冲突。
+constexpr float kExpIconX = 1456, kExpIconY = 80;
+// 命中热区在图标外扩 8px（与快门/AE 锁同口径：视觉边缘点按常差几像素落空）
+constexpr float kIconHitPad = 8.f;
+
+// ---- 快速整数倍变焦按钮（2026-10-03 用户要求）----
+// 竖排 4 枚圆形按钮，铺在**预览区内**、左变焦导轨右缘（kRailREnd=168）之外 ——
+// 即"变焦的右侧、预览区域里"。点按直接落到指定倍率，不必拖导轨。
+// 纵向占位 180..486：避开顶部 HUD 角标行（kHudY=16..42）与底部 EV 面板
+// （kEvPanelY=622..706，且其左缘 202 与本列 x 区间重叠），居中于预览高度。
+// 排列自上而下为 5 / 2 / 1 / 0.7（倍率递减，与左导轨同向，见 kQzVals 注释）。
+constexpr float kQzX = 234, kQzD = 60, kQzY0 = 180, kQzGap = 22;
+
+
+// ---- 设置 / 曝光白平衡 面板（2026-10-04 改全屏）----
+// 改全屏的动因：原 760×~600 小盒里控件只有 336 宽，8 段白平衡预设每段仅 42px，
+// 文字挤在一起（用户反馈"内容太紧凑"）。全屏后控件宽 720，每段 90px。
+// **关闭按钮复用入口图标位**：设置面板在左上、曝光面板在右上 —— 入口在哪，
+// 关闭就在哪，肌肉记忆一致。面板全屏后没有"外部"可点，故不再有"点外部关闭"。
+constexpr float kPanelPadL  = 150;    // 行标签左缘
+constexpr float kPanelCtlR  = 1410;   // 分段控件右缘
+constexpr float kPanelCtlW  = 720;    // 分段控件宽（右对齐到 kPanelCtlR）
+constexpr float kPanelCtlH  = 48;     // 控件高
+constexpr float kPanelHeadH = 44;     // 分组标题行高
+constexpr float kPanelRowH  = 64;     // 普通行高（控件上下各留 8px）
+constexpr float kPanelTopY  = 104;    // 内容区顶（让开标题带）
+constexpr float kPanelBotY  = 690;    // 内容区底
+
+
+// 白平衡预设标签（下标 → 显示名）；下标→Android AWB_MODE 枚举值的映射在
+// CameraEngine::drainUiCmds 的 kEnum[8] 中（避免 UI 层依赖 camera2 枚举细节）
+static const char* kAwbLabels[8] = {"自动", "日光", "阴天", "白炽", "荧光", "暖荧", "暮光", "阴影"};
+// 快速整数倍变焦按钮（0.7 / 1 / 2 / 5 —— 用户指定这四档）
+// **自上而下按倍率递减**：5 → 2 → 1 → 0.7，与左侧变焦导轨方向一致
+// （导轨是长焦在上、专业相机惯例；2026-10-04 用户指出圆钮列方向反了）。
+// 绘制与命中（quickZoomHit）都按 i 递增遍历，故只需倒序这一处数组。
+static const float kQzVals[4] = {5.0f, 2.0f, 1.0f, 0.7f};
+static const char* kQzLabels[4] = {"5", "2", "1", "0.7"};
+static const char* kFmtOpts[2] = {"RAW", "JPG"};
+static const char* kOnOff[2] = {"关", "开"};
+static const char* kRingOpts[2] = {"环形", "单次"};
+static const char* kQuotaOpts[4] = {"1", "4", "8", "不限"};
+static const int kQuotaVals[4] = {1, 4, 8, 0};
 } // namespace layout
 
 using namespace layout;
@@ -192,6 +256,9 @@ bool Ui::attach(ANativeWindow* win) {
     dirty_ = true;   // 尺寸/布局变化后覆盖层必须重烤
     LOGI("ui attached: win=%dx%d scale=%.3f off=(%.0f,%.0f)", gl_.width(), gl_.height(),
          scale_, offX_, offY_);
+    // 电子水平仪 + 持久化设置加载（均在 glue 线程，attach 已完成、dataDir_ 已就绪）
+    initLevel();
+    loadPersistedSettings();
     return true;
 }
 
@@ -261,8 +328,14 @@ void Ui::pushZoomLive(float camTarget) {
 void Ui::onInputEvent(AInputEvent* e) {
     if (AInputEvent_getType(e) != AINPUT_EVENT_TYPE_MOTION) return;
     int32_t action = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK;
-    // 多指时只跟第一根，避免拖拽指针跳变
-    if (AMotionEvent_getPointerCount(e) < 1) return;
+    // 多指时整体忽略（含后续 move）：双指捏合的第一根手指动作会被当成一次点按，
+    // 在预览区里就是莫名其妙的多余对焦。当前 UI 没有多指手势，直接放弃整次多指输入，
+    // 并中断进行中的拖拽（避免第二根手指按下后前一根继续拖值）。
+    if (AMotionEvent_getPointerCount(e) != 1) {
+        drag_ = Drag::NONE;
+        shutterDown_ = false;
+        return;
+    }
     float x = toDesignX(AMotionEvent_getX(e, 0));
     float y = toDesignY(AMotionEvent_getY(e, 0));
     switch (action) {
@@ -276,14 +349,36 @@ void Ui::onInputEvent(AInputEvent* e) {
 }
 
 void Ui::onDown(float x, float y, double tMs) {
+    // 休眠态：任意触摸只发 WAKE 唤醒命令，不执行任何操作（避免唤醒瞬间误触发快门/对焦）。
+    // 引擎收到 WAKE 即重发 repeating 恢复预览，并把后续触摸照常处理。
+    if (sleeping_) {
+        pushCmd(Cmd::WAKE, 1.f);
+        hap_.tick();
+        return;
+    }
     markDirty();     // 任何触摸都改变覆盖层（格式/快门/AE 锁/拖拽起点），重烤
     hapStop_ = -1;   // 新触摸重置落档触感跟踪
+    // 面板打开：所有触摸由面板消费（命中控件→执行动作；命中面板外→关闭面板）。
+    // 必须在其它控件命中之前短路，避免面板后面藏着的快门/对焦等被误触。
+    if (panel_ != Panel::NONE) {
+        handlePanelTap(x, y);
+        return;
+    }
+    // 两个入口图标按钮（无面板时可见可点）。圆形命中 = 圆心距 ≤ 半径+外扩，
+    // 与快速变焦圆钮 quickZoomHit 同一口径（比方框判定更贴合圆形视觉）。
+    if (std::hypot(x - kSetIconX, y - kSetIconY) <= kIconD / 2 + kIconHitPad) {
+        openPanel(Panel::SETTINGS); hap_.click(); return;
+    }
+    if (std::hypot(x - kExpIconX, y - kExpIconY) <= kIconD / 2 + kIconHitPad) {
+        openPanel(Panel::EXPOSURE); hap_.click(); return;
+    }
     // RAW/JPG 格式角标（预览左上第一枚）：点按切换拍摄格式（引擎重建会话 ~300ms）。
     // 热区存设计坐标（onDown 的 x/y 已是 toDesign 反变换后的设计值），上下各放宽 6px 好按
     if (chipFmtL_ > 0 && x >= chipFmtL_ && x <= chipFmtR_ &&
         y >= kHudY - 6 && y <= kHudY + kChipH + 6) {
-        fmtJpg_ = !fmtJpg_;
-        pushCmd(Cmd::SET_FMT, 1.f);
+        bool nj = !fmtJpg_;
+        fmtJpg_ = nj;
+        pushCmd(Cmd::SET_FMT, nj ? 1.f : 0.f);   // 绝对语义（v>0.5=JPEG）
         hap_.click();
         return;
     }
@@ -375,6 +470,13 @@ void Ui::onDown(float x, float y, double tMs) {
             return;
         }
     }
+    // 直方图（预览右上）：它是唯一铺设在预览区里的大块非交互 UI，点上去既会在直方
+    // 图上盖一个对焦框（遮挡读数），也没有任何测光意义 —— 与模式按钮一样做热区排除。
+    {
+        const float hxL = kPreviewX + kPreviewW - 16 - kHistW;
+        if (x >= hxL - 8 && x <= hxL + kHistW + 8 && y >= kHistY - 8 && y <= kHistY + kHistH + 8)
+            return;
+    }
     // 点按模式按钮（预览右上角）：点击即对焦 → 仅选位置 → 对焦并拍照，循环。
     // 必须在预览区判定之前命中（否则会被当成一次对焦点按）。热区四周放宽（按钮窄，
     // 按视觉边缘点经常差几像素落空 —— 2026-10-02 真机：视觉 1028 起，点 1023 落空）。
@@ -383,33 +485,69 @@ void Ui::onDown(float x, float y, double tMs) {
         tapMode_ = TapMode((int(tapMode_) + 1) % 3);
         // 切模式不清除已选框：仅选位置定下的框恒常驻（统计区域仍在生效），
         // 其他模式的动画框走自己的时长自然收尾。
-        shotAfterFocus_ = false;
-        shotAfterFocusT0_ = -1;
+        shotAfterFocus_.store(false, std::memory_order_release);
+        shotAfterFocusT0_.store(-1, std::memory_order_release);
         LOGI("tap mode -> %d", int(tapMode_));
         hap_.click();
         markDirty();
         return;
+    }
+    // 快速整数倍变焦（预览区内、变焦导轨右侧竖排圆钮）：必须在预览区触摸对焦
+    // 判定之前短路，否则点按钮会在预览区盖一个对焦框。圆钮是"当前值高亮"，
+    // 属静态覆盖层内容，点完靠 onDown 开头已有的 markDirty() 重烤。
+    {
+        const int qi = quickZoomHit(x, y);
+        if (qi >= 0) {
+            applyQuickZoom(qi);
+            return;
+        }
     }
     // 触摸对焦候选：落在预览区且上方所有控件都未命中。**按下即刻触发**（不等抬手）——
     // 抬手才处理会白吃一整个按压时长（手指抬起 80~150ms），用户直接读成"点了没反应"。
     // 预览区本身没有任何拖拽手势（变焦/ISO/SS/EV/快门都在各自热区且已 return），
     // 从预览区下滑不会引发别的操作，故不存在误触发。
     if (inR(x, y, kPreviewX, kPreviewY, kPreviewW, kPreviewH)) {
+        // 双击 = 取消指定点：区域一粘到底就再也回不到默认评价测光（审查 P2-6）。
+        // 第一击照常对焦（即时反馈优先），第二击整组清空 AF/AE 区域并撤掉常驻框。
+        if (tMs - lastPreviewTapMs_ < 350.0 &&
+            std::hypot(x - lastPreviewTapX_, y - lastPreviewTapY_) < 40.f) {
+            lastPreviewTapMs_ = -1e3;   // 复位，防三击连触
+            clearTapFocus();
+            return;
+        }
+        lastPreviewTapMs_ = tMs;
+        lastPreviewTapX_ = x;
+        lastPreviewTapY_ = y;
         tapDownX_ = x;
         tapDownY_ = y;
         fireTapFocus(x, y);
     }
 }
 
+// 清除触摸区域：回默认（全画面评价测光 + 连续追焦），UI 上连常驻框一起撤掉。
+void Ui::clearTapFocus() {
+    LOGI("tap: double tap -> clear ROI (default metering)");
+    pushCmd(Cmd::TAP_FOCUS, 0.f, 0.f, 3.f);   // mode 3 = 清区域（见 CameraEngine）
+    afBoxT0_ = -1;
+    afBoxSticky_ = false;
+    afFocusedAt_ = -1;
+    shotAfterFocus_.store(false, std::memory_order_release);
+    shotAfterFocusT0_.store(-1, std::memory_order_release);
+    hap_.click();
+}
+
 // AF 状态回显（引擎每帧回传）：合焦时若处于"对焦并拍照"模式，立刻按快门。
-void Ui::setAfState(int s) {
+// roiLive = false 表示新 ROI 还没被 HAL 回显采用，此时的"合焦"是旧区域的结论，
+// 不能据此触发快门（FocusShot 会拍在错误的对焦区上，审查 P2-8）。
+// shotAfterFocus_ 是两个线程共写的：exchange 保证只可能有一个线程走到 pushCmd。
+void Ui::setAfState(int s, bool roiLive) {
     afState_.store(s, std::memory_order_relaxed);
-    if (shotAfterFocus_ && (s == 2 || s == 4)) {   // PASSIVE_FOCUSED / FOCUSED_LOCKED
-        shotAfterFocus_ = false;
-        shotAfterFocusT0_ = -1;
-        LOGI("tap mode: focused -> shutter");
-        pushCmd(Cmd::SHOT, 0.f);
-    }
+    if (!roiLive) return;
+    if (s != 2 && s != 4) return;                   // PASSIVE_FOCUSED / FOCUSED_LOCKED
+    if (!shotAfterFocus_.exchange(false, std::memory_order_acq_rel)) return;
+    shotAfterFocusT0_.store(-1, std::memory_order_release);
+    LOGI("tap mode: focused -> shutter");
+    pushCmd(Cmd::SHOT, 0.f);
 }
 
 // 触摸对焦落地下发：位置换算成预览区占比，同时起对焦框动画 + 轻触感。
@@ -423,11 +561,25 @@ void Ui::fireTapFocus(float x, float y) {
     afBoxY_ = y;
     afBoxT0_ = nowSec();
     afFocusedAt_ = -1;   // 新一轮对焦：重新等待合焦回显
-    shotAfterFocus_ = (tapMode_ == TapMode::FocusShot);
-    shotAfterFocusT0_ = shotAfterFocus_ ? nowSec() : -1.;
+    shotAfterFocus_.store(tapMode_ == TapMode::FocusShot, std::memory_order_release);
+    shotAfterFocusT0_.store(tapMode_ == TapMode::FocusShot ? nowSec() : -1.,
+                            std::memory_order_release);
     afBoxSticky_ = (tapMode_ == TapMode::LockPos);   // 仅选位置：白框常驻不消失
     hap_.tick();
-    markDirty();
+    // 宽高比断言（低频）：整套坐标换算（fx/fy → active array）假设预览流铺满预览矩形
+    // 且两者宽高比一致（现均 4:3）。机型层改分辨率或改预览矩形后会静默错位 —— 点按位置
+    // 整体偏移且日志看不出，故留一条低频提示。
+    {
+        const int pw = gl_.previewW(0), ph = gl_.previewH(0);
+        if (pw > 0 && ph > 0) {
+            const float src = float(pw) / float(ph);
+            const float dst = kPreviewW / kPreviewH;
+            static int warns = 0;
+            if (std::fabs(src - dst) > 0.02f && warns++ < 3)
+                LOGW("tap coords: preview %dx%d (%.3f) vs rect %.3f - aspect mismatch!",
+                     pw, ph, src, dst);
+        }
+    }
 }
 
 // 刻度落档触感：拖动跨到新档位时 tick 一次。id<0 = 离开吸附带（先复位，
@@ -714,19 +866,29 @@ void Ui::drawRollerH(float tx, float ty, float tw, float th, float curF,
 
 void Ui::drawGrid(float x, float y, float w, float h) {
     if (!gridOn_) return;
-    std::vector<float> v;
-    const float t = std::max(dim(1), 1.f);
+    // 线宽：设计 1px 太细，在 2656 宽屏 + scale_ 放大后也仅约 1.7 物理 px，
+    // 半透明叠加后几乎无对比。取 1.6 设计 px 保底 2 物理 px，双层再各加 0.8 描边。
+    const float t = std::max(dim(1.6f), 2.f);
+    const float e = std::max(dim(0.9f), 1.f);   // 描边单侧外扩
+    std::vector<float> v, edge;
+    // 一个轴对齐矩形（两三角形）
+    auto quad = [&](std::vector<float>& dst, float rx, float ry, float rw, float rh) {
+        const float q[12] = {rx, ry, rx + rw, ry, rx, ry + rh,
+                             rx + rw, ry, rx + rw, ry + rh, rx, ry + rh};
+        dst.insert(dst.end(), std::begin(q), std::end(q));
+    };
     for (int i = 1; i <= 2; ++i) {                       // 竖线：x = w/3, 2w/3
-        float px = x + w * i / 3.f - t / 2;
-        float q[12] = {px, y, px + t, y, px, y + h, px, y + h, px + t, y, px + t, y + h};
-        v.insert(v.end(), std::begin(q), std::end(q));
+        const float px = x + w * i / 3.f;
+        quad(edge, px - t / 2 - e, y, t + 2 * e, h);
+        quad(v, px - t / 2, y, t, h);
     }
     for (int i = 1; i <= 2; ++i) {                       // 横线：y = h/3, 2h/3
-        float py = y + h * i / 3.f - t / 2;
-        float q[12] = {x, py, x + w, py, x, py + t, x, py + t, x + w, py, x + w, py + t};
-        v.insert(v.end(), std::begin(q), std::end(q));
+        const float py = y + h * i / 3.f;
+        quad(edge, x, py - t / 2 - e, w, t + 2 * e);
+        quad(v, x, py - t / 2, w, t);
     }
-    gl_.triangles(v.data(), int(v.size() / 2), kGrid);
+    if (!edge.empty()) gl_.triangles(edge.data(), int(edge.size() / 2), kGridEdge);
+    gl_.triangles(v.data(), int(v.size() / 2), kGridCore);
 }
 
 void Ui::drawHistogram(float x, float y, float w, float h) {
@@ -900,60 +1062,14 @@ void Ui::drawPreviewOverlay() {
     const float pw = dim(kPreviewW), ph = dim(kPreviewH);
 
     drawGrid(px, py, pw, ph);
+    if (levelOn_) drawLevel(px, py, pw, ph);
+    if (safeFrameOn_) drawSafeFrame(px, py, pw, ph);
 
-    // "对焦并拍照"的兜底：HAL 迟迟不报合焦（低反差/纯色墙面）也不能把快门吊死，
-    // 等满 kShotAfterFocusMaxS 直接拍 —— 晚拍一张好过完全不拍。
-    if (shotAfterFocus_ && shotAfterFocusT0_ >= 0 &&
-        nowSec() - shotAfterFocusT0_ > kShotAfterFocusMaxS) {
-        shotAfterFocus_ = false;
-        shotAfterFocusT0_ = -1;
-        LOGI("tap mode: focus timeout %.1fs -> shutter anyway", kShotAfterFocusMaxS);
-        pushCmd(Cmd::SHOT, 0.f);
-    }
+    // （"对焦并拍照"的超时兜底已移到 checkShotAfterFocus() —— 静态层不重烤就不执行，
+    //  会出现"等合焦"吊死的情况。）
 
-    // 触摸对焦框：点按位置缩放落入（1.4→1.0，ease-out）+ 中心点（对焦/测光区域可视化）。
-    // 颜色随 AF 状态回显（橙=扫描中、绿=已合焦、红=合焦失败）—— 用户不用看日志就知道
-    // 点了之后相机有没有真的去合焦。扫描慢于动画时框会延长到 kAfBoxHold，合焦后留 0.6s 收尾。
-    if (afBoxT0_ >= 0) {
-        const double now = nowSec();
-        const double age = now - afBoxT0_;
-        const int st = afState_.load(std::memory_order_relaxed);
-        const bool focused = (st == 2 || st == 4);   // PASSIVE_FOCUSED / FOCUSED_LOCKED
-        if (focused && afFocusedAt_ < 0) afFocusedAt_ = now;
-        double dur = kAfBoxDur;
-        if (st >= 0 && !focused) dur = kAfBoxHold;
-        if (focused && afFocusedAt_ >= 0) dur = std::max(dur, (afFocusedAt_ - afBoxT0_) + 0.6);
-        // "仅选位置"选中的框：白色、常驻不淡出 —— 用户要的就是"位置一直标在那"。
-        // 常驻期间每帧重烤，否则覆盖层缓存不会刷新（AF 状态配色变化同理）。
-        const bool persist = afBoxSticky_;
-        if (persist) markDirty();
-        if (persist || age < dur) {
-            const float in = persist ? 1.f : std::clamp(float(age / 0.18), 0.f, 1.f);
-            const float scl = persist ? 1.f : 1.4f - 0.4f * (1.f - (1.f - in) * (1.f - in));
-            float a = 1.f;
-            if (!persist && age > dur - 0.35)
-                a = float((dur - age) / 0.35);
-            // 状态配色：合焦=绿，失败=红，其余（扫描中/未知）= 强调橙；常驻框恒白
-            Rgba c = kAccent;
-            if (persist) {
-                c = kWhite;
-            } else if (st == 2 || st == 4) {
-                c = Rgba{74 / 255.f, 222 / 255.f, 128 / 255.f, 1};
-            } else if (st == 5 || st == 6) {
-                c = Rgba{1, 77 / 255.f, 64 / 255.f, 1};
-            }
-            const float side = dim(92 * scl);
-            gl_.roundedRect(screenX(afBoxX_) - side / 2, screenY(afBoxY_) - side / 2, side,
-                            side, dim(6 * scl), kNone, {c.r, c.g, c.b, 0.9f * a}, dim(1.6f));
-            const float d = std::max(dim(2.4f), 1.5f);
-            const float cx = screenX(afBoxX_) - d / 2, cy = screenY(afBoxY_) - d / 2;
-            gl_.triangles((float[12]){cx, cy, cx + d, cy, cx, cy + d,
-                                      cx, cy + d, cx + d, cy, cx + d, cy + d},
-                          6, {c.r, c.g, c.b, a});
-        } else {
-            afBoxT0_ = -1;   // 动画结束，停刷
-        }
-    }
+    // 触摸对焦框已移到 drawAfBox()（frame() 里逐帧直画）：常驻框泡在静态覆盖层里会
+    // 让离屏缓存彻底失效，每帧重烤 ~120 draw call（审查 P1-3）。
 
     // HUD chips（RAW|JPG / DNG / 分辨率 / ZSL）。首枚角标是格式切换按钮：点按 RAW↔JPG
     {
@@ -1203,6 +1319,62 @@ void Ui::drawPreviewOverlay() {
     }
 }
 
+// 触摸对焦框（逐帧直画，主帧缓冲）：点按位置缩放落入（1.4→1.0，ease-out）+ 中心点
+//（对焦/测光区域可视化）。颜色随 AF 状态回显（白=仅选位置常驻、橙=扫描中、绿=已合焦、
+// 红=合焦失败）—— 用户不看日志也知道点了之后相机有没有真的去合焦。
+// 扫描慢于动画时框延长保持到 kAfBoxHold，合焦后留 0.6s 收尾淡出。
+void Ui::drawAfBox() {
+    if (afBoxT0_ < 0) return;
+    const double now = nowSec();
+    const double age = now - afBoxT0_;
+    const int st = afState_.load(std::memory_order_relaxed);
+    const bool focused = (st == 2 || st == 4);   // PASSIVE_FOCUSED / FOCUSED_LOCKED
+    if (focused && afFocusedAt_ < 0) afFocusedAt_ = now;
+    double dur = kAfBoxDur;
+    if (st >= 0 && !focused) dur = kAfBoxHold;
+    if (focused && afFocusedAt_ >= 0) dur = std::max(dur, (afFocusedAt_ - afBoxT0_) + 0.6);
+    // "仅选位置"选中的框：白色、常驻不淡出 —— 用户要的就是"位置一直标在那"。
+    const bool persist = afBoxSticky_;
+    if (!persist && age >= dur) {
+        afBoxT0_ = -1;   // 动画自然收尾
+        return;
+    }
+    const float in = persist ? 1.f : std::clamp(float(age / 0.18), 0.f, 1.f);
+    const float scl = persist ? 1.f : 1.4f - 0.4f * (1.f - (1.f - in) * (1.f - in));
+    float a = 1.f;
+    if (!persist && age > dur - 0.35) a = float((dur - age) / 0.35);
+    Rgba c = kAccent;
+    if (persist) {
+        c = kWhite;
+    } else if (st == 2 || st == 4) {
+        c = Rgba{74 / 255.f, 222 / 255.f, 128 / 255.f, 1};
+    } else if (st == 5 || st == 6) {
+        c = Rgba{1, 77 / 255.f, 64 / 255.f, 1};
+    }
+    // 边长 = kAfBoxSide（= 下发 metering rectangle 的视觉口径，见 Ui.h kRoiFrac）
+    const float side = dim(kAfBoxSide * scl);
+    gl_.roundedRect(screenX(afBoxX_) - side / 2, screenY(afBoxY_) - side / 2, side,
+                    side, dim(6 * scl), kNone, {c.r, c.g, c.b, 0.9f * a}, dim(1.6f));
+    const float d = std::max(dim(2.4f), 1.5f);
+    const float cx = screenX(afBoxX_) - d / 2, cy = screenY(afBoxY_) - d / 2;
+    gl_.triangles((float[12]){cx, cy, cx + d, cy, cx, cy + d,
+                              cx, cy + d, cx + d, cy, cx + d, cy + d},
+                  6, {c.r, c.g, c.b, a});
+}
+
+// "对焦并拍照"超时兜底：HAL 迟迟不报合焦（低反差/纯色墙面）也不能把快门吊死，
+// 等满 kShotAfterFocusMaxS 直接拍 —— 晚拍一张好过完全不拍。
+// 每帧检查（原在静态覆盖层里：层不重烤就不执行，CLAUSE 合焦永不到来时快门永久悬挂）。
+void Ui::checkShotAfterFocus() {
+    if (!shotAfterFocus_.load(std::memory_order_acquire)) return;
+    const double t0 = shotAfterFocusT0_.load(std::memory_order_acquire);
+    if (t0 < 0 || nowSec() - t0 <= kShotAfterFocusMaxS) return;
+    if (!shotAfterFocus_.exchange(false, std::memory_order_acq_rel)) return;   // 别人已接管
+    shotAfterFocusT0_.store(-1, std::memory_order_release);
+    LOGI("tap mode: focus timeout %.1fs -> shutter anyway", kShotAfterFocusMaxS);
+    pushCmd(Cmd::SHOT, 0.f);
+}
+
 // 定向求解优先级：controls.txt 强制值 > (屏幕旋转角 − 传感器朝向) > 交给 Gl 几何自动判断。
 // 取模要做正余数：C++ 里 (-1) % 4 == -1。
 int Ui::resolveUvRot() const {
@@ -1216,6 +1388,7 @@ int Ui::resolveUvRot() const {
 
 void Ui::frame() {
     if (!attached()) return;
+    pollLevel();      // 电子水平仪：每帧非阻塞取加速度计（无传感器则 roll_ 恒 0）
     // 三路常流：每帧必须 drain 全部 reader（不消费会撑满 maxImages=3 队列，
     // HAL 会拖慢/掐断整条 repeating）；直方图只统计当前显示源（读回会 stall，三路全开必掉帧）。
     const int tgt = previewTarget_.load(std::memory_order_acquire);
@@ -1252,8 +1425,8 @@ void Ui::frame() {
 
     // 预览帧率：活动 slot 的相机出帧速率，500ms 窗口（预览左上角显示）
     {
-        // 对焦框动画期间逐帧重烤覆盖层（动画在静态层里，不脏不刷会定帧）
-        if (afBoxT0_ >= 0) markDirty();
+        // 拖拽/轨道刻度变化时才有必要重烤静态层；AF 框是逐帧直画（drawAfBox），
+        // 不能再让它把覆盖层钉成永远脏 —— 那等于把缓存收益清零（审查 P1-3）。
         const double t = nowSec();
         if (previewActive_ >= 0) {
             const int64_t cnt = slotFrames_[previewActive_].load(std::memory_order_relaxed);
@@ -1319,6 +1492,26 @@ void Ui::frame() {
         }
     }
     gl_.drawOverlayFull();   // 合成缓存覆盖层（透明区透出下方预览）
+
+    // ---- 逐帧动态层（不进缓存）：对焦框 + FocusShot 超时兜底 ----
+    checkShotAfterFocus();
+    drawAfBox();
+    // 设置 / 曝光白平衡 面板（动态层逐帧直画，常开也不摧毁静态层缓存收益）
+    if (panel_ != Panel::NONE) drawPanel();
+
+    // ---- 自动休眠遮罩：预览区压暗 + 居中提示（覆盖在预览/AF 框之上）----
+    // 相机已停 repeating（见 CameraEngine::sleepCamera），预览帧冻结，只画最后一张 + 提示。
+    if (sleeping_) {
+        gl_.roundedRect(screenX(kPreviewX), screenY(kPreviewY), dim(kPreviewW), dim(kPreviewH),
+                        0, {0, 0, 0, 0.62f}, kNone, 0);
+        const float fs = 30 * kUiZoom * scale_;
+        const std::string tip = "已休眠，触摸唤醒";
+        const float tw = gl_.textWidth(tip, fs);
+        const float cx = screenX(kPreviewX + kPreviewW / 2);
+        const float cy = screenY(kPreviewY + kPreviewH / 2);
+        const float yTop = gl_.textCenterTop(tip, fs, cy);
+        gl_.text(tip, cx - tw / 2, yTop, fs, {1, 1, 1, 0.92f});
+    }
 
     // ---- 白闪（最顶层，逐帧绘制）----
     double now = nowSec();
@@ -1395,6 +1588,10 @@ void Ui::paintOverlay() {
         gl_.text(t, screenX(cx) - w / 2, gl_.textCenterTop(t, fs, screenY(cy)), fs, kT1);
     }
 
+    // 快速整数倍变焦圆钮（预览区内、导轨右侧）—— 必须画在预览区之后（预览在
+    // paintOverlay 开头已画），否则会被预览纹理盖住。
+    drawQuickZoom();
+
     // ---- 右导轨 ----
     gl_.roundedRect(screenX(kRailRX), screenY(0), dim(kRailRW), dim(kStageH), 0, kRail,
                     kLine, 1);
@@ -1426,6 +1623,458 @@ void Ui::paintOverlay() {
         gl_.text("AE", screenX(lx + kAeLockD / 2) - w / 2,
                  gl_.textCenterTop("AE", fs, screenY(kAeLockY + kAeLockD / 2)), fs,
                  aeLock_ ? kT1 : kT3);
+    }
+
+    // ---- 两个入口按钮：必须画在最后 ----
+    // 两侧导轨（railLX_=88 宽 80 / kRailRX=1156 宽 404）都是整块不透明面板，且都在
+    // 预览之后绘制；入口按钮若提前画会被导轨整块盖住 —— 表现为「命中区在、按钮看不见」
+    // （真机验证踩过：点 150,72 能开面板，但屏幕上找不到按钮）。
+    drawSettingsButton();
+    drawExposureButton();
+}
+
+// =================== 设置 / 曝光白平衡 面板（2026-10-03）===================
+
+// ---- 快速整数倍变焦（0.7 / 1 / 2 / 5）----
+// 圆钮中心 y：kQzY0 + kQzD/2 + i*(kQzD+kQzGap)。命中用「圆 + 8px 外扩」，
+// 与快门/AE 锁同一热区口径（视觉边缘点按经常差几像素落空）。
+int Ui::quickZoomHit(float x, float y) const {
+    for (int i = 0; i < 4; ++i) {
+        const float cy = kQzY0 + kQzD / 2 + float(i) * (kQzD + kQzGap);
+        if (std::hypot(x - kQzX, y - cy) <= kQzD / 2 + 8) return i;
+    }
+    return -1;
+}
+
+void Ui::applyQuickZoom(int idx) {
+    if (idx < 0 || idx >= 4) return;
+    const float z = kQzVals[idx];
+    // 落在当前导轨量程之外（低端机 uw 原生 > 0.7 等）→ 钳到量程，不下发越界值。
+    const float target = std::clamp(z, zoomMin_, zoomMax_);
+    zoom_ = target;
+    // 绝对语义直推：与拖拽松手（onUp ZOOM）同一条路径，绕开 120ms 实时节流。
+    // lastZoomPush_/lastCamPush_ 同步落位，避免紧随其后的拖拽被节流窗口吞掉首帧。
+    pushCmd(Cmd::SET_ZOOM, target);
+    lastZoomPush_ = nowSec();
+    lastCamPush_ = target;
+    LOGI("quick zoom tap -> %.2f (target %.2f)", target, z);
+    hap_.click();
+    markDirty();
+}
+
+void Ui::drawQuickZoom() {
+    const float fs = kJogBtnFs * kUiZoom * scale_;
+    for (int i = 0; i < 4; ++i) {
+        const float cy = kQzY0 + kQzD / 2 + float(i) * (kQzD + kQzGap);
+        // 当前值高亮：与目标档的相对误差 <12% 即视为命中该档。
+        // 用相对判据而非绝对差，0.7 档（带宽窄）与 5 档（带宽宽）手感一致。
+        const bool on = std::fabs(zoom_ - kQzVals[i]) / kQzVals[i] < 0.12f;
+        gl_.roundedRect(screenX(kQzX - kQzD / 2), screenY(cy - kQzD / 2),
+                        dim(kQzD), dim(kQzD), dim(kQzD / 2),
+                        on ? Rgba{kAccent.r, kAccent.g, kAccent.b, 0.32f}
+                           : Rgba{1, 1, 1, 0.06f},
+                        on ? kAccent : kLine, 1.5f);
+        const char* t = kQzLabels[i];
+        const float w = gl_.textWidth(t, fs);
+        gl_.text(t, screenX(kQzX) - w / 2, gl_.textCenterTop(t, fs, screenY(cy)), fs,
+                 on ? kAccent : kT1);
+    }
+}
+
+// ---- 入口图标按钮（2026-10-04）----
+// 圆形按钮 + 纯图标几何图形。图标用 Gl::roundedRect（圆环=大圆角矩形）与
+// Gl::triangles（半圆）拼出，不依赖字体 —— 中文字形进静态图集，图标不占那预算。
+// 约定：本段自由函数只收**已换算好的屏幕像素**（cx/cy/r），不碰 Ui 的私有缩放成员；
+// 设计→屏幕的换算由 Ui::drawSettingsButton / drawExposureButton 完成。
+namespace {
+
+// 齿轮：外圈圆环 + 8 个齿 + 中心孔。r 为齿轮外半径（屏幕像素）。
+void gearIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& c) {
+    const float bw = 1.8f * scale;               // 描边宽
+    const float ring = r * 0.62f;                // 齿根圆半径
+    gl.roundedRect(cx - ring, cy - ring, ring * 2, ring * 2, ring, kNone, c, bw);
+    // 8 齿：沿 45° 均布的小方块
+    for (int i = 0; i < 8; ++i) {
+        const float a = float(i) * 3.14159265f / 4.f + 3.14159265f / 8.f;
+        const float tx = cx + std::cos(a) * r * 0.80f - r * 0.17f;
+        const float ty = cy + std::sin(a) * r * 0.80f - r * 0.17f;
+        gl.roundedRect(tx, ty, r * 0.34f, r * 0.34f, r * 0.10f, c, kNone, 0.f);
+    }
+    // 中心孔（用按钮底色挖空 → 直接画深色圆）
+    gl.roundedRect(cx - r * 0.20f, cy - r * 0.20f, r * 0.40f, r * 0.40f, r * 0.20f,
+                   {0, 0, 0, 0.9f}, kNone, 0.f);
+}
+
+// 曝光/白平衡：上下半黑半白的圆（业界通用符号）。r 为圆半径（屏幕像素）。
+void exposureIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& c) {
+    const float bw = 1.8f * scale;
+    gl.roundedRect(cx - r, cy - r, r * 2, r * 2, r, kNone, c, bw);
+    // 上半：亮色填充（用小扇形三角形近似半圆，避免依赖圆弧 shader）
+    const float R = r - bw * 0.5f;               // 内缩到描边内侧
+    const int N = 14;
+    float xy[14 * 2 * 3];
+    int n = 0;
+    for (int i = 0; i < N; ++i) {
+        const float a0 = 3.14159265f + float(i) * 3.14159265f / float(N);
+        const float a1 = 3.14159265f + float(i + 1) * 3.14159265f / float(N);
+        // 每个小扇形一个三角形：(中心, a0, a1)
+        const float p[6] = {cx, cy,
+                            cx + std::cos(a0) * R, cy + std::sin(a0) * R,
+                            cx + std::cos(a1) * R, cy + std::sin(a1) * R};
+        std::memcpy(xy + n, p, sizeof(p));
+        n += 6;
+    }
+    gl.triangles(xy, n, c);
+}
+
+// 关闭图标：圆底 + 两根 ±45° 交叉条（画笔无法旋转，斜条用细长三角形拼）。
+// 面板全屏后没有"面板外"可点，关闭按钮就落在原入口图标位（设置左上 / 曝光右上）。
+void closeIcon(Gl& gl, float cx, float cy, float r, float scale, const Rgba& c) {
+    const float bw = 1.8f * scale;
+    gl.roundedRect(cx - r, cy - r, r * 2, r * 2, r, kNone, c, bw);
+    const float L = r * 0.60f;          // 斜条半长
+    const float t = r * 0.15f;          // 斜条半宽
+    for (int k = 0; k < 2; ++k) {
+        const float a = (k ? -1.f : 1.f) * 0.7853982f;   // ±45°
+        const float ca = std::cos(a), sa = std::sin(a);
+        const float p[12] = {
+            cx - ca * L + sa * t, cy - sa * L - ca * t,      // A
+            cx + ca * L + sa * t, cy + sa * L - ca * t,      // B
+            cx + ca * L - sa * t, cy + sa * L + ca * t,      // C
+            cx - ca * L + sa * t, cy - sa * L - ca * t,      // A
+            cx + ca * L - sa * t, cy + sa * L + ca * t,      // C
+            cx - ca * L - sa * t, cy - sa * L + ca * t,      // D
+        };
+        gl.triangles(p, 12, c);
+    }
+}
+
+}  // namespace
+
+void Ui::drawSettingsButton() {
+    const float d = kIconD;
+    const float x = screenX(kSetIconX - d / 2), y = screenY(kSetIconY - d / 2);
+    const bool active = (panel_ == Panel::SETTINGS);
+    // 底衬用近黑实底 + 亮描边（浮层铁律：浅色半透明会随预览背景一起消失）
+    gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
+                    {0, 0, 0, 0.80f}, {1, 1, 1, 0.55f}, dim(1.5f));
+    if (active)
+        gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
+                        Rgba{kAccent.r, kAccent.g, kAccent.b, 0.30f}, kAccent, dim(2));
+    gearIcon(gl_, screenX(kSetIconX), screenY(kSetIconY), dim(d) * 0.30f, scale_, kT1);
+}
+
+void Ui::drawExposureButton() {
+    const float d = kIconD;
+    const float x = screenX(kExpIconX - d / 2), y = screenY(kExpIconY - d / 2);
+    const bool active = (panel_ == Panel::EXPOSURE);
+    gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
+                    {0, 0, 0, 0.80f}, {1, 1, 1, 0.55f}, dim(1.5f));
+    if (active)
+        gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
+                        Rgba{kAccent.r, kAccent.g, kAccent.b, 0.30f}, kAccent, dim(2));
+    exposureIcon(gl_, screenX(kExpIconX), screenY(kExpIconY), dim(d) * 0.30f, scale_, kT1);
+}
+
+void Ui::openPanel(Panel p) {
+    if (panel_ == p) return;
+    panel_ = p;
+    buildCtlRects();   // 提前填充命中矩形（首帧绘制前若有触摸也不落空）
+    markDirty();       // 按钮高亮变化
+    hap_.click();
+}
+
+void Ui::closePanel() {
+    if (panel_ == Panel::NONE) return;
+    panel_ = Panel::NONE;
+    ctlRects_.clear();
+    markDirty();
+}
+
+// 面板内容块高：由行数推导（buildCtlRects 须已 build）。drawPanel 与
+// handlePanelTap 共用同一份 ctlRects_，天然一致。
+void Ui::buildCtlRects() {
+    ctlRects_.clear();
+    if (panel_ == Panel::NONE) return;
+    // 内容块在全屏内容区里垂直居中：设置面板 9 行（3 标题+6 控件）占 516px，
+    // 曝光面板 5 行只占 280px —— 顶对齐会让后者下半屏空着。
+    const int nHead = (panel_ == Panel::SETTINGS) ? 3 : 2;
+    const int nRow  = (panel_ == Panel::SETTINGS) ? 6 : 3;
+    const float totalH = nHead * kPanelHeadH + nRow * kPanelRowH;
+    float y = kPanelTopY + (kPanelBotY - kPanelTopY - totalH) / 2;
+    const float ctlX = kPanelCtlR - kPanelCtlW;
+    auto header = [&](const char* t) {
+        ctlRects_.push_back({kPanelPadL, y, 0, kPanelHeadH, 0, 0, int(A_HEADER), t, nullptr});
+        y += kPanelHeadH;
+    };
+    auto row = [&](const char* label, const char** opts, int n, int sel, PAct act) {
+        ctlRects_.push_back({ctlX, y + (kPanelRowH - kPanelCtlH) / 2, kPanelCtlW, kPanelCtlH,
+                             n, sel, int(act), label, opts});
+        y += kPanelRowH;
+    };
+    if (panel_ == Panel::SETTINGS) {
+        header("照片质量");
+        row("格式", kFmtOpts, 2, fmtJpg_ ? 1 : 0, A_FMT);
+        row("RAW模式", kRingOpts, 2, rawRing_ ? 0 : 1, A_RAW);
+        row("连拍配额", kQuotaOpts, 4, saveQuotaSel_, A_QUOTA);
+        header("辅助构图");
+        row("网格线", kOnOff, 2, gridOn_ ? 1 : 0, A_GRID);
+        row("水平仪", kOnOff, 2, levelOn_ ? 1 : 0, A_LEVEL);
+        row("安全框", kOnOff, 2, safeFrameOn_ ? 1 : 0, A_SAFE);
+        header("其他");
+        row("持久化", kOnOff, 2, persist_ ? 1 : 0, A_PERSIST);
+    } else {
+        header("曝光");
+        row("自动曝光", kOnOff, 2, aeOn_ ? 1 : 0, A_AE);
+        header("白平衡");
+        row("自动白平衡", kOnOff, 2, awbOn_ ? 1 : 0, A_AWB);
+        row("白平衡预设", kAwbLabels, 8, awbPreset_, A_AWBPRESET);
+    }
+}
+
+void Ui::drawPanel() {
+    buildCtlRects();
+    // 全屏实底（面板本身就是全屏，不需要再叠一层压暗）
+    gl_.roundedRect(screenX(0), screenY(0), dim(kStageW), dim(kStageH), 0,
+                    {0.055f, 0.055f, 0.065f, 1.0f}, kNone, 0);
+    const bool set = (panel_ == Panel::SETTINGS);
+    // 标题居中（关闭按钮在角落，标题不与之争位）
+    const char* title = set ? "设置" : "曝光白平衡";
+    const float tfs = 26 * kUiZoom * scale_;
+    const float tW = gl_.textWidth(title, tfs);
+    gl_.text(title, screenX(kStageW / 2) - tW / 2, screenY(46), tfs, kT1);
+
+    // 行
+    const float fs = 19 * kUiZoom * scale_;
+    for (auto& c : ctlRects_) {
+        if (c.act == int(A_HEADER)) {
+            const float hfs = 15 * kUiZoom * scale_;
+            gl_.text(c.label, screenX(c.x),
+                     gl_.textCenterTop(c.label, hfs, screenY(c.y + c.h / 2)), hfs, kAccent);
+            // 标题下细线，强化分组
+            const float ly = c.y + c.h - 2;
+            gl_.roundedRect(screenX(kPanelPadL), screenY(ly), dim(kStageW - 2 * kPanelPadL),
+                            std::max(1.f, dim(1)), 0, {1, 1, 1, 0.10f}, kNone, 0);
+            continue;
+        }
+        gl_.text(c.label, screenX(c.x - 24) - gl_.textWidth(c.label, fs),
+                 gl_.textCenterTop(c.label, fs, screenY(c.y + c.h / 2)), fs, kT2);
+        // 分段控件底
+        gl_.roundedRect(screenX(c.x), screenY(c.y), dim(c.w), dim(c.h), dim(10),
+                        {1, 1, 1, 0.08f}, kLine, 1);
+        const float sw = c.w / c.n;
+        for (int i = 0; i < c.n; ++i) {
+            const float sx = screenX(c.x + i * sw);
+            if (i == c.sel) {
+                gl_.roundedRect(sx + dim(3), screenY(c.y + 3), dim(sw - 6), dim(c.h - 6),
+                                dim(8), kAccent, kNone, 0);
+            } else if (i > 0) {
+                // 段分隔线
+                gl_.roundedRect(sx, screenY(c.y + 8), std::max(1.f, dim(1)),
+                                dim(c.h - 16), 0, {1, 1, 1, 0.12f}, kNone, 0);
+            }
+            const char* o = c.opts[i];
+            const float ofs = 17 * kUiZoom * scale_;
+            const float ow = gl_.textWidth(o, ofs);
+            gl_.text(o, sx + (dim(sw) - ow) / 2,
+                     gl_.textCenterTop(o, ofs, screenY(c.y + c.h / 2)), ofs,
+                     i == c.sel ? kWhite : kT2);
+        }
+    }
+
+    // 关闭按钮：落在原入口图标位（设置左上 / 曝光右上），点它即关闭
+    const float ccx = set ? kSetIconX : kExpIconX;
+    const float ccy = set ? kSetIconY : kExpIconY;
+    const float scx = screenX(ccx - kIconD / 2), scy = screenY(ccy - kIconD / 2);
+    gl_.roundedRect(scx, scy, dim(kIconD), dim(kIconD), dim(kIconD / 2),
+                    {0, 0, 0, 0.80f}, {1, 1, 1, 0.55f}, dim(1.5f));
+    closeIcon(gl_, screenX(ccx), screenY(ccy), dim(kIconD) * 0.30f, scale_, kT1);
+}
+
+void Ui::handlePanelTap(float x, float y) {
+    // 关闭按钮优先：落在入口图标位（左上 / 右上）即关闭当前面板
+    const bool set = (panel_ == Panel::SETTINGS);
+    const float ccx = set ? kSetIconX : kExpIconX;
+    const float ccy = set ? kSetIconY : kExpIconY;
+    if (std::hypot(x - ccx, y - ccy) <= kIconD / 2 + kIconHitPad) {
+        closePanel(); hap_.click(); return;
+    }
+    for (auto& c : ctlRects_) {
+        if (c.act == int(A_HEADER)) continue;
+        if (inR(x, y, c.x, c.y, c.w, c.h)) {
+            const int seg = int(std::clamp((x - c.x) / (c.w / c.n), 0.f, float(c.n - 1)));
+            doAction(PAct(c.act), seg);
+            return;
+        }
+    }
+    // 其余区域（面板已全屏，无"外部"概念）：忽略
+}
+
+void Ui::doAction(PAct act, int seg) {
+    switch (act) {
+        case A_FMT:       applyFmt(seg == 1); break;
+        case A_RAW:       applyRawMode(seg == 0); break;
+        case A_QUOTA:     applyQuota(kQuotaVals[seg]); break;
+        case A_GRID:      gridOn_ = (seg == 1); markDirty(); commitPersist(); break;
+        case A_LEVEL:     levelOn_ = (seg == 1); markDirty(); commitPersist(); break;
+        case A_SAFE:      safeFrameOn_ = (seg == 1); markDirty(); commitPersist(); break;
+        case A_PERSIST:   persist_ = (seg == 1); markDirty(); commitPersist(); break;
+        case A_AE:        applyAe(seg == 1); break;
+        case A_AWB:       applyAwb(seg == 1); break;
+        case A_AWBPRESET: applyAwbPreset(seg); break;
+        default: break;
+    }
+    hap_.click();
+    buildCtlRects();   // 刷新选中态显示
+}
+
+void Ui::applyFmt(bool jpg) {
+    if (jpg == fmtJpg_) return;       // SET_FMT 绝对语义：仅值变化时下发
+    fmtJpg_ = jpg;
+    pushCmd(Cmd::SET_FMT, jpg ? 1.f : 0.f);
+    commitPersist();
+}
+
+void Ui::applyRawMode(bool ring) {
+    if (ring == rawRing_) return;
+    rawRing_ = ring;
+    pushCmd(Cmd::SET_RAW_MODE, ring ? 1.f : 0.f);
+    commitPersist();
+}
+
+void Ui::applyQuota(int n) {
+    int sel = 3;
+    for (int i = 0; i < 4; ++i) if (kQuotaVals[i] == n) sel = i;
+    if (sel == saveQuotaSel_) return;
+    saveQuotaSel_ = sel;
+    pushCmd(Cmd::SET_SAVE_QUOTA, float(n));
+    commitPersist();
+}
+
+void Ui::applyAe(bool on) {
+    if (on == aeOn_) return;
+    aeOn_ = on;
+    markDirty();     // 面板选中态在逐帧动态层，状态变必须显式置脏重画
+    pushCmd(Cmd::SET_AE, on ? 1.f : 0.f);
+    commitPersist();
+}
+
+void Ui::applyAwb(bool on) {
+    if (on == awbOn_) return;
+    awbOn_ = on;
+    markDirty();
+    pushCmd(Cmd::SET_AWB, on ? 1.f : 0.f);
+    commitPersist();
+}
+
+void Ui::applyAwbPreset(int idx) {
+    if (idx < 0 || idx > 7) idx = 0;
+    // markDirty 不可省：面板画在逐帧动态层，选中态不回写就不会重画 ⇒ 高亮停在旧档
+    // （2026-10-03 真机：点「阴天」无反应，日志证明命中与分段都对，就是缺重画）。
+    // 幂等守卫同 applyAe/applyAwb：重复点同一档不重复下发。
+    if (idx == awbPreset_) return;
+    awbPreset_ = idx;
+    awbOn_ = true;   // 选预设即打开白平衡
+    pushCmd(Cmd::SET_WB_PRESET, float(idx));
+    markDirty();
+    commitPersist();
+}
+
+void Ui::commitPersist() {
+    if (!persist_ || dataDir_.empty()) return;
+    std::ofstream f(dataDir_ + "/settings.txt");
+    if (!f) return;
+    f << "persist=1\n";
+    f << "fmt=" << (fmtJpg_ ? "jpg" : "raw") << "\n";
+    f << "rawmode=" << (rawRing_ ? "ring" : "once") << "\n";
+    f << "quota=" << kQuotaVals[saveQuotaSel_] << "\n";
+    f << "ae=" << (aeOn_ ? "on" : "off") << "\n";
+    f << "awb=" << (awbOn_ ? "on" : "off") << "\n";
+    f << "awbpreset=" << awbPreset_ << "\n";
+    f << "grid=" << (gridOn_ ? 1 : 0) << "\n";
+    f << "level=" << (levelOn_ ? 1 : 0) << "\n";
+    f << "safe=" << (safeFrameOn_ ? 1 : 0) << "\n";
+}
+
+void Ui::loadPersistedSettings() {
+    if (dataDir_.empty()) return;
+    std::ifstream f(dataDir_ + "/settings.txt");
+    if (!f) return;
+    std::string line;
+    bool persist = false;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (k == "persist") persist = (v == "1");
+        else if (k == "fmt") { if ((v == "jpg") != fmtJpg_) applyFmt(v == "jpg"); }
+        else if (k == "rawmode") { bool ring = (v == "ring"); if (ring != rawRing_) applyRawMode(ring); }
+        else if (k == "quota") { int n = std::atoi(v.c_str()); if (n != kQuotaVals[saveQuotaSel_]) applyQuota(n); }
+        else if (k == "ae") { bool on = (v == "on"); if (on != aeOn_) applyAe(on); }
+        else if (k == "awb") { bool on = (v == "on"); if (on != awbOn_) applyAwb(on); }
+        else if (k == "awbpreset") { int idx = std::atoi(v.c_str()); if (idx != awbPreset_) applyAwbPreset(idx); }
+        else if (k == "grid") { bool on = (v == "1"); if (on != gridOn_) { gridOn_ = on; markDirty(); } }
+        else if (k == "level") { bool on = (v == "1"); if (on != levelOn_) { levelOn_ = on; markDirty(); } }
+        else if (k == "safe") { bool on = (v == "1"); if (on != safeFrameOn_) { safeFrameOn_ = on; markDirty(); } }
+    }
+    // 持久化开关本身：仅当文件标记为持久化时才恢复开启（否则默认关闭、不恢复旧值）
+    persist_ = persist;
+    markDirty();
+}
+
+void Ui::drawLevel(float x, float y, float w, float h) {
+    const float cx = x + w / 2, cy = y + h / 2;
+    // 取景中心十字：与网格同口径双层（近黑描边 + 亮白芯），否则亮场景下不可见
+    const float t = std::max(dim(1.6f), 2.f), e = std::max(dim(0.9f), 1.f);
+    gl_.roundedRect(cx - dim(40) - e, cy - t / 2 - e, dim(80) + 2 * e, t + 2 * e, 0,
+                    kGridEdge, kNone, 0);
+    gl_.roundedRect(cx - t / 2 - e, cy - dim(40) - e, t + 2 * e, dim(80) + 2 * e, 0,
+                    kGridEdge, kNone, 0);
+    gl_.roundedRect(cx - dim(40), cy - t / 2, dim(80), t, 0, kGridCore, kNone, 0);
+    gl_.roundedRect(cx - t / 2, cy - dim(40), t, dim(80), 0, kGridCore, kNone, 0);
+    // 水平仪气泡：随 roll 横向偏移，居中 = 水平（无传感器时 roll_=0，气泡居中）
+    const float off = std::clamp(roll_ * (w * 0.35f), -w * 0.45f, w * 0.45f);
+    const float br = dim(10);
+    gl_.roundedRect(cx + off - br, cy - br, br * 2, br * 2, br,
+                    {1, 1, 1, 0.5f}, kAccent, 1.5f);
+    // 中央参考刻度
+    gl_.roundedRect(cx - dim(1), cy - dim(6), dim(2), dim(12), 0, kAccent, kNone, 0);
+}
+
+void Ui::drawSafeFrame(float x, float y, float w, float h) {
+    const float m = 0.05f;   // 5% 安全边距
+    const float sw = std::max(dim(1.6f), 2.f), e = std::max(dim(0.9f), 1.f);
+    // 双层描边（近黑 + 亮白）：单层低 alpha 白在亮预览上会整条消失，同 drawGrid
+    gl_.roundedRect(x + w * m, y + h * m, w * (1 - 2 * m), h * (1 - 2 * m), 0,
+                    kNone, kGridEdge, sw + 2 * e);
+    gl_.roundedRect(x + w * m, y + h * m, w * (1 - 2 * m), h * (1 - 2 * m), 0,
+                    kNone, kGridCore, sw);
+}
+
+// ---- 电子水平仪：加速度计（无传感器则 roll_ 恒 0，气泡居中，优雅降级）----
+void Ui::initLevel() {
+    // ASensorManager_getInstance 自 API26 起废弃；等价且非废弃的入口是
+    // getInstanceForPackage(nullptr)，minSdk=31 可直接用，避免 -Wdeprecated-declarations。
+    snsMgr_ = ASensorManager_getInstanceForPackage(nullptr);
+    if (!snsMgr_) return;
+    snsAcc_ = ASensorManager_getDefaultSensor(snsMgr_, ASENSOR_TYPE_ACCELEROMETER);
+    if (!snsAcc_) return;
+    ALooper* looper = ALooper_forThread();
+    if (!looper) return;
+    snsQ_ = ASensorManager_createEventQueue(snsMgr_, looper, 1, nullptr, nullptr);
+    if (snsQ_)
+        ASensorEventQueue_enableSensor(snsQ_, snsAcc_);
+}
+
+void Ui::pollLevel() {
+    if (!snsQ_) return;
+    ASensorEvent e;
+    // 非阻塞：每帧最多消费若干事件，取最新倾角
+    int got = 0;
+    while (ASensorEventQueue_getEvents((ASensorEventQueue*)snsQ_, &e, 1) > 0 && got < 4) {
+        // 横滚（左右倾）≈ atan2(gx, gz)：手机平放时 gz≈+9.8，左右倾使 gx 增大
+        roll_ = std::atan2(e.acceleration.x, e.acceleration.z);
+        ++got;
     }
 }
 
