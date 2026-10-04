@@ -262,7 +262,7 @@ private:
     void drawPanel();
     void drawSettingsButton();      // 左上、变焦滑块上方
     void drawExposureButton();      // 右上、快门正上方
-    void drawFlashButton();         // 右导轨顶部、曝光图标左侧（无闪光灯时不画）
+    void drawFlashButton();         // ISO 滑轨上方（无闪光灯硬件时不画）
     // 快速整数倍变焦：预览区内、变焦导轨右侧的竖排圆钮（0.7/1/2/5）。
     // 走静态覆盖层（随 zoom_ 变化重烤），命中在 onDown 早期短路 —— 必须在
     // 预览区触摸对焦判定之前，否则点按钮会同时触发一次对焦。
@@ -376,6 +376,19 @@ private:
     std::atomic<int> autoSsUs_{0};          // AE 实测曝光时间 µs
     int zoomUnit_ = 0;                                  // 0=mm 1=×
     bool gridOn_ = true;
+
+    // ---- 底部 toast（短暂提示）----
+    // 逐帧直画在最顶层（不进静态覆盖层缓存）：点按类操作的即时文字反馈
+    // （2026-10-04：闪光档位切换）。到点自动消失，末段 0.35s 淡出。
+    // 面板里改设置靠控件自身的选中态表达，只有"图标循环切换"这类无处显示状态的
+    // 操作才需要 toast —— 图标上的档位符号太小，强光下读不出来。
+    std::string toast_;
+    double toastUntil_ = 0;        // nowSec() 截止时刻；<= 0 = 当前无 toast
+    static constexpr double kToastSec = 1.8;
+    static constexpr float kToastY = 578.f;   // 设计坐标：底部居中（EV 面板顶 622 之上）
+    static constexpr float kToastH = 54.f;
+    void showToast(const char* s);
+    void drawToast();
 
     // 弹出面板状态
     Panel panel_ = Panel::NONE;

@@ -147,6 +147,10 @@ constexpr float kFlashIconX = 1216, kFlashIconY = 48;
 constexpr float kIconHitPad = 8.f;
 // 闪光灯档位名（settings.txt 落盘用；解析时同时接受数字 0..3，便于手写调试）
 constexpr const char* kFlashNames[4] = {"off", "auto", "on", "torch"};
+// 档位切换 toast 文案（底部居中，1.8s 自动消失）。新 CJK 字必须同时加进
+// Gl.cpp bakeFont 的 extra 串，否则静默丢字形（渲染成空白）——见该文件注释。
+constexpr const char* kFlashToast[4] = {"闪光灯 关", "闪光灯 自动", "闪光灯 开",
+                                        "闪光灯 常亮"};
 
 // ---- 快速整数倍变焦按钮（2026-10-03 用户要求）----
 // 竖排 4 枚圆形按钮，铺在**预览区内**、左变焦导轨右缘（kRailREnd=168）之外 ——
@@ -414,6 +418,9 @@ void Ui::onDown(float x, float y, double tMs) {
     if (flashAvail_ &&
         std::hypot(x - kFlashIconX, y - kFlashIconY) <= kIconD / 2 + kIconHitPad) {
         applyFlash((flashMode_ + 1) % 4);
+        // toast 只在**点按**时弹：applyFlash 也被启动时的持久化恢复调用，那条路径
+        // 不该弹提示（用户没做任何操作）。
+        showToast(kFlashToast[flashMode_]);
         hap_.click();
         return;
     }
@@ -1566,7 +1573,9 @@ void Ui::frame() {
         gl_.roundedRect(screenX(kPreviewX), screenY(kPreviewY), dim(kPreviewW),
                         dim(kPreviewH), 0, f, kNone, 0);
     }
-    // 拍照反馈已全部收敛到 HUD 角标行（SAVING / 配额提示），此处不再画浮层 toast
+    // ---- 底部 toast（最顶层，逐帧绘制）----
+    drawToast();
+    // 拍照反馈已全部收敛到 HUD 角标行（SAVING / 配额提示）与底部 toast
     gl_.swap();
 }
 
@@ -1808,40 +1817,52 @@ void strokeSeg(std::vector<float>& v, float x0, float y0, float x1, float y1, fl
     v.insert(v.end(), std::begin(p), std::end(p));
 }
 
-// 闪光灯：Z 形闪电（两段斜笔 + 中间横笔，接缝用小方块缝合）+ 档位附加符号。
+// 闪光灯：单个填充多边形闪电 + 档位附加符号。
 // 档位（0 关 / 1 自动 / 2 开 / 3 常亮）靠**附加符号**区分，不靠颜色单独表意
 // —— 单靠颜色在强光下读不出，且色弱用户分不开：
-//   关 = 闪电被深色斜杠划断；自动 = 右下角 "A"；开 = 纯闪电；常亮 = 闪电 + 四向短芒。
+//   关 = 闪电被斜杠划断；自动 = 右下角 "A"；开 = 纯闪电；常亮 = 闪电 + 四向短芒。
+// 2026-10-04 重画：原实现是「三段笔画 + 转折处补方块」，横摆只有 ±0.2r、笔画细，
+// 缩到 60px 圆钮里读作一条细长的裂纹/Z，不像闪电。改成一整块填充多边形
+//（横摆 ±0.52r、纵跨 ±1.0r），轮廓连续、无拼接缝，才是通用的闪电符号。
+// 坐标：与 roundedRect / text 同一套（**y 向下为正**，shader 负责 Y 翻转）。
 void flashIcon(Gl& gl, float cx, float cy, float r, float scale, int mode, const Rgba& c) {
-    const float w = r * 0.34f;                 // 笔画宽
-    // Z 形闪电的四个骨架点（y 向上为正，与 roundedRect 同一坐标系）
-    const float xTop = cx + 0.16f * r, yTop = cy + 0.55f * r;
-    const float xML = cx - 0.20f * r, yMid = cy + 0.02f * r;
-    const float xMR = cx + 0.20f * r;
-    const float xBot = cx - 0.16f * r, yBot = cy - 0.55f * r;
-
-    std::vector<float> v;
-    strokeSeg(v, xTop, yTop, xML, yMid, w);      // 上斜笔
-    strokeSeg(v, xML, yMid, xMR, yMid, w);      // 中横笔
-    strokeSeg(v, xMR, yMid, xBot, yBot, w);     // 下斜笔
-    gl.triangles(v.data(), int(v.size() / 2), c);
-    // 接缝补齐：斜笔端点落在横笔中线，笔宽方向垂直 ⇒ 转折处会缺一个小三角。
-    // 用同宽方块盖住两个转折点（roundedRect 不能旋转，方块无需旋转）。
-    gl.roundedRect(xML - w / 2, yMid - w / 2, w, w, 0, c, kNone, 0);
-    gl.roundedRect(xMR - w / 2, yMid - w / 2, w, w, 0, c, kNone, 0);
+    // 闪电轮廓 6 顶点（y 向下为正）：顶尖 → 左腰尖 → 腰内角 → 底尖 → 右下尖 → 右腰内角
+    const float P[12] = {
+        cx + 0.30f * r, cy - 1.00f * r,     // 0 顶尖（略偏右）
+        cx - 0.52f * r, cy - 0.10f * r,     // 1 左腰尖
+        cx + 0.02f * r, cy - 0.10f * r,     // 2 腰内角
+        cx - 0.30f * r, cy + 1.00f * r,     // 3 底尖（略偏左）
+        cx + 0.52f * r, cy + 0.10f * r,     // 4 右下尖
+        cx + 0.02f * r, cy + 0.10f * r,     // 5 右腰内角
+    };
+    // 扇形三角化：以顶点 0 为扇心，(0,1,2) (0,2,3) (0,3,4) (0,4,5)
+    float tri[24];
+    for (int t = 0; t < 4; ++t) {
+        const int idx[3] = {0, t + 1, t + 2};
+        for (int k = 0; k < 3; ++k) {
+            tri[t * 6 + k * 2] = P[idx[k] * 2];
+            tri[t * 6 + k * 2 + 1] = P[idx[k] * 2 + 1];
+        }
+    }
+    gl.triangles(tri, 24, c);
 
     if (mode == 0) {
-        // 关：一道深色斜杠划断闪电（比"灰掉"更易读，且与自动档的 A 明确区分）
-        std::vector<float> s;
-        strokeSeg(s, cx - r * 0.80f, cy + r * 0.80f, cx + r * 0.80f, cy - r * 0.80f,
-                  w * 0.85f);
-        gl.triangles(s.data(), int(s.size() / 2), {0, 0, 0, 0.92f});
+        // 关：一道斜杠划断闪电。双层描边（近黑粗底 + 亮色细芯），与构图辅助线同一
+        // 套路：单层深色斜杠在近黑底衬（{0,0,0,0.8}）上整段隐形，只剩闪电身上两个
+        // 缺口，读不出"被划掉"——看着就是图形缺了一块，这才是原先"奇怪"的来源。
+        const float x0 = cx - r * 0.95f, y0 = cy - r * 0.95f;   // 左上
+        const float x1 = cx + r * 0.95f, y1 = cy + r * 0.95f;   // 右下（与闪电斜笔交叉）
+        std::vector<float> s0, s1;
+        strokeSeg(s0, x0, y0, x1, y1, r * 0.46f);
+        gl.triangles(s0.data(), int(s0.size() / 2), {0, 0, 0, 0.92f});
+        strokeSeg(s1, x0, y0, x1, y1, r * 0.22f);
+        gl.triangles(s1.data(), int(s1.size() / 2), {1, 1, 1, 0.80f});
     } else if (mode == 1) {
         // 自动：右下角小 "A"（相机界通用：闪电 + A = 自动闪光）
         const float fs = r * 0.78f;
         const std::string t = "A";
         const float tw = gl.textWidth(t, fs);
-        gl.text(t, cx + r * 0.42f - tw / 2, cy - r * 0.92f, fs, c);
+        gl.text(t, cx + r * 0.42f - tw / 2, cy + r * 0.92f, fs, c);
     } else if (mode == 3) {
         // 常亮：四向短芒（手电筒持续发光的表意符号）
         std::vector<float> s;
@@ -1849,7 +1870,7 @@ void flashIcon(Gl& gl, float cx, float cy, float r, float scale, int mode, const
         for (int i = 0; i < 4; ++i) {
             const float a = 0.7853982f + float(i) * 1.5707963f;   // 45°/135°/225°/315°
             const float ca = std::cos(a), sa = std::sin(a);
-            strokeSeg(s, cx + ca * r0, cy + sa * r0, cx + ca * r1, cy + sa * r1, w * 0.42f);
+            strokeSeg(s, cx + ca * r0, cy + sa * r0, cx + ca * r1, cy + sa * r1, r * 0.14f);
         }
         gl.triangles(s.data(), int(s.size() / 2), c);
     }
@@ -1894,6 +1915,31 @@ void Ui::drawExposureButton() {
         gl_.roundedRect(x, y, dim(d), dim(d), dim(d / 2),
                         Rgba{kAccent.r, kAccent.g, kAccent.b, 0.30f}, kAccent, dim(2));
     exposureIcon(gl_, screenX(kExpIconX), screenY(kExpIconY), dim(d) * 0.30f, scale_, kT1);
+}
+
+void Ui::showToast(const char* s) {
+    if (!s || !*s) return;
+    toast_ = s;
+    toastUntil_ = nowSec() + kToastSec;
+}
+
+// 底部居中 toast：逐帧直画在最顶层（白闪之后、swap 之前调用）。
+// 底衬一律近黑实底（浮层铁律：浅色半透明会随预览背景一起消失）。
+void Ui::drawToast() {
+    if (toast_.empty()) return;
+    const double left = toastUntil_ - nowSec();
+    if (left <= 0) { toast_.clear(); return; }
+    // 只做淡出不做淡入：点按反馈要立刻可读，淡入反而显得迟钝
+    const float a = left < 0.35 ? float(left / 0.35) : 1.f;
+    const float fs = 17.f * kUiZoom * scale_;
+    const float tw = gl_.textWidth(toast_, fs);
+    const float w = tw + 56.f;                    // 左右各 28 内边距
+    const float bx = screenX(kStageW / 2 - w / 2), by = screenY(kToastY - kToastH / 2);
+    Rgba bg{0, 0, 0, 0.86f}, ln{1, 1, 1, 0.22f}, fg{1, 1, 1, 0.95f};
+    bg.a *= a; ln.a *= a; fg.a *= a;
+    gl_.roundedRect(bx, by, dim(w), dim(kToastH), dim(kToastH / 2), bg, ln, dim(1.2f));
+    gl_.text(toast_, screenX(kStageW / 2) - tw / 2,
+             gl_.textCenterTop(toast_, fs, screenY(kToastY)), fs, fg);
 }
 
 void Ui::openPanel(Panel p) {
