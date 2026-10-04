@@ -2068,6 +2068,36 @@ void Ui::drawPanel() {
             const float sx = screenX(c.x), sy = screenY(c.y), sw = dim(c.w), sh = dim(c.h);
             const float ccx = sx + sw / 2, ccy = sy + sh / 2;
             gl_.roundedRect(sx, sy, sw, sh, dim(12), {1, 1, 1, 0.06f}, kLine, 1);
+            // 2D 网格：每格按其所代表的白平衡偏移染一抹轻微颜色，让用户直观感知方向
+            // （暖=橙、冷=蓝、品红=品红、绿=绿），中心中性区几乎无色、边缘略强。
+            {
+                const int N = 9;
+                const float gt = sw / N, gh = sh / N;
+                const float gap = std::max(1.f, dim(1.2f));   // 格间留缝，露出底色形成网格感
+                for (int j = 0; j < N; ++j) {                 // j: 上(品, tint+) → 下(绿, tint-)
+                    for (int i = 0; i < N; ++i) {             // i: 左(冷, temp-) → 右(暖, temp+)
+                        const float temp = (float(i) + 0.5f) / N * 2.f - 1.f;
+                        const float tint = 1.f - (float(j) + 0.5f) / N * 2.f;
+                        const float m2 = temp * temp + tint * tint;   // 离中心距离平方 [0,2]
+                        float r = std::clamp(0.5f + 0.45f * temp + 0.30f * tint, 0.f, 1.f);
+                        float g = std::clamp(0.5f - 0.20f * temp - 0.30f * tint, 0.f, 1.f);
+                        float b = std::clamp(0.5f - 0.45f * temp + 0.30f * tint, 0.f, 1.f);
+                        const float a = 0.09f + 0.11f * m2;   // 轻微但可感知：中心 ~0.09，角落 ~0.31
+                        gl_.roundedRect(sx + i * gt + gap * 0.5f, sy + j * gh + gap * 0.5f,
+                                        gt - gap, gh - gap, 0, {r, g, b, a}, kNone, 0);
+                    }
+                }
+                // 网格线（细白，盖在彩色之上界定格子边界）
+                const float lw = std::max(1.f, dim(1.f));
+                for (int i = 0; i <= N; ++i) {
+                    const float gx = sx + (float)i / N * sw;
+                    gl_.roundedRect(gx - lw * 0.5f, sy, lw, sh, 0, {1, 1, 1, 0.16f}, kNone, 0);
+                }
+                for (int j = 0; j <= N; ++j) {
+                    const float gy = sy + (float)j / N * sh;
+                    gl_.roundedRect(sx, gy - lw * 0.5f, sw, lw, 0, {1, 1, 1, 0.16f}, kNone, 0);
+                }
+            }
             // 双轴（横=色温 X，纵=色调 Y）
             gl_.roundedRect(ccx - 1, sy + dim(8), std::max(1.f, dim(2)), sh - dim(16), 0,
                             {1, 1, 1, 0.18f}, kNone, 0);
